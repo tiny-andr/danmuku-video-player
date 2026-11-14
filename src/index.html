@@ -1104,6 +1104,8 @@
     var mpvPos = -1;
     var mpvSyncTimer = null;
     var audioBridged = false;   // 播放器事件只桥接一次
+    var videoAudioTimer = null; // 检测 <video> 自己是否也在出声
+    var mpvMuteGuard = false;   // 正在由我们静音视频，别再回灌给 mpv
 
     function mpvDetach() {
       if (!mpvActive) return;
@@ -1111,6 +1113,7 @@
       mpvPos = -1;
       try { invoke('mpv_stop').catch(function () { }); } catch (e) { }
       if (mpvSyncTimer) { clearInterval(mpvSyncTimer); mpvSyncTimer = null; }
+      stopVideoAudioWatch();
       externalOrdinal = -1;
       refreshAudioMenu();
     }
@@ -1132,6 +1135,7 @@
       mpvSet('pause', !art.playing);
       mpvSet('speed', art.playbackRate || 1);
       if (!mpvSyncTimer) mpvSyncTimer = setInterval(mpvTick, 250);
+      startVideoAudioWatch();
       refreshAudioMenu();
       diag('mpv-attached', { ordinal: ordinal });
     }
@@ -1140,6 +1144,36 @@
     function mpvTick() {
       if (!mpvActive || !art || mpvPos < 0) return;
       if (art.currentTime - mpvPos > 0.3) invoke('mpv_seek', { seconds: art.currentTime }).catch(function () { });
+    }
+
+    // DTS 这类编码 WebView2 自己其实能解核心音频，会和 mpv 叠成双声。
+    // 用 webkitAudioDecodedByteCount 判断 <video> 是否真在出声，只在那种情况下静音它
+    // （TrueHD 解不出来，字节数恒为 0，不会被误静音，音量图标也就不乱闪）。
+    function checkVideoAudio() {
+      if (!mpvActive || !art || !art.video) return;
+      var v = art.video;
+      var decoded = v.webkitAudioDecodedByteCount || 0;
+      if (decoded > 0 && !v.muted) {
+        mpvMuteGuard = true;
+        v.muted = true;
+        setTimeout(function () { mpvMuteGuard = false; }, 300);
+        diag('video-audio-muted', { decoded: decoded });
+      }
+    }
+
+    function startVideoAudioWatch() {
+      if (videoAudioTimer) return;
+      checkVideoAudio();
+      videoAudioTimer = setInterval(checkVideoAudio, 1000);
+    }
+
+    function stopVideoAudioWatch() {
+      if (videoAudioTimer) { clearInterval(videoAudioTimer); videoAudioTimer = null; }
+      if (art && art.video && art.video.muted) {
+        mpvMuteGuard = true;
+        art.video.muted = false;
+        setTimeout(function () { mpvMuteGuard = false; }, 300);
+      }
     }
 
     function bindMpvEvents() {
@@ -1168,8 +1202,15 @@
       });
       art.on('video:ratechange', function () { mpvSet('speed', art.playbackRate || 1); });
       art.on('video:volumechange', function () {
+        if (mpvMuteGuard) return;   // 我们自己静音视频时的回声，别同步给 mpv
         mpvSet('volume', Math.round((art.volume == null ? 0.5 : art.volume) * 100));
         mpvSet('mute', !!art.muted);
+        // mpv 接管音频时视频轨必须一直静音，否则用户一取消静音，DTS 就和 mpv 叠成双声
+        if (mpvActive && art.video && !art.video.muted) {
+          mpvMuteGuard = true;
+          art.video.muted = true;
+          setTimeout(function () { mpvMuteGuard = false; }, 300);
+        }
       });
       bindMpvEvents();
     }
