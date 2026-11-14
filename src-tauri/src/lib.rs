@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use tauri::Manager;
 
 mod mkv_probe;
+mod mpv;
 mod transcode;
 
 const VIDEO_EXTS: &[&str] = &[
@@ -267,22 +268,25 @@ pub fn run() {
             transcode::transcode_audio_start,
             transcode::extract_subtitle_start,
             transcode::transcode_audio_cancel,
+            mpv::mpv_start,
+            mpv::mpv_load,
+            mpv::mpv_seek,
+            mpv::mpv_set,
+            mpv::mpv_stop,
+            mpv::mpv_status,
             pick_video,
             pick_folder
         ])
         .manage(std::sync::Mutex::new(None::<transcode::TranscodeJob>))
+        .manage(std::sync::Arc::new(std::sync::Mutex::new(mpv::MpvProc::new())))
         .on_window_event(|window, event| {
-            // 关窗即杀转码子进程，不让 ffmpeg 变孤儿
+            // 关窗即杀子进程，不让 ffmpeg / mpv 变孤儿
             if let tauri::WindowEvent::Destroyed = event {
-                if let Some(mut job) = window
-                    .app_handle()
-                    .state::<transcode::JobState>()
-                    .lock()
-                    .unwrap()
-                    .take()
-                {
+                let app = window.app_handle();
+                if let Some(mut job) = app.state::<transcode::JobState>().lock().unwrap().take() {
                     job.kill_now();
                 }
+                mpv::shutdown(app.state::<mpv::MpvState>().inner());
             }
         })
         .run(tauri::generate_context!())

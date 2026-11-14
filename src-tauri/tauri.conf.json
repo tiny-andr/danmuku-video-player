@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "Danmuku Video Player",
-  "version": "1.1.1",
+  "version": "1.2.0",
   "identifier": "com.danmuku.video.player",
   "build": {
     "frontendDist": "../src"
@@ -30,6 +30,9 @@
   "bundle": {
     "active": true,
     "targets": ["nsis"],
+    "resources": {
+      "resources/mpv/mpv.exe": "mpv/mpv.exe"
+    },
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",

@@ -1032,8 +1032,12 @@
             return;
           }
           diag('ensure', { idx: c.audioIndex });
-          try { ensureAudioTrack(path, probeDurationUs, c.audioIndex, c.deadNames.join(' / ')); }
-          catch (e) { diag('ensure-err', { err: String(e) }); }
+          // 优先走 mpv 旁路（原生解码、不转码）；mpv 起不来再回落到 AAC 外挂
+          mpvAttach(path, c.audioIndex, c.audioIndex + 1).catch(function (e) {
+            diag('mpv-fallback', { err: String(e) });
+            try { ensureAudioTrack(path, probeDurationUs, c.audioIndex, c.deadNames.join(' / ')); }
+            catch (e2) { diag('ensure-err', { err: String(e2) }); }
+          });
         }).catch(function (e) { diag('fullcache-err', { err: String(e) }); });
       }).catch(function (e) { diag('probe-err', { err: String(e) }); });
     }
@@ -1078,6 +1082,7 @@
     }
 
     function resetExternalAudio() {
+      mpvDetach();
       if (audioTrack) {
         try {
           audioTrack.audio.pause();
@@ -1087,6 +1092,86 @@
       }
       externalOrdinal = -1;
       refreshAudioMenu();
+    }
+
+    /* ------------------------------------------------------------------ *
+     * 音轨旁路（mpv 子进程）：WebView2 永远解不了 TrueHD / DTS-HD / AC-4 / DRA，
+     * 这些交给独立的 mpv 进程（--no-video，只出声）原生解码，视频照旧由 <video> 渲染。
+     * 不转码、不生成缓存、秒起播；mpv 缺失或起不来时回落到 AAC 外挂音轨。
+     * 主时钟是视频：mpv 只跟随，漂移 > 0.3s 就 seek 拉回。
+     * ------------------------------------------------------------------ */
+    var mpvActive = false;
+    var mpvPos = -1;
+    var mpvSyncTimer = null;
+    var audioBridged = false;   // 播放器事件只桥接一次
+
+    function mpvDetach() {
+      if (!mpvActive) return;
+      mpvActive = false;
+      mpvPos = -1;
+      try { invoke('mpv_stop').catch(function () { }); } catch (e) { }
+      if (mpvSyncTimer) { clearInterval(mpvSyncTimer); mpvSyncTimer = null; }
+      externalOrdinal = -1;
+      refreshAudioMenu();
+    }
+
+    function mpvSet(name, value) {
+      if (!mpvActive) return;
+      invoke('mpv_set', { name: name, value: value }).catch(function () { });
+    }
+
+    async function mpvAttach(path, audioIdx, ordinal) {
+      await invoke('mpv_start');
+      await invoke('mpv_load', { path: path, audioIndex: audioIdx });
+      await invoke('mpv_seek', { seconds: art.currentTime || 0 });
+      mpvActive = true;
+      mpvPos = -1;
+      externalOrdinal = ordinal;
+      mpvSet('volume', Math.round((art.volume == null ? 0.5 : art.volume) * 100));
+      mpvSet('mute', !!art.muted);
+      mpvSet('pause', !art.playing);
+      mpvSet('speed', art.playbackRate || 1);
+      if (!mpvSyncTimer) mpvSyncTimer = setInterval(mpvTick, 250);
+      refreshAudioMenu();
+      diag('mpv-attached', { ordinal: ordinal });
+    }
+
+    // 视频是主时钟，mpv 只负责跟上
+    function mpvTick() {
+      if (!mpvActive || !art || mpvPos < 0) return;
+      if (art.currentTime - mpvPos > 0.3) invoke('mpv_seek', { seconds: art.currentTime }).catch(function () { });
+    }
+
+    function bindMpvEvents() {
+      if (!window.__TAURI__ || !window.__TAURI__.event) return;
+      window.__TAURI__.event.listen('mpv-event', function (e) {
+        var m;
+        try { m = JSON.parse(e.payload); } catch (err) { return; }
+        if (m.event === 'property-change' && m.name === 'time-pos') {
+          if (typeof m.data === 'number') mpvPos = m.data;
+        } else if (m.event === 'end-file') {
+          mpvPos = -1;
+        } else if (m.event === 'file-loaded') {
+          diag('mpv-loaded');
+        }
+      }).catch(function () { });
+    }
+
+    // 视频事件单向驱动 mpv（mpv 只跟随，不反向改视频）。
+    // 必须在 initDesktop 作用域内绑定：createPlayer 在顶层，拿不到这里的 mpv 函数。
+    function bindAudioBridges() {
+      if (!art) return;
+      art.on('play', function () { mpvSet('pause', false); });
+      art.on('pause', function () { mpvSet('pause', true); });
+      art.on('seek', function () {
+        if (mpvActive) invoke('mpv_seek', { seconds: art.currentTime }).catch(function () { });
+      });
+      art.on('video:ratechange', function () { mpvSet('speed', art.playbackRate || 1); });
+      art.on('video:volumechange', function () {
+        mpvSet('volume', Math.round((art.volume == null ? 0.5 : art.volume) * 100));
+        mpvSet('mute', !!art.muted);
+      });
+      bindMpvEvents();
     }
 
     // 整片 AAC 缓存路径（同名 + " (AAC).mkv"）：用于命中已有缓存，未命中则走外挂音轨
@@ -1149,6 +1234,10 @@
       if (externalOrdinal === i + 1) return;
       var t = probeTracks[i];
       var label = codecName(String(t.codec || '').toUpperCase()) || '未知编码';
+      if (mpvActive) {
+        mpvAttach(currentVideoPath, i, i + 1).catch(function (e) { diag('mpv-switch-err', { err: String(e) }); });
+        return;
+      }
       ensureAudioTrack(currentVideoPath, probeDurationUs, i, label);
     }
 
@@ -1344,6 +1433,7 @@
       if (transcodeVideo && transcodeVideo !== currentVideoPath) hidePill(); // 旧任务继续后台跑，胶囊先收起
       resetExternalAudio();
       setVideoFromUrl(mediaUrl(path), name, st.size);
+      if (!audioBridged) { audioBridged = true; bindAudioBridges(); }
       handleAudioCodecs(path, name);
       // 外挂字幕扫描对全部视频类型生效（内嵌轨只有 MKV 能探测，由 handleAudioCodecs 补齐）
       if (!/\.(mkv|mka|webm)$/i.test(name)) buildSubtitleMenu(path, null, ++probeToken);
