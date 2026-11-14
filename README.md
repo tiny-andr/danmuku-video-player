@@ -29,3 +29,8 @@ npm run build
 ## 许可证
 
 [MIT](LICENSE)
+
+## 致谢
+
+- [ArtPlayer](https://github.com/zhw2590582/ArtPlayer) — 播放器内核与弹幕/字幕/音轨插件
+
