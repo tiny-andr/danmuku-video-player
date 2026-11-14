@@ -301,23 +301,16 @@
   var CONFIG_KEY = 'bplayer_danmaku_config';
   var isMobile = document.documentElement.clientWidth < 768;
 
-  // 细粒度速度步进表（值 = 弹幕滚过一屏的秒数，越大越慢）。
-  // 注入插件的 SPEED 配置，保证任何预设/保存的速度值都有对应标签，
-  // 避免插件原版 findIndex 精确匹配失败时面板标签停留在默认文案。
+  // 速度档位（value = 一条弹幕从右边进入到完全离开左边所需的秒数，越大越慢）。
+  // 插件面板用精确匹配按 value 找标签，所以默认值和保存值都必须落在这几个 value
+  // 上（读取保存配置时由 snapSpeed 对齐）。插件内部把 speed 夹在 [1,60]，
+  // vendor 里已把原版上限 10 放开，极慢档才能取到 20 秒。
   var SPEED_STEPS = [
-    { name: '极慢', value: 10 },
-    { name: '9s', value: 9, hide: true },
-    { name: '8s', value: 8, hide: true },
-    { name: '较慢', value: 7.5 },
-    { name: '7s', value: 7, hide: true },
-    { name: '6s', value: 6, hide: true },
-    { name: '适中', value: 5 },
-    { name: '4s', value: 4, hide: true },
-    { name: '较快', value: 3 },
-    { name: '2.5s', value: 2.5, hide: true },
-    { name: '2s', value: 2, hide: true },
-    { name: '1.5s', value: 1.5, hide: true },
-    { name: '极快', value: 1 }
+    { name: '极慢', value: 20 },
+    { name: '较慢', value: 14 },
+    { name: '适中', value: 9 },
+    { name: '较快', value: 5 },
+    { name: '极快', value: 3 }
   ];
 
   var art = null;               // Artplayer 实例
@@ -472,7 +465,7 @@
    * ------------------------------------------------------------------ */
   function defaultDanmakuOption() {
     return {
-      speed: isMobile ? 4 : 7.5,
+      speed: isMobile ? 5 : 9,
       antiOverlap: true,
       synchronousPlayback: false,
       fontSize: isMobile ? 14 : 25,
@@ -628,12 +621,14 @@
     });
   });
 
-  /* 速度档位取整：读取保存配置时对齐到 SPEED_STEPS 中的有效档位 */
+  /* 速度档位取整：读取保存配置时对齐到 SPEED_STEPS 中的有效档位。
+   * 只往「不更快」的方向吸附（取不小于原值的最慢档），升级后绝不会比原来快；
+   * 旧的隐藏档（9/8/7/6/4/2.5/2/1.5）也因此落到更慢的一侧。
+   * SPEED_STEPS 按慢 → 快排列，降序扫描时最后一个 >= v 的档就是最近档。 */
   function speedIndex(v) {
-    var best = 0, dist = Infinity;
+    var best = 0;
     for (var i = 0; i < SPEED_STEPS.length; i++) {
-      var d = Math.abs(SPEED_STEPS[i].value - v);
-      if (d < dist) { dist = d; best = i; }
+      if (SPEED_STEPS[i].value >= v) best = i;
     }
     return best;
   }
@@ -928,11 +923,17 @@
       if (!silent) toast('已切换到 AAC 整片缓存版（播放进度保留）');
     }
 
-    // ---- 音轨菜单（多音轨文件的信息条 🎵 入口） ----
+    // ---- 音轨菜单（存在死编码音轨的多轨文件才出现；全可播的文件内核直接播，不做外挂） ----
+    function hasDeadAudio() {
+      return (probeTracks || []).some(function (t) {
+        var c = String(t.codec || '').toUpperCase();
+        return c.indexOf('A_DTS') === 0 || c === 'A_TRUEHD' || c === 'A_AC4' || c === 'A_DRA';
+      });
+    }
     function refreshAudioMenu() {
       var btn = $('btnAudioEntry');
       var panel = $('audioPanel');
-      if (fullCacheActive || !probeTracks || probeTracks.length < 2) {
+      if (fullCacheActive || !hasDeadAudio() || !probeTracks || probeTracks.length < 2) {
         btn.hidden = true;
         panel.hidden = true;
         return;
@@ -958,7 +959,7 @@
     }
 
     function switchAudioTrack(i) {
-      if (fullCacheActive || !probeTracks || !probeTracks[i] || !currentVideoPath) return;
+      if (fullCacheActive || !hasDeadAudio() || !probeTracks || !probeTracks[i] || !currentVideoPath) return;
       $('audioPanel').hidden = true;
       if (externalOrdinal === i + 1) return;
       var t = probeTracks[i];

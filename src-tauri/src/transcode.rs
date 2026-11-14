@@ -111,9 +111,9 @@ fn find_ffmpeg() -> Result<PathBuf, String> {
     }
 }
 
-/// 公共参数段（进度流 + 不读 stdin + 覆盖输出）。
-fn common_args(out: &Path, limit_secs: Option<u64>) -> Vec<String> {
-    let mut a: Vec<String> = [
+/// 全局参数段（进度流 + 不读 stdin + 覆盖输出）。
+fn ffmpeg_header() -> Vec<String> {
+    [
         "-hide_banner".into(),
         "-loglevel".into(),
         "error".into(),
@@ -123,7 +123,15 @@ fn common_args(out: &Path, limit_secs: Option<u64>) -> Vec<String> {
         "pipe:1".into(),
         "-nostats".into(),
     ]
-    .to_vec();
+    .to_vec()
+}
+
+/// 音轨 → AAC 独立 mka。`limit_secs` 仅供测试截短时长。
+/// -readrate 限速：转换期间视频还在同一个盘上播放，全速顺序读会饿死播放起播（HDD 尤甚）。
+fn ffmpeg_audio_args(src: &Path, audio_index: usize, out: &Path, limit_secs: Option<u64>) -> Vec<String> {
+    let mut a = ffmpeg_header();
+    a.extend(["-readrate".into(), "8".into()]);
+    a.extend(["-i".into(), src.to_string_lossy().into_owned(), "-map".into(), format!("0:a:{audio_index}"), "-c:a".into(), "aac".into(), "-b:a".into(), "640k".into()]);
     if let Some(s) = limit_secs {
         a.push("-t".into());
         a.push(s.to_string());
@@ -132,17 +140,11 @@ fn common_args(out: &Path, limit_secs: Option<u64>) -> Vec<String> {
     a
 }
 
-/// 音轨 → AAC 独立 mka。`limit_secs` 仅供测试截短时长。
-fn ffmpeg_audio_args(src: &Path, audio_index: usize, out: &Path, limit_secs: Option<u64>) -> Vec<String> {
-    let mut a: Vec<String> = ["-i".into(), src.to_string_lossy().into_owned(), "-map".into(), format!("0:a:{audio_index}"), "-c:a".into(), "aac".into(), "-b:a".into(), "640k".into()].to_vec();
-    a.extend(common_args(out, limit_secs));
-    a
-}
-
-/// 字幕轨 → SRT（文本轨道统一转 srt，ASS 样式丢弃，与前端 VTT 渲染一致）。
+/// 字幕轨 → SRT（文本轨道统一转 srt，ASS 样式丢弃，与前端 VTT 渲染一致）。字幕轨稀疏读取，无需限速。
 fn ffmpeg_sub_args(src: &Path, sub_index: usize, out: &Path) -> Vec<String> {
-    let mut a: Vec<String> = ["-i".into(), src.to_string_lossy().into_owned(), "-map".into(), format!("0:s:{sub_index}"), "-c:s".into(), "srt".into()].to_vec();
-    a.extend(common_args(out, None));
+    let mut a = ffmpeg_header();
+    a.extend(["-i".into(), src.to_string_lossy().into_owned(), "-map".into(), format!("0:s:{sub_index}"), "-c:s".into(), "srt".into()]);
+    a.push(out.to_string_lossy().into_owned());
     a
 }
 
