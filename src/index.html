@@ -135,6 +135,42 @@
   .info-k { color: var(--muted); font-size: 11px; letter-spacing: .5px; }
   .info-v { font-size: 13px; font-weight: 600; font-variant-numeric: tabular-nums; }
   .info-v.accent { color: var(--accent); }
+  /* ---- 弹幕屏蔽（入口在信息条行尾，浮窗编辑词库） ---- */
+  .btn-block {
+    margin-left: auto;
+    background: #232733; border: 1px solid var(--line); color: var(--muted);
+    border-radius: 8px; padding: 4px 12px; font-size: 12px; font-family: inherit; cursor: pointer;
+    transition: border-color .15s, color .15s;
+  }
+  .btn-block:hover { color: var(--accent); border-color: var(--accent); }
+  .block-panel {
+    position: fixed; right: 16px; bottom: 64px; z-index: 70;
+    width: 320px; max-width: calc(100vw - 32px);
+    display: flex; flex-direction: column; gap: 10px;
+    background: rgba(20, 22, 28, .97); backdrop-filter: blur(10px);
+    border: 1px solid var(--line); border-radius: 12px; padding: 12px 14px;
+    box-shadow: 0 24px 70px -28px rgba(0, 0, 0, .7);
+  }
+  .block-panel[hidden] { display: none; }
+  .block-head { display: flex; align-items: center; gap: 10px; }
+  .block-head b { font-size: 13px; }
+  .block-count { font-size: 11px; color: var(--muted); }
+  .block-head .spacer { flex: 1; }
+  .block-head button {
+    background: none; border: 1px solid var(--line); color: var(--muted);
+    border-radius: 6px; width: 24px; height: 24px; cursor: pointer; font-family: inherit;
+  }
+  .block-head button:hover { color: var(--text); border-color: var(--accent); }
+  .block-panel textarea {
+    width: 100%; resize: vertical;
+    background: #232733; color: var(--text); border: 1px solid var(--line);
+    border-radius: 8px; padding: 8px 10px; font-size: 12px; line-height: 1.7;
+    font-family: inherit; min-height: 120px;
+  }
+  .block-panel textarea:focus { outline: none; border-color: var(--accent); }
+  .block-foot { font-size: 11px; color: var(--muted); line-height: 1.6; }
+  .switch { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: var(--muted); cursor: pointer; }
+  .switch input { accent-color: var(--accent); width: 15px; height: 15px; cursor: pointer; }
   /* ---- 页面滚动条 ---- */
   ::-webkit-scrollbar { width: 10px; height: 10px; }
   ::-webkit-scrollbar-track { background: var(--bg); }
@@ -176,6 +212,19 @@
     <div class="info-item"><span class="info-k">弹幕数量</span><span class="info-v accent" id="infoCount">—</span></div>
     <div class="info-item"><span class="info-k">弹幕解析</span><span class="info-v" id="infoParse">—</span></div>
     <div class="info-item"><span class="info-k">当前进度</span><span class="info-v" id="infoTime">—</span></div>
+    <button type="button" class="btn-block" id="btnBlockEntry" title="设置弹幕屏蔽词">🚫 弹幕屏蔽</button>
+  </div>
+
+  <div class="block-panel" id="blockPanel" hidden>
+    <div class="block-head">
+      <b>弹幕屏蔽</b>
+      <span class="block-count" id="blockCount"></span>
+      <span class="spacer"></span>
+      <button type="button" id="blockClose" title="关闭">✕</button>
+    </div>
+    <label class="switch"><input type="checkbox" id="blockEnabled" /><span>启用屏蔽</span></label>
+    <textarea id="blockWords" spellcheck="false" placeholder="一行一个屏蔽词&#10;弹幕内容包含该词即被隐藏"></textarea>
+    <div class="block-foot">包含屏蔽词的弹幕将不再显示 · 改动即时生效并自动保存</div>
   </div>
 
   <aside class="playlist" id="playlist" aria-label="剧集播放列表">
@@ -484,7 +533,9 @@
   function applyDanmaku() {
     var p = danmakuPlugin();
     if (p) {
-      p.config({ danmuku: danmakuList });
+      // 插件装载队列只读 option.danmuku（插件原始拼写，没有 danmaku 别名）。
+      // 传错拼键 config({danmaku:...}) 不会生效，弹幕会一条都不显示。
+      p.config({ danmuku: filterDanmaku(danmakuList) });
       p.load();
     }
   }
@@ -536,6 +587,95 @@
   }
 
   function snapSpeed(v) { return SPEED_STEPS[speedIndex(v)].value; }
+
+  /* ------------------------------------------------------------------ *
+   * 弹幕屏蔽：包含关键词的弹幕直接不进入插件队列（filterDanmaku）。
+   * 词库一行一个，开关与词库改动即时生效并持久化到本机。
+   * danmakuList 始终保存未过滤的全量弹幕，换词库后无需重新解析文件。
+   * ------------------------------------------------------------------ */
+  var BLOCK_KEY = 'bplayer_block_config';
+  var blockState = { enabled: false, words: '' };
+  var blockWordsCache = null;   // 去重后的小写词数组，词库变动后置空重建
+  var blockInputTimer = null;
+
+  function loadBlockConfig() {
+    try {
+      var c = JSON.parse(localStorage.getItem(BLOCK_KEY));
+      if (c) {
+        blockState.enabled = !!c.enabled;
+        blockState.words = String(c.words || '');
+      }
+    } catch (e) { /* 损坏的配置按默认关闭处理 */ }
+  }
+
+  function saveBlockConfig() {
+    try { localStorage.setItem(BLOCK_KEY, JSON.stringify(blockState)); } catch (e) { /* 忽略持久化失败 */ }
+  }
+
+  function blockWords() {
+    if (blockWordsCache) return blockWordsCache;
+    var seen = {}, out = [];
+    blockState.words.split('\n').forEach(function (w) {
+      w = w.trim().toLowerCase();
+      if (w && !seen[w]) { seen[w] = 1; out.push(w); }
+    });
+    blockWordsCache = out;
+    return out;
+  }
+
+  function filterDanmaku(list) {
+    if (!blockState.enabled) return list;
+    var words = blockWords();
+    if (!words.length) return list;
+    return list.filter(function (item) {
+      var t = String(item.text).toLowerCase();
+      for (var i = 0; i < words.length; i++) {
+        if (t.indexOf(words[i]) > -1) return false;
+      }
+      return true;
+    });
+  }
+
+  function updateBlockMeta() {
+    var n = blockWords().length;
+    $('blockCount').textContent = blockState.enabled ? n + ' 个屏蔽词' : '已关闭';
+  }
+
+  function applyBlockSettings() {
+    blockWordsCache = null;
+    saveBlockConfig();
+    applyDanmaku();   // 按新词库重新过滤并装载（未建播放器时是安全的空操作）
+    updateBlockMeta();
+  }
+
+  function bindBlockPanel() {
+    var panel = $('blockPanel');
+    $('btnBlockEntry').addEventListener('click', function () {
+      var opening = panel.hidden;
+      panel.hidden = !opening;
+      if (opening) {
+        $('blockEnabled').checked = blockState.enabled;
+        $('blockWords').value = blockState.words;
+        updateBlockMeta();
+      }
+    });
+    $('blockClose').addEventListener('click', function () { panel.hidden = true; });
+    $('blockEnabled').addEventListener('change', function () {
+      blockState.enabled = this.checked;
+      applyBlockSettings();
+    });
+    $('blockWords').addEventListener('input', function () {
+      clearTimeout(blockInputTimer);
+      var v = this.value;
+      blockInputTimer = setTimeout(function () {
+        blockState.words = v;
+        applyBlockSettings();
+      }, 400);
+    });
+    document.addEventListener('keydown', function (e) {
+      if (e.key === 'Escape') panel.hidden = true;
+    });
+  }
   /* ------------------------------------------------------------------ *
    * 桌面版主流程（Tauri）
    * 拖拽拿到真实路径，主进程直接读盘，
@@ -674,13 +814,17 @@
     renderPlaylist();
   }
 
+  loadBlockConfig();
+  bindBlockPanel();
   initDesktop();
 
   // 便于调试 / 自动化验证
   window.Bplayer = {
     get art() { return art; },
     get danmaku() { return danmakuList; },
-    get queue() { return debugQueue; }
+    get queue() { return debugQueue; },
+    get block() { return { enabled: blockState.enabled, words: blockWords().length }; },
+    get filter() { return filterDanmaku; }
   };
 })();
 </script>

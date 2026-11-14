@@ -1,6 +1,6 @@
 [package]
 name = "bplayer"
-version = "0.1.0"
+version = "1.0.0"
 description = "Bplayer 本地视频 + 弹幕播放器（桌面版）"
 edition = "2021"
 
