@@ -245,7 +245,6 @@
     <button type="button" class="btn-block" id="btnSubtitleEntry" title="选择字幕" hidden>📝 字幕</button>
     <button type="button" class="btn-block" id="btnAudioEntry" title="选择音轨" hidden>🎵 音轨</button>
     <button type="button" class="btn-block" id="btnBlockEntry" title="设置弹幕屏蔽词">🚫 弹幕屏蔽</button>
-    <button type="button" class="btn-block" id="btnDensityEntry" title="设置每秒最多显示几条弹幕">📊 弹幕密度</button>
   </div>
 
   <div class="block-panel" id="densityPanel" hidden>
@@ -552,6 +551,8 @@
     // 外挂音轨：audio-track 插件，独立 Audio 元素跟随视频时钟（工厂函数直接接线，不走插件管理器）
     audioTrack = artplayerPluginAudioTrack({ url: '' })(art);
 
+    mountDensityControl();   // 弹幕密度入口挂在控制栏右列（齿轮左边）
+
     art.on('artplayerPluginDanmuku:config', function (opt) { saveConfig(opt); });
     art.on('artplayerPluginDanmuku:loaded', function (q) { debugQueue = q; });
     art.on('video:ended', function () { if (window.__BplayerNext) window.__BplayerNext(); });
@@ -840,14 +841,40 @@
     updateDensityMeta();
   }
 
-  function bindDensityPanel() {
+  function toggleDensityPanel() {
     var panel = $('densityPanel');
-    $('btnDensityEntry').addEventListener('click', function () {
-      var opening = panel.hidden;
-      panel.hidden = !opening;
-      if (opening) updateDensityMeta();
+    var opening = panel.hidden;
+    panel.hidden = !opening;
+    if (opening) updateDensityMeta();
+  }
+
+  /* 控制栏入口：直接往 Artplayer 右侧控制列插一个原生 .art-control 按钮，
+   * 尺寸、透明度、显隐动画全部沿用 Artplayer 自带样式，跟齿轮/画中画并排。
+   * 用 DOM 插入而不是 controls.add()：不吃 API 的参数校验，版本升级也不会静默失效。 */
+  var DENSITY_ICON = '<svg class="art-icon" viewBox="0 0 24 24" aria-hidden="true">' +
+    '<path d="M4 7h16M4 12.5h11M4 18h6" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round"/></svg>';
+
+  function mountDensityControl() {
+    if ($('ctlDensity')) return;
+    var box = (art && art.template && art.template.$controlsRight) ||
+              document.querySelector('#player .art-controls-right');
+    if (!box) return;
+    var btn = document.createElement('div');
+    btn.className = 'art-control art-control-density';
+    btn.id = 'ctlDensity';
+    btn.title = '弹幕密度';
+    btn.setAttribute('role', 'button');
+    btn.setAttribute('aria-label', '弹幕密度');
+    btn.innerHTML = DENSITY_ICON;
+    btn.addEventListener('click', function (e) {
+      e.stopPropagation();   // 别让点击穿到播放器触发暂停
+      toggleDensityPanel();
     });
-    $('densityClose').addEventListener('click', function () { panel.hidden = true; });
+    box.insertBefore(btn, box.firstChild);
+  }
+
+  function bindDensityPanel() {
+    $('densityClose').addEventListener('click', function () { $('densityPanel').hidden = true; });
     // 拖动时只更新文案，松手（change）才重建队列，避免一次拖动装十几次弹幕
     $('densityRange').addEventListener('input', function () {
       var v = DENSITY_STEPS[Number(this.value)];
@@ -856,6 +883,9 @@
       updateDensityLabel();
     });
     $('densityRange').addEventListener('change', function () { applyDensitySettings(); });
+    document.addEventListener('keydown', function (e) {
+      if (e.key === 'Escape') $('densityPanel').hidden = true;
+    });
   }
   /* ------------------------------------------------------------------ *
    * 桌面版主流程（Tauri）
