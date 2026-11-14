@@ -1,6 +1,6 @@
 # danmuku-video-player
 
-本地视频弹幕播放器（Bplayer 桌面版）：打开本机视频，自动加载同名弹幕文件一起播放。
+本地视频弹幕播放器（Danmuku Video Player 桌面版）：打开本机视频，自动加载同名弹幕文件一起播放。
 
 ![播放器界面](docs/screenshot.png)
 

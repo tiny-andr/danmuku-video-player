@@ -1,8 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "Bplayer",
-  "version": "1.0.0",
-  "identifier": "com.bplayer.desktop",
+  "productName": "Danmuku Video Player",
+  "version": "1.0.1",
+  "identifier": "com.danmuku.video.player",
   "build": {
     "frontendDist": "../src"
   },
@@ -11,7 +11,7 @@
     "windows": [
       {
         "label": "main",
-        "title": "Bplayer · 本地视频 + 弹幕播放器",
+        "title": "Danmuku Video Player · 本地视频 + 弹幕播放器",
         "width": 1280,
         "height": 860,
         "minWidth": 960,

@@ -346,17 +346,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "bplayer"
-version = "1.0.0"
-dependencies = [
- "rfd",
- "serde",
- "serde_json",
- "tauri",
- "tauri-build",
-]
-
-[[package]]
 name = "brotli"
 version = "9.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -691,6 +680,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ea691ed9f36489d087419b8b2ba3ef27d89621380b4178c73e2445a379e4e0f4"
 dependencies = [
  "link-section",
+]
+
+[[package]]
+name = "danmuku-video-player"
+version = "1.0.1"
+dependencies = [
+ "rfd",
+ "serde",
+ "serde_json",
+ "tauri",
+ "tauri-build",
 ]
 
 [[package]]

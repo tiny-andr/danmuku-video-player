@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>Bplayer · 本地视频 + 弹幕播放器</title>
+<title>Danmuku Video Player · 本地视频 + 弹幕播放器</title>
 <style>
   :root {
     --accent: #fb7299;
@@ -518,7 +518,7 @@
     }
     placeholder.classList.add('hide');
     chipVideo.innerHTML = '🎬 <b>' + escapeHtml(name) + '</b>';
-    document.title = name + ' · Bplayer';
+    document.title = name + ' · Danmuku Video Player';
     // 信息栏：立即显示文件大小，时长/分辨率等元数据就绪后补齐
     $('infobar').hidden = false;
     $('infoSize').textContent = size ? fmtBytes(size) : '—';

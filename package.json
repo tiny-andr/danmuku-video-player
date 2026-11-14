@@ -1,8 +1,8 @@
 {
-  "name": "bplayer",
-  "version": "1.0.0",
+  "name": "danmuku-video-player",
+  "version": "1.0.1",
   "private": true,
-  "description": "Bplayer 本地视频 + 弹幕播放器（Tauri 桌面版）",
+  "description": "Danmuku Video Player 本地视频 + 弹幕播放器（Tauri 桌面版）",
   "scripts": {
     "dev": "tauri dev",
     "build": "tauri build",
