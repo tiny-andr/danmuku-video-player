@@ -1106,6 +1106,7 @@
     var audioBridged = false;   // 播放器事件只桥接一次
     var videoAudioTimer = null; // 检测 <video> 自己是否也在出声
     var mpvMuteGuard = false;   // 正在由我们静音视频，别再回灌给 mpv
+    var audioSplitter = null;    // 把 <video> 的音频接到 gain=0，UI 上仍显示正常音量
 
     function mpvDetach() {
       if (!mpvActive) return;
@@ -1113,6 +1114,7 @@
       mpvPos = -1;
       try { invoke('mpv_stop').catch(function () { }); } catch (e) { }
       if (mpvSyncTimer) { clearInterval(mpvSyncTimer); mpvSyncTimer = null; }
+      unmuteVideoViaWebAudio();
       stopVideoAudioWatch();
       externalOrdinal = -1;
       refreshAudioMenu();
@@ -1135,7 +1137,7 @@
       mpvSet('pause', !art.playing);
       mpvSet('speed', art.playbackRate || 1);
       if (!mpvSyncTimer) mpvSyncTimer = setInterval(mpvTick, 250);
-      startVideoAudioWatch();
+      if (!muteVideoViaWebAudio()) startVideoAudioWatch();
       refreshAudioMenu();
       diag('mpv-attached', { ordinal: ordinal });
     }
@@ -1144,6 +1146,35 @@
     function mpvTick() {
       if (!mpvActive || !art || mpvPos < 0) return;
       if (art.currentTime - mpvPos > 0.3) invoke('mpv_seek', { seconds: art.currentTime }).catch(function () { });
+    }
+
+    // 把 <video> 的音频接进一个 gain=0 的 WebAudio 管道：声音被隔离掉，
+    // 但 video.volume / video.muted 一个都不改，Artplayer 的音量图标和滑块照常显示、照常可调。
+    // 这样 mpv 独占音频时界面不会出现「显示静音却有声音」的怪状态。
+    function muteVideoViaWebAudio() {
+      if (audioSplitter) return true;
+      try {
+        var Ctx = window.AudioContext || window.webkitAudioContext;
+        if (!Ctx || !art || !art.video) return false;
+        var ctx = new Ctx();
+        var srcNode = ctx.createMediaElementSource(art.video);
+        var gain = ctx.createGain();
+        gain.gain.value = 0;
+        srcNode.connect(gain);
+        gain.connect(ctx.destination);
+        if (ctx.state === 'suspended') ctx.resume().catch(function () { });
+        audioSplitter = { ctx: ctx, gain: gain };
+        diag('video-audio-webhook');
+        return true;
+      } catch (e) {
+        diag('video-audio-webhook-fail', { err: String(e) });
+        return false;
+      }
+    }
+
+    function unmuteVideoViaWebAudio() {
+      if (!audioSplitter) return;
+      try { audioSplitter.gain.gain.value = 1; } catch (e) { }
     }
 
     // DTS 这类编码 WebView2 自己其实能解核心音频，会和 mpv 叠成双声。
@@ -1206,7 +1237,7 @@
         mpvSet('volume', Math.round((art.volume == null ? 0.5 : art.volume) * 100));
         mpvSet('mute', !!art.muted);
         // mpv 接管音频时视频轨必须一直静音，否则用户一取消静音，DTS 就和 mpv 叠成双声
-        if (mpvActive && art.video && !art.video.muted) {
+        if (mpvActive && !audioSplitter && art.video && !art.video.muted) {
           mpvMuteGuard = true;
           art.video.muted = true;
           setTimeout(function () { mpvMuteGuard = false; }, 300);
