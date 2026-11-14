@@ -1,0 +1,1270 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Bplayer · 本地视频 + 弹幕播放器</title>
+<style>
+  :root {
+    --accent: #fb7299;
+    --bg: #111318;
+    --card: #1a1d24;
+    --line: #2a2e37;
+    --text: #e8eaf0;
+    --muted: #9aa1b0;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background:
+      radial-gradient(1100px 560px at 88% -12%, rgba(123, 92, 255, .16), transparent 62%),
+      radial-gradient(900px 520px at -12% 28%, rgba(251, 114, 153, .10), transparent 60%),
+      radial-gradient(1000px 680px at 50% 112%, rgba(0, 161, 214, .09), transparent 62%),
+      var(--bg);
+    background-attachment: fixed;
+    color: var(--text);
+    font-family: "Segoe UI", "Microsoft YaHei", system-ui, sans-serif;
+  }
+  .wrap > * { animation: rise .55s cubic-bezier(.22, .8, .32, 1) both; }
+  .wrap > *:nth-child(2) { animation-delay: .06s; }
+  .wrap > *:nth-child(3) { animation-delay: .12s; }
+  .wrap > *:nth-child(4) { animation-delay: .18s; }
+  .wrap > *:nth-child(5) { animation-delay: .24s; }
+  @keyframes rise { from { opacity: 0; transform: translateY(12px); } to { opacity: 1; transform: none; } }
+  @media (prefers-reduced-motion: reduce) {
+    .wrap > * { animation: none; }
+  }
+  .wrap { max-width: 1200px; margin: 0 auto; padding: 20px 16px 40px; }
+  header h1 { font-size: 22px; margin: 0; }
+  header h1 span { color: var(--accent); }
+  header p { margin: 6px 0 16px; color: var(--muted); font-size: 13px; line-height: 1.6; }
+  .toolbar {
+    display: flex; flex-wrap: wrap; gap: 12px; align-items: center;
+    background: var(--card); border: 1px solid var(--line);
+    border-radius: 12px; padding: 12px 14px; margin-bottom: 12px;
+  }
+  .field { display: flex; align-items: center; gap: 8px; font-size: 13px; color: var(--muted); }
+  input[type="file"] { font-size: 12px; color: var(--muted); max-width: 250px; }
+  input[type="file"]::file-selector-button {
+    background: #232733; color: var(--text); border: 1px solid var(--line);
+    border-radius: 8px; padding: 6px 12px; margin-right: 8px; cursor: pointer; font-size: 12px;
+  }
+  input[type="file"]::file-selector-button:hover { border-color: var(--accent); color: var(--accent); }
+  .chips { display: flex; flex-wrap: wrap; gap: 8px; margin-left: auto; }
+  .chip {
+    background: #232733; border: 1px solid var(--line); border-radius: 999px;
+    padding: 4px 12px; font-size: 12px; color: var(--muted);
+    max-width: 340px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .chip b { color: var(--text); font-weight: 600; }
+  .btn-folder {
+    display: inline-flex; align-items: center; gap: 6px;
+    background: linear-gradient(135deg, rgba(251, 114, 153, .16), rgba(123, 92, 255, .16));
+    color: var(--text); border: 1px solid rgba(251, 114, 153, .45);
+    border-radius: 8px; padding: 6px 12px; font-size: 12px; font-family: inherit; cursor: pointer;
+    transition: transform .18s ease, box-shadow .18s ease, border-color .18s ease;
+  }
+  .btn-folder:hover { transform: translateY(-1px); border-color: var(--accent); box-shadow: 0 6px 18px -8px rgba(251, 114, 153, .55); }
+  .btn-folder:active { transform: translateY(0) scale(.98); }
+  .btn-folder.attn { border-color: var(--accent); animation: folderAttn 1.1s ease-in-out 4; }
+  @keyframes folderAttn {
+    0%, 100% { box-shadow: 0 0 0 0 rgba(251, 114, 153, 0); }
+    50% { box-shadow: 0 0 0 7px rgba(251, 114, 153, .28); }
+  }
+  .chip-folder { cursor: pointer; border-style: dashed; font-family: inherit; transition: border-color .2s, color .2s; }
+  .chip-folder:hover { border-color: var(--accent); color: var(--text); }
+  .chip-folder.ok { border-style: solid; border-color: rgba(0, 205, 120, .5); color: #7ee2a8; }
+  .chip-folder.pending { border-color: rgba(255, 170, 2, .55); color: #ffcf70; }
+  .chip-folder.flash { animation: chipFlash .9s ease; }
+  @keyframes chipFlash {
+    0% { box-shadow: 0 0 0 0 rgba(251, 114, 153, .55); }
+    100% { box-shadow: 0 0 0 14px rgba(251, 114, 153, 0); }
+  }
+  @media (prefers-reduced-motion: reduce) { .chip-folder.flash { animation: none; } .btn-folder.attn { animation: none; } }
+  /* ---- 桌面版（Tauri）---- */
+  .field-desktop { display: none; }
+  .desktop .field-desktop { display: flex; }
+  #btnOpenVideo, #btnOpenFolder, #btnPlaylist { display: none; }
+  .desktop #btnOpenVideo, .desktop #btnOpenFolder, .desktop #btnPlaylist { display: inline-flex; }
+  .desktop .field-folder, .desktop #chipFolder, .desktop .field-web { display: none; }
+  .playlist {
+    position: fixed; top: 0; right: 0; bottom: 0; width: 330px; max-width: 92vw;
+    background: rgba(20, 22, 28, .97); backdrop-filter: blur(10px);
+    border-left: 1px solid var(--line); z-index: 60;
+    transform: translateX(105%); transition: transform .25s ease;
+    display: flex; flex-direction: column;
+    box-shadow: -18px 0 50px -20px rgba(0, 0, 0, .6);
+  }
+  .playlist.open { transform: translateX(0); }
+  .pl-head {
+    display: flex; align-items: center; gap: 10px;
+    padding: 14px 16px; border-bottom: 1px solid var(--line); font-size: 13px;
+  }
+  .pl-head b { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .pl-head span { color: var(--muted); font-size: 12px; }
+  .pl-head button {
+    background: none; border: 1px solid var(--line); color: var(--muted);
+    border-radius: 6px; width: 26px; height: 26px; cursor: pointer; font-family: inherit;
+  }
+  .pl-head button:hover { color: var(--text); border-color: var(--accent); }
+  .pl-list { list-style: none; margin: 0; padding: 8px; overflow-y: auto; flex: 1; }
+  .pl-list::-webkit-scrollbar { width: 8px; }
+  .pl-list::-webkit-scrollbar-thumb { background: #3a3f4d; border-radius: 4px; }
+  .pl-list::-webkit-scrollbar-thumb:hover { background: var(--accent); }
+  .pl-list::-webkit-scrollbar-track { background: transparent; }
+  .pl-item {
+    display: flex; gap: 8px; align-items: center;
+    padding: 8px 10px; border-radius: 8px; cursor: pointer;
+    font-size: 12px; color: var(--muted); transition: background .15s, color .15s;
+  }
+  .pl-item:hover { background: rgba(251, 114, 153, .08); color: var(--text); }
+  .pl-item.current { background: rgba(251, 114, 153, .16); color: var(--text); }
+  .pl-name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .pl-dan {
+    font-size: 10px; color: #7ee2a8; border: 1px solid rgba(0, 205, 120, .4);
+    padding: 1px 6px; border-radius: 999px; flex: none;
+  }
+  .pl-empty { padding: 20px; text-align: center; color: var(--muted); font-size: 12px; }
+  .stage {
+    position: relative; width: 100%; height: 72vh; min-height: 320px;
+    background: #000; border-radius: 12px; overflow: hidden; border: 1px solid var(--line);
+    box-shadow: 0 24px 70px -28px rgba(251, 114, 153, .28), 0 14px 50px -24px rgba(123, 92, 255, .30);
+  }
+  body.dragging .stage { outline: 2px dashed var(--accent); outline-offset: -6px; }
+  .dropzone {
+    position: absolute; inset: 0; z-index: 9; display: none;
+    align-items: center; justify-content: center;
+    background: rgba(17, 19, 24, .84); backdrop-filter: blur(6px);
+  }
+  body.dragging .dropzone { display: flex; }
+  .dropzone-inner {
+    text-align: center; padding: 34px 46px; border-radius: 16px;
+    border: 2px dashed var(--accent); background: rgba(251, 114, 153, .07);
+    animation: dzPulse 1.2s ease-in-out infinite;
+  }
+  @keyframes dzPulse { 0%, 100% { transform: scale(1); } 50% { transform: scale(1.03); } }
+  .dz-icon { font-size: 40px; color: var(--accent); }
+  .dz-title { font-size: 18px; font-weight: 700; margin-top: 8px; }
+  .dz-sub { font-size: 12px; color: var(--muted); margin-top: 8px; line-height: 1.8; }
+  #player { width: 100%; height: 100%; }
+  .placeholder {
+    position: absolute; inset: 0; z-index: 5; cursor: pointer; text-align: center;
+    display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 12px;
+    padding: 20px;
+    background: radial-gradient(ellipse at center, #1c2029 0%, #101216 75%);
+  }
+  .placeholder.hide { display: none; }
+  .placeholder .icon { font-size: 52px; }
+  .placeholder .title { font-size: 18px; font-weight: 600; }
+  .placeholder .sub { font-size: 13px; color: var(--muted); line-height: 1.8; }
+  footer { margin-top: 14px; color: var(--muted); font-size: 12px; line-height: 1.8; }
+  body.dragover #player { box-shadow: inset 0 0 0 3px rgba(139, 92, 246, .7); }
+  .toast {
+    position: fixed; left: 50%; bottom: 28px; transform: translateX(-50%);
+    background: #232733; border: 1px solid var(--line); color: var(--text);
+    padding: 10px 18px; border-radius: 10px; font-size: 13px;
+    opacity: 0; transition: opacity .25s; pointer-events: none; z-index: 99;
+    width: max-content; max-width: 80vw;
+  }
+  .toast.show { opacity: 1; }
+  /* ---- 加载信息条 ---- */
+  .infobar {
+    display: flex; flex-wrap: wrap; gap: 10px 28px; align-items: baseline;
+    margin-top: 12px; padding: 10px 16px;
+    background: var(--card); border: 1px solid var(--line); border-radius: 12px;
+  }
+  .infobar[hidden] { display: none; }
+  .info-item { display: inline-flex; align-items: baseline; gap: 8px; }
+  .info-k { color: var(--muted); font-size: 11px; letter-spacing: .5px; }
+  .info-v { font-size: 13px; font-weight: 600; font-variant-numeric: tabular-nums; }
+  .info-v.accent { color: var(--accent); }
+  /* ---- 常驻弹幕控制台 ---- */
+  .console {
+    margin-top: 12px; background: var(--card); border: 1px solid var(--line);
+    border-radius: 12px; padding: 12px 14px;
+  }
+  .console-body { border: 0; padding: 0; margin: 0; min-inline-size: 0; }
+  .console-body:disabled { opacity: .45; }
+  .console-head { display: flex; align-items: center; gap: 14px; margin-bottom: 12px; flex-wrap: wrap; }
+  .console-title {
+    font-size: 13px; font-weight: 700; letter-spacing: 1px;
+    background: linear-gradient(90deg, var(--accent), #7b5cff);
+    -webkit-background-clip: text; background-clip: text; color: transparent;
+  }
+  .console-head .spacer { flex: 1; }
+  .btn-reset {
+    background: #232733; border: 1px solid var(--line); color: var(--muted);
+    border-radius: 8px; padding: 5px 14px; font-size: 12px; cursor: pointer; transition: all .15s;
+  }
+  .btn-reset:hover { color: var(--accent); border-color: var(--accent); }
+  .console-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 14px 20px; }
+  .ctl-label { display: flex; justify-content: space-between; align-items: baseline; font-size: 12px; color: var(--muted); margin-bottom: 6px; }
+  .ctl-label output { color: var(--text); font-weight: 600; font-variant-numeric: tabular-nums; }
+  input[type="range"] { -webkit-appearance: none; appearance: none; width: 100%; height: 18px; background: transparent; cursor: pointer; }
+  input[type="range"]::-webkit-slider-runnable-track { height: 4px; border-radius: 2px; background: linear-gradient(90deg, var(--accent), #7b5cff); }
+  input[type="range"]::-webkit-slider-thumb {
+    -webkit-appearance: none; width: 14px; height: 14px; border-radius: 50%;
+    background: #fff; border: 3px solid var(--accent); margin-top: -5px;
+    box-shadow: 0 0 0 0 rgba(251, 114, 153, .25); transition: box-shadow .15s;
+  }
+  input[type="range"]:hover::-webkit-slider-thumb { box-shadow: 0 0 0 5px rgba(251, 114, 153, .2); }
+  input[type="range"]::-moz-range-track { height: 4px; border-radius: 2px; background: linear-gradient(90deg, var(--accent), #7b5cff); }
+  input[type="range"]::-moz-range-thumb { width: 8px; height: 8px; border-radius: 50%; background: #fff; border: 3px solid var(--accent); }
+  .ctl-scale { display: flex; justify-content: space-between; font-size: 10px; color: var(--muted); margin-top: 2px; }
+  select {
+    width: 100%; background: #232733; color: var(--text); border: 1px solid var(--line);
+    border-radius: 8px; padding: 6px 8px; font-size: 12px; cursor: pointer;
+  }
+  select:hover { border-color: var(--accent); }
+  .pill-group { display: flex; flex-wrap: wrap; gap: 6px; }
+  .pill { position: relative; }
+  .pill input { position: absolute; opacity: 0; pointer-events: none; }
+  .pill span {
+    display: inline-block; padding: 5px 12px; border-radius: 999px;
+    border: 1px solid var(--line); background: #232733; color: var(--muted);
+    font-size: 12px; cursor: pointer; transition: all .15s; user-select: none;
+  }
+  .pill span:hover { border-color: var(--accent); color: var(--text); }
+  .pill input:checked + span { background: rgba(251, 114, 153, .16); border-color: var(--accent); color: var(--accent); }
+  .pill input:focus-visible + span { outline: 2px solid var(--accent); outline-offset: 2px; }
+  .switch { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: var(--muted); cursor: pointer; }
+  .switch input { accent-color: var(--accent); width: 15px; height: 15px; cursor: pointer; }
+  /* ---- 页面滚动条 ---- */
+  ::-webkit-scrollbar { width: 10px; height: 10px; }
+  ::-webkit-scrollbar-track { background: var(--bg); }
+  ::-webkit-scrollbar-thumb { background: #2a2e37; border-radius: 5px; border: 2px solid var(--bg); }
+  ::-webkit-scrollbar-thumb:hover { background: var(--accent); }
+  @media (max-width: 768px) {
+    .stage { height: 46vh; }
+    .chips { margin-left: 0; }
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>B<span>player</span> · 本地视频 + 弹幕播放器</h1>
+    <p>与 mybili 相同的播放内核（Artplayer + artplayer-plugin-danmuku），纯本地运行、无需服务器。支持 B 站 XML 弹幕和 mybili 导出的 JSON 弹幕。</p>
+  </header>
+
+  <div class="toolbar">
+    <label class="field field-web">视频
+      <input id="videoInput" type="file" accept="video/*,.mp4,.m4v,.webm,.mov,.mkv,.avi,.ts,.flv,.wmv,.mpg,.mpeg" />
+    </label>
+    <label class="field field-web">弹幕
+      <input id="danmakuInput" type="file" accept=".xml,.json,text/xml,application/json" />
+    </label>
+    <div class="field field-folder">
+      <button type="button" id="linkFolderBtn" class="btn-folder"
+        title="选择视频所在文件夹（或直接把整个文件夹拖入页面）；之后只加载视频也会自动配对同名弹幕">📁 关联弹幕文件夹</button>
+      <input id="folderInput" type="file" webkitdirectory directory multiple
+        style="position:absolute;width:1px;height:1px;opacity:0;pointer-events:none" />
+    </div>
+    <div class="field field-desktop">
+      <button type="button" id="btnOpenVideo" class="btn-folder" title="选择本地视频文件">🎬 打开视频</button>
+      <button type="button" id="btnOpenFolder" class="btn-folder" title="选择剧集文件夹，生成播放列表">📂 打开文件夹</button>
+      <button type="button" id="btnPlaylist" class="btn-folder" title="显示 / 隐藏剧集播放列表">📑 播放列表</button>
+    </div>
+    <div class="chips">
+      <div class="chip" id="chipVideo">未加载视频</div>
+      <div class="chip" id="chipDanmaku">未加载弹幕</div>
+      <button type="button" class="chip chip-folder" id="chipFolder">📁 未关联弹幕文件夹</button>
+    </div>
+  </div>
+
+  <div class="stage" id="stage">
+    <div id="player"></div>
+    <div class="placeholder" id="placeholder">
+      <div class="icon">📺</div>
+      <div class="title">拖入视频文件开始播放</div>
+      <div class="sub">
+        可同时拖入「视频 + 弹幕」两个文件，或点击此处选择视频<br />
+        弹幕支持 B 站 XML（.xml）与 mybili 导出 JSON（.json）<br />
+        点「📁 关联弹幕文件夹」授权一次，或把整个文件夹拖入页面，<br />
+        之后只拖入视频也会自动加载同文件夹下的同名弹幕
+      </div>
+    </div>
+    <div class="dropzone" id="dropzone">
+      <div class="dropzone-inner">
+        <div class="dz-icon">⬇</div>
+        <div class="dz-title">松开加载文件</div>
+        <div class="dz-sub">
+          自动识别视频（mp4 / webm / mov…）与弹幕（B 站 XML / JSON）<br />
+          支持一次拖入两个文件，也可只拖入其中之一<br />
+          拖入整个文件夹 = 关联文件夹，同名弹幕自动配对
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="infobar" id="infobar" hidden>
+    <div class="info-item"><span class="info-k">时长</span><span class="info-v" id="infoDuration">—</span></div>
+    <div class="info-item"><span class="info-k">分辨率</span><span class="info-v" id="infoRes">—</span></div>
+    <div class="info-item"><span class="info-k">视频大小</span><span class="info-v" id="infoSize">—</span></div>
+    <div class="info-item"><span class="info-k">弹幕数量</span><span class="info-v accent" id="infoCount">—</span></div>
+    <div class="info-item"><span class="info-k">弹幕解析</span><span class="info-v" id="infoParse">—</span></div>
+    <div class="info-item"><span class="info-k">当前进度</span><span class="info-v" id="infoTime">—</span></div>
+  </div>
+
+  <div class="console">
+    <fieldset class="console-body" id="consoleFields" disabled>
+      <div class="console-head">
+        <span class="console-title">弹幕控制台</span>
+        <label class="switch"><input type="checkbox" id="ctlVisible" checked /><span>弹幕总开关</span></label>
+        <span class="spacer"></span>
+        <button type="button" class="btn-reset" id="ctlReset">恢复默认</button>
+      </div>
+      <div class="console-grid">
+        <div class="ctl">
+          <div class="ctl-label">滚动速度<output id="outSpeed">—</output></div>
+          <input type="range" id="ctlSpeed" min="0" max="12" step="1" value="3" />
+          <div class="ctl-scale"><span>极慢</span><span>适中</span><span>极快</span></div>
+        </div>
+        <div class="ctl">
+          <div class="ctl-label">弹幕字号<output id="outFont">—</output></div>
+          <input type="range" id="ctlFont" min="12" max="48" step="1" value="25" />
+          <div class="ctl-scale"><span>12px</span><span>48px</span></div>
+        </div>
+        <div class="ctl">
+          <div class="ctl-label">不透明度<output id="outOpacity">—</output></div>
+          <input type="range" id="ctlOpacity" min="10" max="100" step="5" value="100" />
+          <div class="ctl-scale"><span>10%</span><span>100%</span></div>
+        </div>
+        <div class="ctl">
+          <div class="ctl-label">显示区域</div>
+          <select id="ctlMargin">
+            <option value="0">1/4 屏</option>
+            <option value="1">半屏</option>
+            <option value="2">3/4 屏</option>
+            <option value="3">满屏</option>
+          </select>
+        </div>
+        <div class="ctl">
+          <div class="ctl-label">弹幕类型</div>
+          <div class="pill-group">
+            <label class="pill"><input type="checkbox" id="ctlMode0" checked /><span>滚动</span></label>
+            <label class="pill"><input type="checkbox" id="ctlMode1" checked /><span>顶部</span></label>
+            <label class="pill"><input type="checkbox" id="ctlMode2" checked /><span>底部</span></label>
+          </div>
+        </div>
+        <div class="ctl">
+          <div class="ctl-label">行为</div>
+          <div class="pill-group">
+            <label class="pill"><input type="checkbox" id="ctlAnti" checked /><span>防重叠</span></label>
+            <label class="pill"><input type="checkbox" id="ctlSync" /><span>同步播放速度</span></label>
+          </div>
+        </div>
+      </div>
+    </fieldset>
+  </div>
+
+  <aside class="playlist" id="playlist" aria-label="剧集播放列表">
+    <div class="pl-head">
+      <b id="plTitle">📂 播放列表</b>
+      <span id="plCount"></span>
+      <button type="button" id="plClose" title="关闭播放列表">✕</button>
+    </div>
+    <ul class="pl-list" id="plList"></ul>
+  </aside>
+
+  <footer>
+    提示：弹幕开关、滚动速度、字号、显示区域等在播放器右下角「设置」面板中调整，配置自动保存到本机。<br />
+    视频需为浏览器原生支持的格式（MP4/H.264、WebM 等）；MKV / FLV / HEVC 等可能无法播放。<br />
+    注：本地内置的弹幕插件已打性能补丁（状态池 O(1) 操作），可流畅装载 10 万条以上弹幕；原版见 vendor/*.orig.js。<br />
+    同名弹幕自动加载：点「关联弹幕文件夹」授权一次（Chrome / Edge 长期有效，其他浏览器本次会话有效），或直接把整个文件夹拖入页面（本次会话有效）；之后加载视频时自动配对同文件夹下的同名 .xml / .json；点状态胶囊可重新扫描。
+  </footer>
+</div>
+<div class="toast" id="toast"></div>
+
+<script src="vendor/artplayer.js"></script>
+<script src="vendor/artplayer-plugin-danmuku.js"></script>
+<script>
+(function () {
+  'use strict';
+
+  var $ = function (id) { return document.getElementById(id); };
+  var videoInput = $('videoInput');
+  var danmakuInput = $('danmakuInput');
+  var placeholder = $('placeholder');
+  var chipVideo = $('chipVideo');
+  var chipDanmaku = $('chipDanmaku');
+  var toastEl = $('toast');
+
+  var CONFIG_KEY = 'bplayer_danmaku_config';
+  var isMobile = document.documentElement.clientWidth < 768;
+
+  // 细粒度速度步进表（值 = 弹幕滚过一屏的秒数，越大越慢）。
+  // 注入插件的 SPEED 配置，保证任何预设/保存的速度值都有对应标签，
+  // 避免插件原版 findIndex 精确匹配失败时面板标签停留在默认文案。
+  var SPEED_STEPS = [
+    { name: '极慢', value: 10 },
+    { name: '9s', value: 9, hide: true },
+    { name: '8s', value: 8, hide: true },
+    { name: '较慢', value: 7.5 },
+    { name: '7s', value: 7, hide: true },
+    { name: '6s', value: 6, hide: true },
+    { name: '适中', value: 5 },
+    { name: '4s', value: 4, hide: true },
+    { name: '较快', value: 3 },
+    { name: '2.5s', value: 2.5, hide: true },
+    { name: '2s', value: 2, hide: true },
+    { name: '1.5s', value: 1.5, hide: true },
+    { name: '极快', value: 1 }
+  ];
+  var MARGIN_STEPS = [[10, '75%'], [10, '50%'], [10, '25%'], [10, 10]];
+
+  var art = null;               // Artplayer 实例
+  var videoObjectUrl = null;    // 当前视频的 Object URL
+  var danmakuList = [];         // 播放器格式弹幕数组
+  var debugQueue = [];          // 插件内部队列引用（调试/验证用）
+  var toastTimer = null;
+  var attnTimer = null;       // 「关联文件夹」按钮引导脉冲的移除定时器
+  var seekFlushTimer = null;    // seek 清屏防抖
+
+  // 跳转后立即清掉旧画面残留弹幕（插件原版会让旧弹幕滚完才消失）。
+  // 防抖 80ms：拖动进度条连续 seek 时只在落点清一次，避免反复全量回收。
+  function scheduleDanmakuFlush() {
+    clearTimeout(seekFlushTimer);
+    seekFlushTimer = setTimeout(function () {
+      var p = danmakuPlugin();
+      if (p) p.reset();
+    }, 80);
+  }
+
+  function toast(msg, ms) {
+    toastEl.textContent = msg;
+    toastEl.classList.add('show');
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(function () { toastEl.classList.remove('show'); }, ms || 2600);
+  }
+
+  function fmtDuration(sec) {
+    sec = Math.round(sec || 0);
+    var h = Math.floor(sec / 3600), m = Math.floor((sec % 3600) / 60), s = sec % 60;
+    var pad = function (n) { return String(n).padStart(2, '0'); };
+    return h > 0 ? h + ':' + pad(m) + ':' + pad(s) : m + ':' + pad(s);
+  }
+
+  function fmtBytes(n) {
+    if (!isFinite(n) || n <= 0) return '—';
+    if (n >= 1073741824) return (n / 1073741824).toFixed(2) + ' GB';
+    if (n >= 1048576) return (n / 1048576).toFixed(1) + ' MB';
+    return (n / 1024).toFixed(0) + ' KB';
+  }
+
+  /* 信息栏：时长 / 分辨率 / 进度 跟随 video 元素实时更新 */
+  function updateVideoInfo() {
+    var v = document.querySelector('#player video');
+    if (!v) return;
+    var hasDur = isFinite(v.duration) && v.duration > 0;
+    var dur = hasDur ? fmtDuration(v.duration) : '—';
+    $('infoDuration').textContent = dur;
+    $('infoRes').textContent = v.videoWidth ? v.videoWidth + '×' + v.videoHeight : '—';
+    chipVideo.innerHTML = '🎬 <b>' + escapeHtml(currentVideoName) + '</b>' + (hasDur ? ' · ' + dur : '');
+    updateProgressInfo();
+  }
+
+  function updateProgressInfo() {
+    var v = document.querySelector('#player video');
+    if (!v) return;
+    $('infoTime').textContent = fmtDuration(v.currentTime) + ' / ' + (isFinite(v.duration) && v.duration > 0 ? fmtDuration(v.duration) : '—');
+  }
+
+  /* ------------------------------------------------------------------ *
+   * 弹幕解析：规则与 mybili 后端 DanmakuConverterService 完全一致
+   *   time  : 秒（XML 中本就是秒；JSON 导出也是秒）
+   *   mode  : B 站 1-3 滚动→0，5 顶部→1，4 底部→2，6-9 高级→降级滚动
+   *   color : 十进制 → #RRGGBB
+   *   高级弹幕内容为 JSON 数组，取索引 4 的纯文本
+   * ------------------------------------------------------------------ */
+  function convertColor(dec) {
+    var n = Number(dec);
+    if (!isFinite(n)) n = 16777215;
+    return '#' + (n & 0xffffff).toString(16).padStart(6, '0').toUpperCase();
+  }
+
+  function convertMode(m) {
+    m = Number(m);
+    return m === 5 ? 1 : m === 4 ? 2 : 0;
+  }
+
+  function plainText(content) {
+    var t = content.trim();
+    if (t.charAt(0) === '[') {
+      try {
+        var arr = JSON.parse(t);
+        if (Array.isArray(arr) && arr.length > 4 && arr[4] != null) return String(arr[4]);
+      } catch (e) { /* 非高级弹幕，按原文本处理 */ }
+    }
+    return content;
+  }
+
+  function makeItem(time, mode, color, text) {
+    return { text: text, time: time, mode: mode, color: color, border: false, style: {} };
+  }
+
+  function parseBiliXml(xmlText) {
+    var out = [];
+    var doc = null;
+    try {
+      doc = new DOMParser().parseFromString(xmlText, 'text/xml');
+      if (doc.getElementsByTagName('parsererror').length) doc = null;
+    } catch (e) { doc = null; }
+
+    if (doc) {
+      var nodes = doc.getElementsByTagName('d');
+      for (var i = 0; i < nodes.length; i++) {
+        var p = (nodes[i].getAttribute('p') || '').split(',');
+        var text = plainText(nodes[i].textContent || '');
+        if (!text) continue;
+        out.push(makeItem(parseFloat(p[0]) || 0, convertMode(p[1]), convertColor(p[3]), text));
+      }
+    } else {
+      // 容错：XML 含非法字符导致解析失败时，退回正则提取
+      var decode = function (s) {
+        return s
+          .replace(/&#(\d+);/g, function (_, n) { return String.fromCharCode(+n); })
+          .replace(/&lt;/g, '<').replace(/&gt;/g, '>')
+          .replace(/&quot;/g, '"').replace(/&apos;/g, "'")
+          .replace(/&amp;/g, '&');
+      };
+      var re = /<d p="([^"]*)">([\s\S]*?)<\/d>/g;
+      var m;
+      while ((m = re.exec(xmlText))) {
+        var pp = m[1].split(',');
+        var t2 = plainText(decode(m[2]));
+        if (!t2) continue;
+        out.push(makeItem(parseFloat(pp[0]) || 0, convertMode(pp[1]), convertColor(pp[3]), t2));
+      }
+    }
+    out.sort(function (a, b) { return a.time - b.time; });
+    return out;
+  }
+
+  function parseJsonDanmaku(text) {
+    var data = JSON.parse(text);
+    if (!Array.isArray(data)) throw new Error('JSON 弹幕应为数组（mybili 导出格式）');
+    var out = [];
+    for (var i = 0; i < data.length; i++) {
+      var d = data[i] || {};
+      var txt = String(d.text == null ? '' : d.text);
+      if (!txt) continue;
+      var mode = Number(d.mode);
+      out.push(makeItem(
+        Number(d.time) || 0,
+        (mode === 0 || mode === 1 || mode === 2) ? mode : convertMode(d.mode),
+        typeof d.color === 'number' ? convertColor(d.color) : (d.color || '#FFFFFF'),
+        txt
+      ));
+    }
+    out.sort(function (a, b) { return a.time - b.time; });
+    return out;
+  }
+
+  /* ------------------------------------------------------------------ *
+   * 播放器（配置与 mybili Player.vue 对齐，设置持久化到 localStorage）
+   * ------------------------------------------------------------------ */
+  function defaultDanmakuOption() {
+    return {
+      speed: isMobile ? 4 : 7.5,
+      antiOverlap: true,
+      synchronousPlayback: false,
+      fontSize: isMobile ? 14 : 25,
+      theme: 'light',
+      margin: isMobile ? [10, '75%'] : [10, 10],
+      modes: [0, 1, 2]
+    };
+  }
+
+  function loadSavedConfig() {
+    try {
+      var c = JSON.parse(localStorage.getItem(CONFIG_KEY)) || {};
+      if (typeof c.speed === 'number') c.speed = snapSpeed(c.speed);
+      return c;
+    } catch (e) { return {}; }
+  }
+
+  function saveConfig(opt) {
+    try {
+      localStorage.setItem(CONFIG_KEY, JSON.stringify({
+        speed: opt.speed,
+        antiOverlap: opt.antiOverlap,
+        synchronousPlayback: opt.synchronousPlayback,
+        fontSize: opt.fontSize,
+        theme: opt.theme,
+        margin: opt.margin,
+        modes: opt.modes,
+        opacity: opt.opacity
+      }));
+    } catch (e) { /* 隐私模式等场景下忽略 */ }
+  }
+
+  function danmakuPlugin() {
+    return art && art.plugins && art.plugins.artplayerPluginDanmuku;
+  }
+
+  function createPlayer(url) {
+    var option = defaultDanmakuOption();
+    var saved = loadSavedConfig();
+    for (var k in saved) option[k] = saved[k];
+    option.danmuku = danmakuList;
+    option.SPEED = { min: 0, max: SPEED_STEPS.length - 1, steps: SPEED_STEPS };
+
+    art = new Artplayer({
+      container: $('player'),
+      url: url,
+      volume: isMobile ? 1 : 0.5,
+      fullscreen: true,
+      fullscreenWeb: !isMobile,
+      autoOrientation: true,
+      setting: true,
+      playbackRate: true,
+      flip: true,
+      pip: true,
+      miniProgressBar: true,
+      theme: '#fb7299',
+      lang: 'zh-cn',
+      plugins: [artplayerPluginDanmuku(option)]
+    });
+
+    art.on('artplayerPluginDanmuku:config', function (opt) { saveConfig(opt); syncControls(); });
+    art.on('artplayerPluginDanmuku:loaded', function (q) { debugQueue = q; });
+    art.on('video:ended', function () { if (window.__BplayerNext) window.__BplayerNext(); });
+    $('consoleFields').disabled = false;
+    syncControls();
+
+    var v = document.querySelector('#player video');
+    if (v) {
+      v.addEventListener('loadedmetadata', updateVideoInfo);
+      v.addEventListener('durationchange', updateVideoInfo);
+      v.addEventListener('timeupdate', updateProgressInfo);
+      if (v.readyState >= 1) updateVideoInfo(); // 元数据可能已就绪，防止错过事件
+      v.addEventListener('error', function () {
+        toast('视频无法播放：浏览器可能不支持该文件的编码（如 MKV / HEVC）', 5000);
+      });
+      v.addEventListener('seeking', scheduleDanmakuFlush);
+    }
+  }
+
+  var currentVideoName = '';
+  function escapeHtml(s) {
+    return String(s).replace(/[&<>"']/g, function (c) {
+      return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
+    });
+  }
+
+  function setVideoFromUrl(url, name, size) {
+    if (currentVideoName !== name) danmakuLoadToken++; // 作废仍在解析的旧弹幕任务
+    currentVideoName = name;
+    if (!art) {
+      createPlayer(url);
+    } else {
+      art.url = url; // Artplayer 切换视频源
+    }
+    placeholder.classList.add('hide');
+    chipVideo.innerHTML = '🎬 <b>' + escapeHtml(name) + '</b>';
+    document.title = name + ' · Bplayer';
+    // 信息栏：立即显示文件大小，时长/分辨率等元数据就绪后补齐
+    $('infobar').hidden = false;
+    $('infoSize').textContent = size ? fmtBytes(size) : '—';
+    $('infoDuration').textContent = '—';
+    $('infoRes').textContent = '—';
+    $('infoTime').textContent = '—';
+    updateVideoInfo();
+    // 选择文件属于用户手势，可以自动起播
+    try { Promise.resolve(art.play()).catch(function () {}); } catch (e) {}
+  }
+
+  function setVideo(file) {
+    var url = URL.createObjectURL(file);
+    setVideoFromUrl(url, file.name, file.size);
+    if (videoObjectUrl) URL.revokeObjectURL(videoObjectUrl);
+    videoObjectUrl = url;
+    // 已关联文件夹时，自动配对同名弹幕
+    tryAutoDanmaku(file.name);
+    // 浏览器沙箱读不到视频同目录的其他文件：未关联时给出一次性引导，
+    // 避免用户以为「拖入视频就该自动带弹幕」却毫无提示。
+    if (!window.__TAURI__ && !folderLabel && !danmakuSourceName) {
+      toast('浏览器无法直接读取视频同目录的文件：点「📁 关联弹幕文件夹」授权一次，或把整个文件夹拖入页面，之后同名弹幕自动加载', 7000);
+      var b = $('linkFolderBtn');
+      b.classList.remove('attn'); void b.offsetWidth; b.classList.add('attn');
+      clearTimeout(attnTimer);
+      attnTimer = setTimeout(function () { b.classList.remove('attn'); }, 5000);
+    }
+  }
+
+  function applyDanmaku() {
+    var p = danmakuPlugin();
+    if (p) {
+      p.config({ danmuku: danmakuList });
+      p.load();
+    }
+  }
+
+  function applyDanmakuText(name, text, t0) {
+    var list;
+    if (/\.json$/i.test(name)) list = parseJsonDanmaku(text);
+    else list = parseBiliXml(text);
+    danmakuList = list;
+    applyDanmaku();
+    var ms = Math.round(performance.now() - t0);
+    chipDanmaku.innerHTML = '💬 <b>' + list.length.toLocaleString() + '</b> 条弹幕 · ' + ms + 'ms';
+    $('infobar').hidden = false;
+    $('infoCount').textContent = list.length.toLocaleString() + ' 条';
+    $('infoParse').textContent = ms + ' ms';
+    danmakuSourceName = name;
+    toast('已装载 ' + list.length.toLocaleString() + ' 条弹幕');
+  }
+
+  function setDanmakuFile(file) {
+    chipDanmaku.textContent = '💬 解析中…';
+    var token = ++danmakuLoadToken; // 切换视频/清空后，过期解析结果直接丢弃
+    var t0 = performance.now();
+    file.text().then(function (text) {
+      // 先让“解析中”绘制出来，再做重活
+      return new Promise(function (r) { setTimeout(r, 30); }).then(function () {
+        if (token !== danmakuLoadToken) return;
+        applyDanmakuText(file.name, text, t0);
+      });
+    }).catch(function (e) {
+      if (token !== danmakuLoadToken) return;
+      chipDanmaku.textContent = '💬 解析失败';
+      danmakuSourceName = '';
+      toast('弹幕解析失败：' + (e && e.message ? e.message : e), 4500);
+    });
+  }
+
+  function handleFiles(files) {
+    var arr = Array.prototype.slice.call(files || []);
+    var video = null, dan = null;
+    for (var i = 0; i < arr.length; i++) {
+      var f = arr[i];
+      if (!video && (/\.(mp4|m4v|webm|mov|mkv|avi|ts|flv|wmv|mpg|mpeg)$/i.test(f.name) || (f.type && f.type.indexOf('video/') === 0))) video = f;
+      if (!dan && /\.(xml|json)$/i.test(f.name)) dan = f;
+    }
+    if (dan) danmakuSourceName = dan.name; // 批量拖入时手动弹幕优先，避免自动配对重复解析
+    if (video) setVideo(video);
+    if (dan) setDanmakuFile(dan);
+    if (!video && !dan) toast('未识别的文件：请选择视频（mp4 / webm…）或弹幕（xml / json）');
+  }
+
+  /* ------------------------------------------------------------------ *
+   * 同名弹幕自动加载
+   * 浏览器沙箱不允许网页无授权读取同目录文件，因此采用「关联一次文件夹」：
+   *   - Chromium：showDirectoryPicker 授权，handle 存 IndexedDB，跨会话生效
+   *   - 其他浏览器：webkitdirectory 目录选择框兜底（本次会话有效）
+   * 关联后加载视频时，按同名（忽略扩展名与大小写）配对 .xml / .json 弹幕
+   * ------------------------------------------------------------------ */
+  var folderHandle = null;      // FileSystemDirectoryHandle（可持久化）
+  var folderLabel = '';         // 展示用文件夹名
+  var folderPending = false;    // 已存 handle 但尚未授权
+  var folderMap = new Map();    // 小写基名 -> { file, prio }，xml 优先于 json
+  var danmakuSourceName = '';   // 当前弹幕来源文件名（手动优先判重）
+  var danmakuLoadToken = 0;     // 解析任务代际，防止过期解析覆盖新状态
+  var lastNoMatch = '';         // 上次「无同名弹幕」提示的视频基名，避免重复刷屏
+
+  function baseName(n) { return String(n).replace(/\.[^.]+$/, ''); }
+
+  function folderChip() {
+    var el = $('chipFolder');
+    if (!folderLabel) {
+      el.textContent = '📁 未关联弹幕文件夹';
+      el.className = 'chip chip-folder';
+      el.title = '点击选择视频所在文件夹，之后同名弹幕自动加载';
+    } else if (folderPending) {
+      el.textContent = '📁 ' + folderLabel + ' · 待授权';
+      el.className = 'chip chip-folder pending';
+      el.title = '点击授权读取该文件夹';
+    } else {
+      el.textContent = '📁 ' + folderLabel + ' · ' + folderMap.size + ' 个弹幕文件';
+      el.className = 'chip chip-folder ok';
+      el.title = '点击重新扫描文件夹';
+    }
+  }
+
+  function ingestFolderFiles(files, label) {
+    folderMap = new Map();
+    for (var i = 0; i < files.length; i++) {
+      var f = files[i];
+      var m = /\.(xml|json)$/i.exec(f.name);
+      if (!m) continue;
+      var key = baseName(f.name).toLowerCase();
+      var prio = /xml$/i.test(m[1]) ? 0 : 1;
+      var cur = folderMap.get(key);
+      if (!cur || prio < cur.prio) folderMap.set(key, { file: f, prio: prio });
+    }
+    folderLabel = label;
+    folderPending = false;
+    lastNoMatch = '';
+    folderChip();
+    if (currentVideoName) tryAutoDanmaku(currentVideoName);
+  }
+
+  async function scanDirHandle(h) {
+    var files = [];
+    for await (const entry of h.values()) {
+      if (entry.kind === 'file') files.push(await entry.getFile());
+    }
+    return files;
+  }
+
+  /* 拖入整个文件夹时的遍历（FileSystemEntry API，各浏览器通用）。
+     限深 5 层、限 4000 个文件，防止误拖超大目录时卡死页面。 */
+  function readAllEntries(entry) {
+    return new Promise(function (res) {
+      var reader = entry.createReader(), all = [];
+      (function batch() {
+        reader.readEntries(function (es) {
+          if (!es.length) return res(all);
+          all = all.concat(Array.prototype.slice.call(es));
+          batch();
+        }, function () { res(all); });
+      })();
+    });
+  }
+  async function collectEntryFiles(entry, out, depth) {
+    if (out.length >= 4000 || depth > 5) return;
+    if (entry.isFile) {
+      var f = await new Promise(function (res) { entry.file(res, function () { res(null); }); });
+      if (f) out.push(f);
+    } else if (entry.isDirectory) {
+      var es = await readAllEntries(entry);
+      for (var i = 0; i < es.length; i++) await collectEntryFiles(es[i], out, depth + 1);
+    }
+  }
+
+  async function ensureFolderRead() {
+    if (!folderHandle) return false;
+    var p = await folderHandle.queryPermission({ mode: 'read' });
+    if (p !== 'granted') p = await folderHandle.requestPermission({ mode: 'read' });
+    if (p !== 'granted') { folderPending = true; folderChip(); return false; }
+    folderPending = false;
+    return true;
+  }
+
+  async function tryAutoDanmaku(videoName) {
+    var base = baseName(videoName).toLowerCase();
+    if (!base) return;
+    // 存有 handle 但还没授权/扫描：借当前用户手势申请权限
+    if (folderHandle && folderPending) {
+      try {
+        if (!(await ensureFolderRead())) return;
+        ingestFolderFiles(await scanDirHandle(folderHandle), folderHandle.name);
+        return; // ingest 内部会再次触发匹配
+      } catch (e) { folderChip(); return; }
+    }
+    var hit = folderMap.get(base);
+    if (hit) {
+      lastNoMatch = '';
+      if (hit.file.name === danmakuSourceName) return;
+      setDanmakuFile(hit.file);
+      toast('已自动加载同名弹幕：' + hit.file.name);
+      var c = $('chipFolder');
+      c.classList.remove('flash');
+      void c.offsetWidth;
+      c.classList.add('flash');
+      return;
+    }
+    // 新视频没有同名弹幕，而当前弹幕属于别的视频：清空，避免串集
+    if (danmakuSourceName && baseName(danmakuSourceName).toLowerCase() !== base) {
+      clearDanmaku();
+      toast('未找到同名弹幕，已清空上一视频的弹幕');
+      return;
+    }
+    // 已关联但目录里没有同名弹幕：明确告知，便于排查命名不一致
+    if (folderLabel && !folderPending && lastNoMatch !== base) {
+      lastNoMatch = base;
+      toast('文件夹中没有与「' + baseName(videoName) + '」同名的弹幕（.xml / .json）', 4200);
+    }
+  }
+
+  function clearDanmaku() {
+    danmakuLoadToken++;
+    danmakuList = [];
+    danmakuSourceName = '';
+    applyDanmaku();
+    chipDanmaku.textContent = '💬 未加载弹幕';
+    $('infoCount').textContent = '—';
+    $('infoParse').textContent = '—';
+  }
+
+  async function linkFolder() {
+    if (window.showDirectoryPicker) {
+      try {
+        var h = await window.showDirectoryPicker({ mode: 'read' });
+        folderHandle = h;
+        await saveFolderHandle(h);
+        ingestFolderFiles(await scanDirHandle(h), h.name);
+        toast('已关联文件夹「' + h.name + '」，同名弹幕将自动加载');
+        return;
+      } catch (e) {
+        if (e && e.name === 'AbortError') return; // 用户取消
+        // 环境不支持时退回目录选择框
+      }
+    }
+    $('folderInput').click();
+  }
+
+  /* IndexedDB 持久化目录 handle（Chromium 授权跨会话保留） */
+  function openIdb() {
+    return new Promise(function (res, rej) {
+      var rq = indexedDB.open('bplayer', 1);
+      rq.onupgradeneeded = function () { rq.result.createObjectStore('kv'); };
+      rq.onsuccess = function () { res(rq.result); };
+      rq.onerror = function () { rej(rq.error); };
+    });
+  }
+  async function saveFolderHandle(h) {
+    try {
+      var db = await openIdb();
+      db.transaction('kv', 'readwrite').objectStore('kv').put(h, 'danmakuFolder');
+    } catch (e) { /* 隐私模式等场景下忽略持久化失败 */ }
+  }
+  async function loadFolderHandle() {
+    try {
+      var db = await openIdb();
+      return await new Promise(function (res) {
+        var rq = db.transaction('kv').objectStore('kv').get('danmakuFolder');
+        rq.onsuccess = function () { res(rq.result || null); };
+        rq.onerror = function () { res(null); };
+      });
+    } catch (e) { return null; }
+  }
+  async function restoreFolder() {
+    var h = await loadFolderHandle();
+    if (!h) return;
+    folderHandle = h;
+    folderLabel = h.name;
+    folderPending = true;
+    folderChip();
+    try {
+      var p = await h.queryPermission({ mode: 'read' });
+      if (p === 'granted') ingestFolderFiles(await scanDirHandle(h), h.name);
+      else folderChip();
+    } catch (e) {
+      folderHandle = null;
+      folderLabel = '';
+      folderPending = false;
+      folderChip();
+    }
+  }
+
+  /* ---------------------------- 事件绑定 ---------------------------- */
+  videoInput.addEventListener('change', function () {
+    if (videoInput.files && videoInput.files[0]) setVideo(videoInput.files[0]);
+  });
+  danmakuInput.addEventListener('change', function () {
+    if (danmakuInput.files && danmakuInput.files[0]) setDanmakuFile(danmakuInput.files[0]);
+  });
+  $('linkFolderBtn').addEventListener('click', linkFolder);
+  $('folderInput').addEventListener('change', function () {
+    var fs = this.files;
+    if (!fs || !fs.length) return;
+    var label = (fs[0].webkitRelativePath || '').split('/')[0] || '所选文件夹';
+    folderHandle = null; // 兜底路径：仅本次会话有效，不持久化
+    ingestFolderFiles(fs, label);
+    toast('已关联文件夹「' + label + '」（本次会话有效）');
+    this.value = '';
+  });
+  $('chipFolder').addEventListener('click', async function () {
+    if (!folderHandle) { linkFolder(); return; }
+    try {
+      if (!(await ensureFolderRead())) return;
+      ingestFolderFiles(await scanDirHandle(folderHandle), folderHandle.name);
+      toast('已重新扫描「' + folderHandle.name + '」');
+    } catch (e) { folderChip(); }
+  });
+  placeholder.addEventListener('click', function () {
+    if (window.__BplayerDesktop) {
+      window.__TAURI__.core.invoke('pick_video').then(function (p) {
+        if (p) window.__BplayerDesktop.loadVideo(p, null);
+      });
+      return;
+    }
+    videoInput.click();
+  });
+
+  // 拖拽加载：整页可拖入，拖入时显示落放提示层；
+  // 用进入/离开计数避免在子元素间移动时提示层闪烁。
+  var dragDepth = 0;
+  function hasFiles(e) {
+    return e.dataTransfer && Array.prototype.indexOf.call(e.dataTransfer.types || [], 'Files') > -1;
+  }
+  document.addEventListener('dragenter', function (e) {
+    if (!hasFiles(e)) return;
+    e.preventDefault();
+    dragDepth++;
+    document.body.classList.add('dragging');
+  });
+  document.addEventListener('dragover', function (e) {
+    if (!hasFiles(e)) return;
+    e.preventDefault();
+    document.body.classList.add('dragging');
+  });
+  document.addEventListener('dragleave', function (e) {
+    if (!hasFiles(e)) return;
+    dragDepth = Math.max(0, dragDepth - 1);
+    if (!dragDepth) document.body.classList.remove('dragging');
+  });
+  document.addEventListener('drop', function (e) {
+    if (!hasFiles(e)) return;
+    e.preventDefault();
+    dragDepth = 0;
+    document.body.classList.remove('dragging');
+    // 拖入整个文件夹：视为「关联文件夹」（本次会话有效），无需授权弹窗。
+    // 这是除按钮授权外最省事的路径：把视频所在目录拖进来一次即可。
+    var dirs = [];
+    var items = e.dataTransfer.items || [];
+    for (var i = 0; i < items.length; i++) {
+      if (items[i].kind === 'file' && items[i].webkitGetAsEntry) {
+        var en = items[i].webkitGetAsEntry();
+        if (en && en.isDirectory) dirs.push(en);
+      }
+    }
+    if (dirs.length) {
+      var droppedFiles = e.dataTransfer.files;
+      (async function () {
+        var collected = [];
+        for (var d = 0; d < dirs.length; d++) await collectEntryFiles(dirs[d], collected, 0);
+        folderHandle = null; // 拖入关联仅本次会话有效，不持久化
+        ingestFolderFiles(collected, dirs[0].name);
+        toast('已关联拖入的文件夹「' + dirs[0].name + '」· ' + folderMap.size + ' 个弹幕文件（本次会话有效）', 4200);
+        // 文件夹与视频一起拖入时，接着加载视频并自动配对
+        if (droppedFiles && droppedFiles.length) handleFiles(droppedFiles);
+      })();
+      return;
+    }
+    if (e.dataTransfer.files && e.dataTransfer.files.length) handleFiles(e.dataTransfer.files);
+  });
+
+  /* ------------------------- 常驻弹幕控制台 ------------------------- *
+   * 与播放器内设置面板共用同一配置源（plugin.option），
+   * 任何一侧修改都会通过 config 事件同步另一侧，显示值即实际值。 */
+  function speedIndex(v) {
+    var best = 0, dist = Infinity;
+    for (var i = 0; i < SPEED_STEPS.length; i++) {
+      var d = Math.abs(SPEED_STEPS[i].value - v);
+      if (d < dist) { dist = d; best = i; }
+    }
+    return best;
+  }
+
+  function snapSpeed(v) { return SPEED_STEPS[speedIndex(v)].value; }
+
+  function syncControls() {
+    if (!art) return;
+    var o = danmakuPlugin().option;
+    $('ctlVisible').checked = !!o.visible;
+    $('ctlSpeed').value = speedIndex(o.speed);
+    $('outSpeed').textContent = o.speed + 's / 屏';
+    var fs = Math.round(Number(o.fontSize) || 25);
+    $('ctlFont').value = fs;
+    $('outFont').textContent = fs + 'px';
+    var op = Math.round((o.opacity == null ? 1 : o.opacity) * 100);
+    $('ctlOpacity').value = op;
+    $('outOpacity').textContent = op + '%';
+    var mi = -1;
+    for (var i = 0; i < MARGIN_STEPS.length; i++) {
+      if (MARGIN_STEPS[i][0] === o.margin[0] && MARGIN_STEPS[i][1] === o.margin[1]) { mi = i; break; }
+    }
+    $('ctlMargin').value = String(mi < 0 ? 3 : mi);
+    $('ctlMode0').checked = o.modes.indexOf(0) > -1;
+    $('ctlMode1').checked = o.modes.indexOf(1) > -1;
+    $('ctlMode2').checked = o.modes.indexOf(2) > -1;
+    $('ctlAnti').checked = !!o.antiOverlap;
+    $('ctlSync').checked = !!o.synchronousPlayback;
+  }
+
+  function cfg(patch) {
+    var p = danmakuPlugin();
+    if (p) p.config(patch);
+  }
+
+  function bindConsole() {
+    $('ctlSpeed').addEventListener('input', function () { cfg({ speed: SPEED_STEPS[+this.value].value }); });
+    $('ctlFont').addEventListener('input', function () { cfg({ fontSize: +this.value }); });
+    $('ctlOpacity').addEventListener('input', function () { cfg({ opacity: +this.value / 100 }); });
+    $('ctlMargin').addEventListener('change', function () { cfg({ margin: MARGIN_STEPS[+this.value] }); });
+    $('ctlVisible').addEventListener('change', function () { cfg({ visible: this.checked }); });
+    $('ctlAnti').addEventListener('change', function () { cfg({ antiOverlap: this.checked }); });
+    $('ctlSync').addEventListener('change', function () { cfg({ synchronousPlayback: this.checked }); });
+    var modeHandler = function () {
+      var modes = [];
+      if ($('ctlMode0').checked) modes.push(0);
+      if ($('ctlMode1').checked) modes.push(1);
+      if ($('ctlMode2').checked) modes.push(2);
+      cfg({ modes: modes });
+    };
+    $('ctlMode0').addEventListener('change', modeHandler);
+    $('ctlMode1').addEventListener('change', modeHandler);
+    $('ctlMode2').addEventListener('change', modeHandler);
+    $('ctlReset').addEventListener('click', function () {
+      var d = defaultDanmakuOption();
+      d.opacity = 1;
+      d.visible = true;
+      cfg(d);
+    });
+  }
+  /* ------------------------------------------------------------------ *
+   * 桌面版（Tauri）适配层
+   * 脱离浏览器沙箱：拖拽拿到真实路径，主进程直接读盘，
+   * 同名弹幕零授权自动加载；拖入文件夹生成剧集播放列表。
+   * 非 Tauri 环境不执行，网页版行为保持不变。
+   * ------------------------------------------------------------------ */
+  function initDesktop() {
+    document.body.classList.add('desktop');
+    var T = window.__TAURI__;
+    var invoke = T.core.invoke;
+    var playlist = [], playlistDir = '', currentEpIndex = -1;
+
+    function pathName(p) { return String(p).replace(/\\/g, '/').split('/').pop(); }
+    function pathDir(p) { return String(p).replace(/[\\/][^\\/]+$/, ''); }
+    function normPath(p) { return String(p).replace(/\\/g, '/'); }
+    function mediaUrl(p) { return T.core.convertFileSrc(p); }
+
+    function renderPlaylist() {
+      var ul = $('plList');
+      ul.innerHTML = '';
+      if (!playlist.length) {
+        ul.innerHTML = '<li class="pl-empty">拖入整个文件夹，或点「打开文件夹」<br/>生成剧集播放列表</li>';
+      }
+      playlist.forEach(function (ep, i) {
+        var li = document.createElement('li');
+        li.className = 'pl-item' + (i === currentEpIndex ? ' current' : '');
+        li.title = ep.name + (ep.danmaku ? ' · ' + ep.danmaku : ' · 无同名弹幕');
+        var nm = document.createElement('span');
+        nm.className = 'pl-name';
+        nm.textContent = ep.name;
+        li.appendChild(nm);
+        if (ep.danmaku) {
+          var bd = document.createElement('span');
+          bd.className = 'pl-dan';
+          bd.textContent = '弹幕';
+          li.appendChild(bd);
+        }
+        li.addEventListener('click', function () { desktopLoadVideo(ep.path, null, i); });
+        ul.appendChild(li);
+      });
+      $('plCount').textContent = playlist.length ? playlist.length + ' 集' : '';
+    }
+
+    async function loadPlaylist(dir, open) {
+      var scan = await invoke('scan_folder', { dir: dir });
+      playlist = scan.episodes;
+      playlistDir = normPath(dir);
+      $('plTitle').textContent = '📂 ' + scan.label;
+      renderPlaylist();
+      if (open) $('playlist').classList.add('open');
+      return scan;
+    }
+
+    function desktopLoadDanmaku(name, text) {
+      chipDanmaku.textContent = '💬 解析中…';
+      var token = ++danmakuLoadToken;
+      var t0 = performance.now();
+      setTimeout(function () {
+        if (token !== danmakuLoadToken) return;
+        applyDanmakuText(name, text, t0);
+      }, 30);
+    }
+
+    async function desktopLoadVideo(path, manualDanPath, epIndex) {
+      var name = pathName(path);
+      var st = await invoke('fs_stat', { path: path });
+      if (st.kind !== 'file') { toast('文件不存在：' + name); return; }
+      setVideoFromUrl(mediaUrl(path), name, st.size);
+      var dir = pathDir(path);
+      if (epIndex == null) {
+        if (!playlist.length || playlistDir !== normPath(dir)) await loadPlaylist(dir, false);
+        epIndex = -1;
+        for (var i = 0; i < playlist.length; i++) if (normPath(playlist[i].path) === normPath(path)) { epIndex = i; break; }
+      }
+      currentEpIndex = epIndex;
+      renderPlaylist();
+      // 弹幕：手动拖入优先，否则零授权同名配对
+      if (manualDanPath) {
+        desktopLoadDanmaku(pathName(manualDanPath), await invoke('read_text', { path: manualDanPath }));
+      } else {
+        var pair = await invoke('pair_danmaku', { videoPath: path });
+        if (pair) {
+          desktopLoadDanmaku(pair.name, pair.text);
+          toast('已自动加载同名弹幕：' + pair.name);
+        } else {
+          clearDanmaku();
+          toast('「' + baseName(name) + '」同目录没有同名弹幕（.xml / .json）', 4200);
+        }
+      }
+    }
+    window.__BplayerDesktop = { loadVideo: desktopLoadVideo };
+
+    $('btnOpenVideo').addEventListener('click', async function () {
+      var p = await invoke('pick_video');
+      if (p) desktopLoadVideo(p, null);
+    });
+    $('btnOpenFolder').addEventListener('click', async function () {
+      var d = await invoke('pick_folder');
+      if (d) { await loadPlaylist(d, true); toast('已加载播放列表 · ' + playlist.length + ' 集'); }
+    });
+    $('btnPlaylist').addEventListener('click', function () { $('playlist').classList.toggle('open'); });
+    $('plClose').addEventListener('click', function () { $('playlist').classList.remove('open'); });
+
+    // 播完自动下一集
+    window.__BplayerNext = function () {
+      if (currentEpIndex >= 0 && currentEpIndex + 1 < playlist.length) {
+        toast('自动播放下一集：' + playlist[currentEpIndex + 1].name);
+        desktopLoadVideo(playlist[currentEpIndex + 1].path, null, currentEpIndex + 1);
+      }
+    };
+
+    // 拖拽：Tauri 给真实路径（文件夹=播放列表；视频=零授权配对）
+    T.webview.getCurrentWebview().onDragDropEvent(async function (ev) {
+      // 全局 bundle 的回调给的是信封 {event, payload}，兼容解包后的形状
+      var p = ev && ev.payload ? ev.payload : ev;
+      if (!p) return;
+      if (p.type === 'enter' || p.type === 'over') document.body.classList.add('dragover');
+      if (p.type === 'leave' || p.type === 'drop') document.body.classList.remove('dragover');
+      if (p.type !== 'drop' || !p.paths || !p.paths.length) return;
+      var paths = p.paths;
+      var st = await invoke('fs_stat', { path: paths[0] });
+      if (st.kind === 'dir') {
+        var scan = await loadPlaylist(paths[0], true);
+        toast('已加载播放列表「' + scan.label + '」· ' + playlist.length + ' 集');
+        return;
+      }
+      var video = null, dan = null;
+      for (var i = 0; i < paths.length; i++) {
+        var n = pathName(paths[i]);
+        if (!video && /\.(mp4|m4v|webm|mov|mkv|avi|ts|flv|wmv|mpg|mpeg)$/i.test(n)) video = paths[i];
+        if (!dan && /\.(xml|json)$/i.test(n)) dan = paths[i];
+      }
+      if (video) desktopLoadVideo(video, dan);
+      else if (dan) desktopLoadDanmaku(pathName(dan), await invoke('read_text', { path: dan }));
+      else toast('未识别的文件：请拖入视频（mp4 / webm…）或弹幕（xml / json）');
+    });
+
+    placeholder.querySelector('.sub').innerHTML =
+      '拖入视频即开始播放，同目录同名弹幕自动加载（无需任何授权）<br />' +
+      '拖入整个文件夹生成剧集播放列表，点击换集、播完自动下一集<br />' +
+      '弹幕支持 B 站 XML（.xml）与 mybili 导出 JSON（.json）';
+    renderPlaylist();
+  }
+
+  bindConsole();
+  if (window.__TAURI__) {
+    initDesktop();
+  } else {
+    folderChip();
+    restoreFolder();
+  }
+
+  // 便于调试 / 自动化验证
+  window.Bplayer = {
+    get art() { return art; },
+    get danmaku() { return danmakuList; },
+    get queue() { return debugQueue; },
+    get folder() { return { label: folderLabel, pending: folderPending, count: folderMap.size, persisted: !!folderHandle, source: danmakuSourceName }; }
+  };
+})();
+</script>
+</body>
+</html>

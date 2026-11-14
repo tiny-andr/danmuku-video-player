@@ -1,0 +1,6 @@
+{
+  "identifier": "default",
+  "description": "Bplayer 桌面版权限",
+  "windows": ["main"],
+  "permissions": ["core:default"]
+}
