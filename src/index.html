@@ -124,6 +124,13 @@
     width: max-content; max-width: 80vw;
   }
   .toast.show { opacity: 1; }
+  .pill {
+    position: fixed; right: 18px; bottom: 28px;
+    background: #232733; border: 1px solid var(--line); color: var(--text);
+    padding: 8px 14px; border-radius: 10px; font-size: 12px;
+    opacity: 0; transition: opacity .25s; pointer-events: none; z-index: 99;
+  }
+  .pill.show { opacity: 1; pointer-events: auto; cursor: pointer; }
   /* ---- 加载信息条（行尾并入弹幕快捷开关） ---- */
   .infobar {
     display: flex; flex-wrap: wrap; gap: 10px 28px; align-items: center;
@@ -171,6 +178,20 @@
   .block-foot { font-size: 11px; color: var(--muted); line-height: 1.6; }
   .switch { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: var(--muted); cursor: pointer; }
   .switch input { accent-color: var(--accent); width: 15px; height: 15px; cursor: pointer; }
+  /* ---- 音轨菜单（浮窗复用 block-panel 外壳） ---- */
+  .track-item {
+    display: flex; align-items: center; gap: 8px;
+    padding: 8px 10px; border: 1px solid var(--line); border-radius: 8px;
+    background: #232733; color: var(--text); font-size: 12px;
+    cursor: pointer; line-height: 1.5;
+    transition: border-color .15s, color .15s;
+  }
+  .track-item:hover { border-color: var(--accent); }
+  .track-item.current { border-color: var(--accent); color: var(--accent); }
+  .track-item .t-meta { color: var(--muted); font-size: 11px; margin-left: auto; }
+  .track-item.current .t-meta { color: var(--accent); }
+  .track-item.disabled { opacity: .45; cursor: default; }
+  .track-item.disabled:hover { border-color: var(--line); }
   /* ---- 页面滚动条 ---- */
   ::-webkit-scrollbar { width: 10px; height: 10px; }
   ::-webkit-scrollbar-track { background: var(--bg); }
@@ -212,6 +233,8 @@
     <div class="info-item"><span class="info-k">弹幕数量</span><span class="info-v accent" id="infoCount">—</span></div>
     <div class="info-item"><span class="info-k">弹幕解析</span><span class="info-v" id="infoParse">—</span></div>
     <div class="info-item"><span class="info-k">当前进度</span><span class="info-v" id="infoTime">—</span></div>
+    <button type="button" class="btn-block" id="btnSubtitleEntry" title="选择字幕" hidden>📝 字幕</button>
+    <button type="button" class="btn-block" id="btnAudioEntry" title="选择音轨" hidden>🎵 音轨</button>
     <button type="button" class="btn-block" id="btnBlockEntry" title="设置弹幕屏蔽词">🚫 弹幕屏蔽</button>
   </div>
 
@@ -227,6 +250,28 @@
     <div class="block-foot">包含屏蔽词的弹幕将不再显示 · 改动即时生效并自动保存</div>
   </div>
 
+  <div class="block-panel" id="audioPanel" hidden>
+    <div class="block-head">
+      <b>音轨</b>
+      <span class="block-count" id="audioTrackCount"></span>
+      <span class="spacer"></span>
+      <button type="button" id="audioClose" title="关闭">✕</button>
+    </div>
+    <div id="audioTrackList"></div>
+    <div class="block-foot">点击切换音轨 · 首次切换需后台把该音轨转成 AAC 外挂音频</div>
+  </div>
+
+  <div class="block-panel" id="subtitlePanel" hidden>
+    <div class="block-head">
+      <b>字幕</b>
+      <span class="block-count" id="subtitleCount"></span>
+      <span class="spacer"></span>
+      <button type="button" id="subtitleClose" title="关闭">✕</button>
+    </div>
+    <div id="subtitleList"></div>
+    <div class="block-foot">外挂字幕扫描同目录同名/变体文件 · 内嵌文本字幕需后台抽取为 SRT（PGS 图形字幕不支持）</div>
+  </div>
+
   <aside class="playlist" id="playlist" aria-label="剧集播放列表">
     <div class="pl-head">
       <b id="plTitle">📂 播放列表</b>
@@ -237,9 +282,11 @@
   </aside>
 </div>
 <div class="toast" id="toast"></div>
+<div class="pill" id="pill" title="点击取消转码"></div>
 
 <script src="vendor/artplayer.js"></script>
 <script src="vendor/artplayer-plugin-danmuku.js"></script>
+<script src="vendor/artplayer-plugin-audio-track.js"></script>
 <script>
 (function () {
   'use strict';
@@ -249,6 +296,7 @@
   var chipVideo = $('chipVideo');
   var chipDanmaku = $('chipDanmaku');
   var toastEl = $('toast');
+  var pillEl = $('pill');
 
   var CONFIG_KEY = 'bplayer_danmaku_config';
   var isMobile = document.documentElement.clientWidth < 768;
@@ -273,6 +321,7 @@
   ];
 
   var art = null;               // Artplayer 实例
+  var audioTrack = null;        // audio-track 插件接线（外挂音轨的 Audio 元素句柄）
   var danmakuList = [];         // 播放器格式弹幕数组
   var debugQueue = [];          // 插件内部队列引用（调试/验证用）
   var toastTimer = null;
@@ -483,6 +532,9 @@
       lang: 'zh-cn',
       plugins: [artplayerPluginDanmuku(option)]
     });
+
+    // 外挂音轨：audio-track 插件，独立 Audio 元素跟随视频时钟（工厂函数直接接线，不走插件管理器）
+    audioTrack = artplayerPluginAudioTrack({ url: '' })(art);
 
     art.on('artplayerPluginDanmuku:config', function (opt) { saveConfig(opt); });
     art.on('artplayerPluginDanmuku:loaded', function (q) { debugQueue = q; });
@@ -737,11 +789,378 @@
       }, 30);
     }
 
+    // ---- 音轨编码探测 + 外挂音轨（audio-track 插件） ----
+    // 依据实测：DTS/TrueHD/AC-4/DRA/LPCM 内核解不了（无声）；AC-3/E-AC-3 随 WebView2 与系统解码器而定。
+    // 死编码 → 后台把指定音轨转成独立 (音轨N).mka（视频不动，仍从原文件播），audio-track 插件同步外挂；
+    // 已有 (AAC).mkv 整片缓存 → 直接换源自包含播放；只有 AC-3 等不可靠编码 → 仅提示不转换。
+    var probeToken = 0;
+    var transcodeVideo = '';    // 正在转换的源视频（归一化路径）
+    var transcodeOrdinal = -1;  // 正在转换的音轨序号（1-based）
+    var currentVideoPath = '';  // 当前播放的源视频（归一化路径）
+    var externalOrdinal = -1;   // 当前挂载的外挂音轨序号；-1 = 无
+    var probeTracks = null;     // 最近一次探测的音轨列表（仅 audio）
+    var probeDurationUs = null;
+    var fullCacheActive = false; // 已换到自包含 (AAC).mkv 播放
+    var subItems = [];          // 字幕菜单条目（外挂文件 + 内嵌轨 + PGS 占位）
+    var mountedSubId = '';      // 当前挂载的字幕条目 id；'' = 关闭
+    var pendingSub = null;      // 正在后台抽取的内嵌字幕条目
+    var pillLabel = '音轨';     // 当前后台任务的类型标签
+
+    function codecName(c) {
+      if (c.indexOf('A_DTS') === 0) return 'DTS（含 DTS-HD）';
+      if (c === 'A_TRUEHD') return 'TrueHD';
+      if (c === 'A_AC4') return 'AC-4';
+      if (c === 'A_DRA') return 'DRA';
+      if (c === 'A_AC3') return 'AC-3';
+      if (c === 'A_EAC3') return 'E-AC-3';
+      if (c.indexOf('A_PCM') === 0) return 'LPCM';
+      if (c === 'S_TEXT/UTF8' || c === 'S_TEXT/ASCII') return 'SRT';
+      if (c === 'S_TEXT/ASS' || c === 'S_TEXT/SSA') return 'ASS';
+      if (c === 'S_TEXT/WEBVTT') return 'WebVTT';
+      if (c.indexOf('S_HDMV/PGS') === 0) return 'PGS';
+      if (c.indexOf('S_VOBSUB') === 0) return 'VobSub';
+      return c;
+    }
+
+    function classifyAudio(tracks) {
+      var audios = (tracks || []).filter(function (t) { return t.kind === 'audio'; });
+      var res = { count: audios.length, dead: 0, deadNames: [], shakyNames: [], audioIndex: -1 };
+      audios.forEach(function (t, i) {
+        var c = String(t.codec || '').toUpperCase();
+        if (c.indexOf('A_DTS') === 0 || c === 'A_TRUEHD' || c === 'A_AC4' || c === 'A_DRA') { res.dead++; res.deadNames.push(codecName(c)); }
+        else if (c === 'A_AC3' || c === 'A_EAC3' || c.indexOf('A_PCM') === 0) res.shakyNames.push(codecName(c));
+        if (res.audioIndex < 0 && t.default) res.audioIndex = i; // 默认目标：default 音轨，否则第一条
+      });
+      if (res.audioIndex < 0) res.audioIndex = 0;
+      var uniq = function (a) { return a.filter(function (v, i) { return a.indexOf(v) === i; }); };
+      res.deadNames = uniq(res.deadNames);
+      res.shakyNames = uniq(res.shakyNames);
+      return res;
+    }
+
+    function handleAudioCodecs(path, name) {
+      if (!/\.(mkv|mka|webm)$/i.test(name)) return;
+      var token = ++probeToken;
+      invoke('probe_mkv_tracks', { path: path }).then(function (probe) {
+        if (token !== probeToken) return;
+        probeTracks = (probe.tracks || []).filter(function (t) { return t.kind === 'audio'; });
+        probeDurationUs = probe.duration_us || null;
+        refreshAudioMenu();
+        buildSubtitleMenu(path, probe.tracks, token);
+        var c = classifyAudio(probe.tracks);
+        if (!c.count || (!c.dead && !c.shakyNames.length)) return; // 内部音轨可播，不打扰
+        var fullCache = fullAacPath(path);
+        invoke('fs_stat', { path: fullCache }).then(function (st) {
+          if (token !== probeToken) return;
+          if (st.kind === 'file') {
+            switchToAudioCache(path, fullCache, st.size, true); // 整片缓存命中：静默换源
+            return;
+          }
+          if (!c.dead) {
+            toast('音轨编码（' + c.shakyNames.join(' / ') + '）解码不可靠（随 WebView2 版本而定），可能无声', 8000);
+            return;
+          }
+          ensureAudioTrack(path, probeDurationUs, c.audioIndex, c.deadNames.join(' / '));
+        }).catch(function () { });
+      }).catch(function () { });
+    }
+
+    // 确保某条音轨的外挂 mka 存在：命中直接挂载，未命中后台转换完成后挂载
+    function ensureAudioTrack(path, durationUs, audioIdx, label) {
+      var ordinal = audioIdx + 1;
+      invoke('transcode_target', { videoPath: path, audioIndex: audioIdx }).then(function (mkaPath) {
+        if (normPath(currentVideoPath) !== normPath(path)) return;
+        invoke('fs_stat', { path: mkaPath }).then(function (st) {
+          if (normPath(currentVideoPath) !== normPath(path)) return;
+          if (st.kind === 'file') { engageExternalAudio(path, mkaPath, ordinal, true); return; }
+          if (transcodeVideo === normPath(path) && transcodeOrdinal === ordinal) return; // 这条已在转
+          transcodeVideo = normPath(path);
+          transcodeOrdinal = ordinal;
+          updatePill(-1, 0);
+          invoke('transcode_audio_start', { videoPath: path, audioIndex: audioIdx, durationUs: durationUs || null }).then(function () {
+            if (transcodeVideo === normPath(path)) {
+              toast('音轨' + ordinal + '（' + label + '）本内核无法解码，正在后台转换为 AAC 外挂音轨', 6000);
+            }
+          }).catch(function (e) {
+            hidePill();
+            transcodeVideo = '';
+            transcodeOrdinal = -1;
+            toast('音轨转换未能启动：' + e, 8000);
+          });
+        }).catch(function () { });
+      }).catch(function () { });
+    }
+
+    // 挂载外挂音频（audio-track 插件用独立 Audio 元素跟视频同步；原音轨无声，不会打架）
+    function engageExternalAudio(path, mkaPath, ordinal, silent) {
+      if (!audioTrack || normPath(currentVideoPath) !== normPath(path)) return;
+      externalOrdinal = ordinal;
+      audioTrack.update({ url: mediaUrl(mkaPath) });
+      refreshAudioMenu();
+      if (!silent) toast('音轨' + ordinal + ' 外挂音频已挂载');
+    }
+
+    function resetExternalAudio() {
+      if (audioTrack) {
+        try {
+          audioTrack.audio.pause();
+          audioTrack.audio.removeAttribute('src');
+          audioTrack.audio.load();
+        } catch (e) { }
+      }
+      externalOrdinal = -1;
+      refreshAudioMenu();
+    }
+
+    // 换到 (AAC).mkv 整片缓存版：保留播放进度；弹幕/标题仍按原文件
+    function switchToAudioCache(path, cachePath, size, silent) {
+      if (!art || normPath(currentVideoPath) !== normPath(path)) return;
+      resetExternalAudio();
+      fullCacheActive = true;
+      refreshAudioMenu();
+      var t = art.currentTime || 0;
+      art.url = mediaUrl(cachePath);
+      art.once('video:canplay', function () {
+        try { if (t > 0.3) art.currentTime = t; } catch (e) { }
+        try { art.play(); } catch (e) { }
+      });
+      if (size) $('infoSize').textContent = fmtBytes(size);
+      if (!silent) toast('已切换到 AAC 整片缓存版（播放进度保留）');
+    }
+
+    // ---- 音轨菜单（多音轨文件的信息条 🎵 入口） ----
+    function refreshAudioMenu() {
+      var btn = $('btnAudioEntry');
+      var panel = $('audioPanel');
+      if (fullCacheActive || !probeTracks || probeTracks.length < 2) {
+        btn.hidden = true;
+        panel.hidden = true;
+        return;
+      }
+      btn.hidden = false;
+      $('audioTrackCount').textContent = probeTracks.length + ' 条';
+      var list = $('audioTrackList');
+      list.innerHTML = '';
+      probeTracks.forEach(function (t, i) {
+        var ordinal = i + 1;
+        var item = document.createElement('div');
+        item.className = 'track-item' + (externalOrdinal === ordinal ? ' current' : '');
+        var main = document.createElement('span');
+        main.textContent = '音轨' + ordinal + (t.default ? '（默认）' : '');
+        item.appendChild(main);
+        var meta = document.createElement('span');
+        meta.className = 't-meta';
+        meta.textContent = [codecName(String(t.codec || '').toUpperCase()), t.lang].filter(Boolean).join(' · ');
+        item.appendChild(meta);
+        item.addEventListener('click', function () { switchAudioTrack(i); });
+        list.appendChild(item);
+      });
+    }
+
+    function switchAudioTrack(i) {
+      if (fullCacheActive || !probeTracks || !probeTracks[i] || !currentVideoPath) return;
+      $('audioPanel').hidden = true;
+      if (externalOrdinal === i + 1) return;
+      var t = probeTracks[i];
+      var label = codecName(String(t.codec || '').toUpperCase()) || '未知编码';
+      ensureAudioTrack(currentVideoPath, probeDurationUs, i, label);
+    }
+
+    // ---- 字幕：外挂扫描 + 内嵌抽取（artplayer 原生 srt/ass→VTT 管线，asset 协议带 CORS） ----
+    function subSrtPath(p, ordinal) {
+      return String(p).replace(/\.mkv$/i, ' (字幕' + ordinal + ').srt');
+    }
+
+    // 编码探测：严格 UTF-8 解不过就当 GBK（常见中文 srt 是 GBK）
+    function detectEncoding(path) {
+      return invoke('read_bytes', { path: path }).then(function (b64) {
+        var bin = atob(b64);
+        var bytes = new Uint8Array(bin.length);
+        for (var i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+        try { new TextDecoder('utf-8', { fatal: true }).decode(bytes); return 'utf-8'; }
+        catch (e) { return 'gbk'; }
+      }).catch(function () { return null; });
+    }
+
+    function buildSubtitleMenu(path, tracks, token) {
+      invoke('scan_subtitles', { videoPath: path }).then(function (exts) {
+        if (token !== probeToken) return;
+        subItems = [];
+        (exts || []).forEach(function (f) {
+          var ext = f.name.split('.').pop().toLowerCase();
+          subItems.push({
+            id: 'ext:' + f.path,
+            kind: 'ext',
+            name: f.name,
+            path: f.path,
+            type: ext === 'ass' || ext === 'ssa' ? 'ass' : (ext === 'vtt' ? 'vtt' : 'srt'),
+          });
+        });
+        var subOrdinal = 0;
+        (tracks || []).forEach(function (t) {
+          if (t.kind !== 'subtitle') return;
+          subOrdinal++;
+          var c = String(t.codec || '').toUpperCase();
+          var label = t.name || t.lang || ('字幕' + subOrdinal);
+          if (c.indexOf('S_TEXT') === 0) {
+            subItems.push({ id: 'emb:' + subOrdinal, kind: 'embedded', ordinal: subOrdinal, name: '内嵌 ' + label, codecLabel: codecName(c), type: 'srt', default: !!t.default });
+          } else {
+            // PGS / VobSub 等图形字幕：内核无法渲染，菜单里明确标出
+            subItems.push({ id: 'pgs:' + subOrdinal, kind: 'bitmap', name: '内嵌 ' + label + '（' + codecName(c) + ' 图形字幕，不支持）', disabled: true });
+          }
+        });
+        refreshSubtitleMenu();
+        if (!mountedSubId) autoMountSubtitle();
+      }).catch(function () { });
+    }
+
+    function refreshSubtitleMenu() {
+      var btn = $('btnSubtitleEntry');
+      var panel = $('subtitlePanel');
+      if (!subItems.length) {
+        btn.hidden = true;
+        panel.hidden = true;
+        return;
+      }
+      btn.hidden = false;
+      $('subtitleCount').textContent = subItems.length + ' 项';
+      var list = $('subtitleList');
+      list.innerHTML = '';
+      var off = document.createElement('div');
+      off.className = 'track-item' + (mountedSubId === '' ? ' current' : '');
+      off.textContent = '关闭字幕';
+      off.addEventListener('click', unmountSubtitle);
+      list.appendChild(off);
+      subItems.forEach(function (s) {
+        var item = document.createElement('div');
+        if (s.disabled) {
+          item.className = 'track-item disabled';
+          item.textContent = s.name;
+          list.appendChild(item);
+          return;
+        }
+        item.className = 'track-item' + (mountedSubId === s.id ? ' current' : '');
+        var main = document.createElement('span');
+        main.textContent = s.name;
+        item.appendChild(main);
+        var meta = document.createElement('span');
+        meta.className = 't-meta';
+        var bits = [];
+        if (s.kind === 'ext') bits.push('外挂');
+        if (s.kind === 'embedded') bits.push('内嵌');
+        if (s.codecLabel) bits.push(s.codecLabel);
+        else if (s.type) bits.push(s.type.toUpperCase());
+        meta.textContent = bits.join(' · ');
+        item.appendChild(meta);
+        item.addEventListener('click', function () { mountSubtitle(s, false); });
+        list.appendChild(item);
+      });
+    }
+
+    function mountSubtitle(s, silent) {
+      if (s.disabled || !currentVideoPath) return;
+      $('subtitlePanel').hidden = true;
+      if (s.kind === 'ext') {
+        mountSubtitleUrl(mediaUrl(s.path), s, silent);
+        return;
+      }
+      // 内嵌：确保抽取出的 srt 存在，未抽取则后台转一次（完成事件里挂载）
+      var cachePath = subSrtPath(currentVideoPath, s.ordinal);
+      invoke('fs_stat', { path: cachePath }).then(function (st) {
+        if (st.kind === 'file') { mountSubtitleUrl(mediaUrl(cachePath), s, silent); return; }
+        pendingSub = s;
+        pillLabel = '字幕';
+        transcodeVideo = currentVideoPath;
+        transcodeOrdinal = -1;
+        updatePill(-1, 0);
+        invoke('extract_subtitle_start', { videoPath: currentVideoPath, subIndex: s.ordinal - 1, durationUs: probeDurationUs || null }).then(function () {
+          if (transcodeVideo === currentVideoPath && pendingSub === s) toast('正在后台抽取内嵌字幕，完成后自动挂载', 6000);
+        }).catch(function (e) {
+          hidePill();
+          transcodeVideo = '';
+          pendingSub = null;
+          toast('字幕抽取未能启动：' + e, 8000);
+        });
+      }).catch(function () { });
+    }
+
+    function mountSubtitleUrl(url, s, silent) {
+      if (!art) return;
+      var opt = { name: s.name, type: s.type };
+      var encPromise = s.encoding
+        ? Promise.resolve(s.encoding)
+        : (s.kind === 'ext' ? detectEncoding(s.path) : Promise.resolve('utf-8'));
+      encPromise.then(function (enc) {
+        if (enc) { s.encoding = enc; opt.encoding = enc; }
+        return art.subtitle.switch(url, opt);
+      }).then(function () {
+        mountedSubId = s.id;
+        art.subtitle.style({ display: 'block' });
+        refreshSubtitleMenu();
+        if (!silent) toast('已挂载字幕：' + s.name);
+      }).catch(function (e) {
+        toast('字幕加载失败：' + e, 6000);
+      });
+    }
+
+    function unmountSubtitle() {
+      mountedSubId = '';
+      $('subtitlePanel').hidden = true;
+      if (art) art.subtitle.style({ display: 'none' });
+      refreshSubtitleMenu();
+    }
+
+    // 自动挂载：同名/变体外挂 > 默认内嵌文本轨 > 第一条内嵌文本轨 > 第一条外挂
+    function autoMountSubtitle() {
+      var vb = baseName(currentVideoName).toLowerCase();
+      var exact = subItems.filter(function (s) {
+        if (s.kind !== 'ext') return false;
+        var b = baseName(s.name).toLowerCase();
+        return b === vb || b.indexOf(vb + '.') === 0;
+      });
+      var embDefault = subItems.filter(function (s) { return s.kind === 'embedded' && s.default; });
+      var embFirst = subItems.filter(function (s) { return s.kind === 'embedded'; });
+      var extFirst = subItems.filter(function (s) { return s.kind === 'ext'; });
+      var cand = exact[0] || embDefault[0] || embFirst[0] || extFirst[0];
+      if (cand) mountSubtitle(cand, !!exact[0]);
+    }
+
+    function pillText(percent, written) {
+      var s = '⏳ 后台处理' + pillLabel;
+      if (percent >= 0) s += ' ' + Math.round(percent) + '%';
+      if (written) s += ' · ' + fmtBytes(written);
+      return s;
+    }
+    function updatePill(percent, written) {
+      pillEl.textContent = pillText(percent, written);
+      pillEl.classList.add('show');
+    }
+    function hidePill() { pillEl.classList.remove('show'); }
+    pillEl.addEventListener('click', function () {
+      invoke('transcode_audio_cancel').then(function (ok) {
+        if (ok) { hidePill(); transcodeVideo = ''; transcodeOrdinal = -1; pendingSub = null; toast('已取消后台处理'); }
+      });
+    });
+
     async function desktopLoadVideo(path, manualDanPath, epIndex) {
       var name = pathName(path);
       var st = await invoke('fs_stat', { path: path });
       if (st.kind !== 'file') { toast('文件不存在：' + name); return; }
+      currentVideoPath = normPath(path);
+      probeTracks = null;
+      probeDurationUs = null;
+      fullCacheActive = false;
+      subItems = [];
+      mountedSubId = '';
+      pendingSub = null;
+      pillLabel = '音轨';
+      if (art) art.subtitle.style({ display: 'none' }); // 上一部的字幕先藏起来，扫描到新的会自动挂载
+      if (transcodeVideo && transcodeVideo !== currentVideoPath) hidePill(); // 旧任务继续后台跑，胶囊先收起
+      resetExternalAudio();
       setVideoFromUrl(mediaUrl(path), name, st.size);
+      handleAudioCodecs(path, name);
+      // 外挂字幕扫描对全部视频类型生效（内嵌轨只有 MKV 能探测，由 handleAudioCodecs 补齐）
+      if (!/\.(mkv|mka|webm)$/i.test(name)) buildSubtitleMenu(path, null, ++probeToken);
       var dir = pathDir(path);
       if (epIndex == null) {
         if (!playlist.length || playlistDir !== normPath(dir)) await loadPlaylist(dir, false);
@@ -750,11 +1169,12 @@
       }
       currentEpIndex = epIndex;
       renderPlaylist();
-      // 弹幕：手动拖入优先，否则零授权同名配对
+      // 弹幕：手动拖入优先，否则零授权同名配对（直接打开 (AAC) 缓存时按原文件名配对）
       if (manualDanPath) {
         desktopLoadDanmaku(pathName(manualDanPath), await invoke('read_text', { path: manualDanPath }));
       } else {
-        var pair = await invoke('pair_danmaku', { videoPath: path });
+        var pairPath = / \(AAC\)\.mkv$/i.test(name) ? path.replace(/ \(AAC\)\.mkv$/i, '.mkv') : path;
+        var pair = await invoke('pair_danmaku', { videoPath: pairPath });
         if (pair) {
           desktopLoadDanmaku(pair.name, pair.text);
           toast('已自动加载同名弹幕：' + pair.name);
@@ -776,6 +1196,10 @@
     });
     $('btnPlaylist').addEventListener('click', function () { $('playlist').classList.toggle('open'); });
     $('plClose').addEventListener('click', function () { $('playlist').classList.remove('open'); });
+    $('btnAudioEntry').addEventListener('click', function () { $('audioPanel').hidden = !$('audioPanel').hidden; });
+    $('audioClose').addEventListener('click', function () { $('audioPanel').hidden = true; });
+    $('btnSubtitleEntry').addEventListener('click', function () { $('subtitlePanel').hidden = !$('subtitlePanel').hidden; });
+    $('subtitleClose').addEventListener('click', function () { $('subtitlePanel').hidden = true; });
 
     // 播完自动下一集
     window.__BplayerNext = function () {
@@ -809,6 +1233,43 @@
       if (video) desktopLoadVideo(video, dan);
       else if (dan) desktopLoadDanmaku(pathName(dan), await invoke('read_text', { path: dan }));
       else toast('未识别的文件：请拖入视频（mp4 / webm…）或弹幕（xml / json）');
+    });
+
+    // 转码进度/完成/失败事件（Rust 侧 ffmpeg 工作线程发出）
+    T.event.listen('transcode://progress', function (ev) {
+      var p = ev.payload || {};
+      if (normPath(p.video) !== transcodeVideo) return;
+      pillLabel = p.kind === 'subtitle' ? '字幕' : '音轨';
+      updatePill(p.percent, p.written);
+    });
+    T.event.listen('transcode://done', function (ev) {
+      var p = ev.payload || {};
+      hidePill();
+      if (normPath(p.video) !== transcodeVideo) {
+        toast('「' + baseName(pathName(p.video)) + '」后台处理完成');
+        return;
+      }
+      transcodeVideo = '';
+      if (p.kind === 'subtitle') {
+        var s = pendingSub;
+        pendingSub = null;
+        if (s && normPath(currentVideoPath) === normPath(p.video)) {
+          mountSubtitleUrl(mediaUrl(p.out), s, false); // 正播这个文件：直接挂载抽取好的字幕
+        }
+      } else if (transcodeOrdinal > 0) {
+        var ordinal = transcodeOrdinal;
+        transcodeOrdinal = -1;
+        engageExternalAudio(p.video, p.out, ordinal, false); // 正播这个文件：直接挂载外挂音频
+      }
+    });
+    T.event.listen('transcode://error', function (ev) {
+      var p = ev.payload || {};
+      if (normPath(p.video) !== transcodeVideo) return;
+      hidePill();
+      transcodeVideo = '';
+      transcodeOrdinal = -1;
+      pendingSub = null;
+      toast((p.kind === 'subtitle' ? '字幕抽取失败：' : '音轨转换失败：') + (p.message || '未知错误'), 8000);
     });
 
     renderPlaylist();
