@@ -128,10 +128,12 @@ fn ffmpeg_header() -> Vec<String> {
 
 /// 音轨 → AAC 独立 mka。`limit_secs` 仅供测试截短时长。
 /// -readrate 限速：转换期间视频还在同一个盘上播放，全速顺序读会饿死播放起播（HDD 尤甚）。
+/// -ac 2 是硬要求：TrueHD/DTS-HD 常见 8 声道，原样编成 8ch AAC 时 WebView2（Media
+/// Foundation）解码上限只有 6 声道，7.1 会静音 —— 转了等于没转。立体声足够，192k 已富余。
 fn ffmpeg_audio_args(src: &Path, audio_index: usize, out: &Path, limit_secs: Option<u64>) -> Vec<String> {
     let mut a = ffmpeg_header();
     a.extend(["-readrate".into(), "8".into()]);
-    a.extend(["-i".into(), src.to_string_lossy().into_owned(), "-map".into(), format!("0:a:{audio_index}"), "-c:a".into(), "aac".into(), "-b:a".into(), "640k".into()]);
+    a.extend(["-i".into(), src.to_string_lossy().into_owned(), "-map".into(), format!("0:a:{audio_index}"), "-c:a".into(), "aac".into(), "-ac".into(), "2".into(), "-b:a".into(), "192k".into()]);
     if let Some(s) = limit_secs {
         a.push("-t".into());
         a.push(s.to_string());
@@ -247,7 +249,7 @@ fn spawn_job(app: AppHandle, state: tauri::State<'_, JobState>, spec: JobSpec) -
         }
     };
 
-    let (mut child, stdout, stderr) = spawn_ffmpeg(&ffmpeg, &spec.args)?;
+    let (child, stdout, stderr) = spawn_ffmpeg(&ffmpeg, &spec.args)?;
     *state.lock().unwrap() = Some(TranscodeJob { child, gen });
 
     let kind = spec.kind.to_string();
