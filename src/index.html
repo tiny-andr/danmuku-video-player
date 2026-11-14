@@ -178,6 +178,15 @@
   .block-foot { font-size: 11px; color: var(--muted); line-height: 1.6; }
   .switch { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: var(--muted); cursor: pointer; }
   .switch input { accent-color: var(--accent); width: 15px; height: 15px; cursor: pointer; }
+  /* ---- 弹幕密度滑块（浮窗复用 block-panel 外壳） ---- */
+  .block-panel input[type=range] {
+    width: 100%; min-width: 0; margin: 2px 0;
+    accent-color: var(--accent); cursor: pointer;
+  }
+  .density-scale {
+    display: flex; justify-content: space-between;
+    font-size: 10px; color: var(--muted); font-variant-numeric: tabular-nums;
+  }
   /* ---- 音轨菜单（浮窗复用 block-panel 外壳） ---- */
   .track-item {
     display: flex; align-items: center; gap: 8px;
@@ -236,6 +245,20 @@
     <button type="button" class="btn-block" id="btnSubtitleEntry" title="选择字幕" hidden>📝 字幕</button>
     <button type="button" class="btn-block" id="btnAudioEntry" title="选择音轨" hidden>🎵 音轨</button>
     <button type="button" class="btn-block" id="btnBlockEntry" title="设置弹幕屏蔽词">🚫 弹幕屏蔽</button>
+    <button type="button" class="btn-block" id="btnDensityEntry" title="设置每秒最多显示几条弹幕">📊 弹幕密度</button>
+  </div>
+
+  <div class="block-panel" id="densityPanel" hidden>
+    <div class="block-head">
+      <b>弹幕密度</b>
+      <span class="block-count" id="densityValue">不限</span>
+      <span class="spacer"></span>
+      <button type="button" id="densityClose" title="关闭">✕</button>
+    </div>
+    <input type="range" id="densityRange" min="0" max="7" step="1" />
+    <div class="density-scale"><span>不限</span><span>20</span><span>12</span><span>8</span><span>5</span><span>3</span><span>2</span><span>1</span></div>
+    <div class="block-foot" id="densityStat">每秒最多放出几条，超出的直接丢弃</div>
+    <div class="block-foot">改动即时生效并自动保存 · 同屏条数 ≈ 每秒条数 × 速度秒数</div>
   </div>
 
   <div class="block-panel" id="blockPanel" hidden>
@@ -580,7 +603,7 @@
     if (p) {
       // 插件装载队列只读 option.danmuku（插件原始拼写，没有 danmaku 别名）。
       // 传错拼键 config({danmaku:...}) 不会生效，弹幕会一条都不显示。
-      p.config({ danmuku: filterDanmaku(danmakuList) });
+      p.config({ danmuku: densityFilter(filterDanmaku(danmakuList)) });
       p.load();
     }
   }
@@ -722,6 +745,117 @@
     document.addEventListener('keydown', function (e) {
       if (e.key === 'Escape') panel.hidden = true;
     });
+  }
+  /* ------------------------------------------------------------------ *
+   * 弹幕密度：限「每秒最多显示几条」，对整段弹幕逐秒等间隔抽样。
+   * 与屏蔽词叠加时先屏蔽后抽样（被屏蔽的弹幕不占配额）。
+   * 超出的直接丢弃、不延后 —— 延后会让弹幕落到错误的时间点上。
+   * 抽样只依赖已解析的 danmakuList，与速度/字号/显示区域无关。
+   * ------------------------------------------------------------------ */
+  var DENSITY_KEY = 'bplayer_density_config';
+  var DENSITY_STEPS = [0, 20, 12, 8, 5, 3, 2, 1];   // 0 = 不限，单位：条/秒
+  var densityState = { limit: 0 };
+
+  function loadDensityConfig() {
+    try {
+      var c = JSON.parse(localStorage.getItem(DENSITY_KEY));
+      if (c && typeof c.limit === 'number') densityState.limit = densityStep(c.limit);
+    } catch (e) { /* 损坏的配置按「不限」处理 */ }
+  }
+
+  function saveDensityConfig() {
+    try { localStorage.setItem(DENSITY_KEY, JSON.stringify(densityState)); } catch (e) { /* 忽略持久化失败 */ }
+  }
+
+  // 保存值对齐到最近档位（手改过配置文件也不会让滑块落空）
+  function densityStep(v) {
+    var best = 0, dist = Infinity;
+    for (var i = 0; i < DENSITY_STEPS.length; i++) {
+      var d = Math.abs(DENSITY_STEPS[i] - v);
+      if (d < dist) { dist = d; best = i; }
+    }
+    return DENSITY_STEPS[best];
+  }
+
+  function densityLabel(v) { return v ? v + ' 条/秒' : '不限'; }
+
+  function densityFilter(list) {
+    var limit = densityState.limit;
+    if (!limit || !list.length) return list;
+    var out = [], i = 0;
+    while (i < list.length) {
+      var sec = Math.floor(list[i].time);
+      var j = i + 1;
+      while (j < list.length && Math.floor(list[j].time) === sec) j++;
+      var count = j - i;
+      if (count <= limit) {
+        for (var k = i; k < j; k++) out.push(list[k]);
+      } else {
+        // 等间隔抽样：一秒内均匀留 limit 条，密集段不会全挤在开头
+        for (var m = 0; m < limit; m++) out.push(list[i + Math.floor(m * count / limit)]);
+      }
+      i = j;
+    }
+    return out;
+  }
+
+  function updateDensityMeta() {
+    var range = $('densityRange');
+    range.max = String(DENSITY_STEPS.length - 1);
+    range.value = String(Math.max(0, DENSITY_STEPS.indexOf(densityState.limit)));
+    updateDensityLabel();
+    updateDensityStat();
+  }
+
+  // 当前弹幕速度（秒/屏），用来把「每秒条数」换算成「同屏条数」给用户看
+  function currentSpeedSeconds() {
+    var p = danmakuPlugin();
+    return (p && p.option && typeof p.option.speed === 'number') ? p.option.speed : 9;
+  }
+
+  // 拖动时只更新文字（O(1)），不重算全片
+  function updateDensityLabel() {
+    var limit = densityState.limit;
+    var speed = currentSpeedSeconds();
+    $('densityValue').textContent = densityLabel(limit);
+    $('densityStat').textContent = limit
+      ? '每秒最多 ' + limit + ' 条 · 同屏约 ' + Math.round(limit * speed) + ' 条 · 超出直接丢弃'
+      : '不限：整片弹幕全部显示';
+  }
+
+  // 打开面板/松手后统计保留条数（O(n)，14 万条约几十毫秒，只在此时算）
+  function updateDensityStat() {
+    var total = danmakuList.length;
+    var limit = densityState.limit;
+    if (!total) return;
+    var kept = limit ? densityFilter(filterDanmaku(danmakuList)).length : total;
+    $('densityStat').textContent =
+      '全片 ' + total.toLocaleString() + ' 条 → 保留 ' + kept.toLocaleString() + ' 条' +
+      (limit ? ' · 同屏约 ' + Math.round(limit * currentSpeedSeconds()) + ' 条' : '');
+  }
+
+  function applyDensitySettings() {
+    saveDensityConfig();
+    applyDanmaku();      // 按新密度重新抽样装载（未建播放器时是安全空操作）
+    updateDensityMeta();
+  }
+
+  function bindDensityPanel() {
+    var panel = $('densityPanel');
+    $('btnDensityEntry').addEventListener('click', function () {
+      var opening = panel.hidden;
+      panel.hidden = !opening;
+      if (opening) updateDensityMeta();
+    });
+    $('densityClose').addEventListener('click', function () { panel.hidden = true; });
+    // 拖动时只更新文案，松手（change）才重建队列，避免一次拖动装十几次弹幕
+    $('densityRange').addEventListener('input', function () {
+      var v = DENSITY_STEPS[Number(this.value)];
+      if (typeof v !== 'number') return;
+      densityState.limit = v;
+      updateDensityLabel();
+    });
+    $('densityRange').addEventListener('change', function () { applyDensitySettings(); });
   }
   /* ------------------------------------------------------------------ *
    * 桌面版主流程（Tauri）
@@ -1278,6 +1412,8 @@
 
   loadBlockConfig();
   bindBlockPanel();
+  loadDensityConfig();
+  bindDensityPanel();
   initDesktop();
 
   // 便于调试 / 自动化验证
@@ -1286,6 +1422,7 @@
     get danmaku() { return danmakuList; },
     get queue() { return debugQueue; },
     get block() { return { enabled: blockState.enabled, words: blockWords().length }; },
+    get density() { return { limit: densityState.limit, kept: densityFilter(filterDanmaku(danmakuList)).length }; },
     get filter() { return filterDanmaku; }
   };
 })();
