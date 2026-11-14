@@ -997,20 +997,32 @@
       return res;
     }
 
+    // 音轨链路诊断：结果累积在 window.__bplayerDiag，出问题时可从 DevTools 直接读
+    function diag(step, data) {
+      try {
+        var log = window.__bplayerDiag || (window.__bplayerDiag = []);
+        if (log.length > 200) log.shift();
+        log.push(Object.assign({ step: step, at: Math.round(performance.now()) }, data || {}));
+      } catch (e) { }
+    }
+
     function handleAudioCodecs(path, name) {
       if (!/\.(mkv|mka|webm)$/i.test(name)) return;
       var token = ++probeToken;
       invoke('probe_mkv_tracks', { path: path }).then(function (probe) {
-        if (token !== probeToken) return;
+        diag('probe', { token: token, now: probeToken, tracks: (probe.tracks || []).length });
+        if (token !== probeToken) { diag('probe-stale'); return; }
         probeTracks = (probe.tracks || []).filter(function (t) { return t.kind === 'audio'; });
         probeDurationUs = probe.duration_us || null;
-        refreshAudioMenu();
-        buildSubtitleMenu(path, probe.tracks, token);
+        try { refreshAudioMenu(); } catch (e) { diag('menu-err', { err: String(e) }); }
+        try { buildSubtitleMenu(path, probe.tracks, token); } catch (e) { diag('sub-err', { err: String(e) }); }
         var c = classifyAudio(probe.tracks);
-        if (!c.count || (!c.dead && !c.shakyNames.length)) return; // 内部音轨可播，不打扰
+        diag('classify', c);
+        if (!c.count || (!c.dead && !c.shakyNames.length)) { diag('audio-ok-native'); return; }
         var fullCache = fullAacPath(path);
         invoke('fs_stat', { path: fullCache }).then(function (st) {
-          if (token !== probeToken) return;
+          diag('fullcache', { kind: st.kind });
+          if (token !== probeToken) { diag('stat-stale'); return; }
           if (st.kind === 'file') {
             switchToAudioCache(path, fullCache, st.size, true); // 整片缓存命中：静默换源
             return;
@@ -1019,17 +1031,21 @@
             toast('音轨编码（' + c.shakyNames.join(' / ') + '）解码不可靠（随 WebView2 版本而定），可能无声', 8000);
             return;
           }
-          ensureAudioTrack(path, probeDurationUs, c.audioIndex, c.deadNames.join(' / '));
-        }).catch(function () { });
-      }).catch(function () { });
+          diag('ensure', { idx: c.audioIndex });
+          try { ensureAudioTrack(path, probeDurationUs, c.audioIndex, c.deadNames.join(' / ')); }
+          catch (e) { diag('ensure-err', { err: String(e) }); }
+        }).catch(function (e) { diag('fullcache-err', { err: String(e) }); });
+      }).catch(function (e) { diag('probe-err', { err: String(e) }); });
     }
 
     // 确保某条音轨的外挂 mka 存在：命中直接挂载，未命中后台转换完成后挂载
     function ensureAudioTrack(path, durationUs, audioIdx, label) {
       var ordinal = audioIdx + 1;
       invoke('transcode_target', { videoPath: path, audioIndex: audioIdx }).then(function (mkaPath) {
-        if (normPath(currentVideoPath) !== normPath(path)) return;
+        diag('target', { ordinal: ordinal, tail: String(mkaPath).slice(-28) });
+        if (normPath(currentVideoPath) !== normPath(path)) { diag('target-stale'); return; }
         invoke('fs_stat', { path: mkaPath }).then(function (st) {
+          diag('mka-stat', { kind: st.kind });
           if (normPath(currentVideoPath) !== normPath(path)) return;
           if (st.kind === 'file') { engageExternalAudio(path, mkaPath, ordinal, true); return; }
           if (transcodeVideo === normPath(path) && transcodeOrdinal === ordinal) return; // 这条已在转
@@ -1052,9 +1068,11 @@
 
     // 挂载外挂音频（audio-track 插件用独立 Audio 元素跟视频同步；原音轨无声，不会打架）
     function engageExternalAudio(path, mkaPath, ordinal, silent) {
+      diag('engage', { hasTrack: !!audioTrack, samePath: normPath(currentVideoPath) === normPath(path) });
       if (!audioTrack || normPath(currentVideoPath) !== normPath(path)) return;
       externalOrdinal = ordinal;
       audioTrack.update({ url: mediaUrl(mkaPath) });
+      diag('engaged');
       refreshAudioMenu();
       if (!silent) toast('音轨' + ordinal + ' 外挂音频已挂载');
     }
@@ -1070,6 +1088,9 @@
       externalOrdinal = -1;
       refreshAudioMenu();
     }
+
+    // 整片 AAC 缓存路径（同名 + " (AAC).mkv"）：用于命中已有缓存，未命中则走外挂音轨
+    function fullAacPath(p) { return String(p).replace(/\.(mkv|mp4|webm)$/i, ' (AAC).$1'); }
 
     // 换到 (AAC).mkv 整片缓存版：保留播放进度；弹幕/标题仍按原文件
     function switchToAudioCache(path, cachePath, size, silent) {
@@ -1087,7 +1108,7 @@
       if (!silent) toast('已切换到 AAC 整片缓存版（播放进度保留）');
     }
 
-    // ---- 音轨菜单（存在死编码音轨的多轨文件才出现；全可播的文件内核直接播，不做外挂） ----
+    // ---- 音轨菜单（存在死编码音轨就出现；单轨文件也要入口：没得选，但能看到挂载状态/重试） ----
     function hasDeadAudio() {
       return (probeTracks || []).some(function (t) {
         var c = String(t.codec || '').toUpperCase();
@@ -1097,7 +1118,7 @@
     function refreshAudioMenu() {
       var btn = $('btnAudioEntry');
       var panel = $('audioPanel');
-      if (fullCacheActive || !hasDeadAudio() || !probeTracks || probeTracks.length < 2) {
+      if (fullCacheActive || !hasDeadAudio() || !probeTracks || !probeTracks.length) {
         btn.hidden = true;
         panel.hidden = true;
         return;
@@ -1453,6 +1474,7 @@
     get queue() { return debugQueue; },
     get block() { return { enabled: blockState.enabled, words: blockWords().length }; },
     get density() { return { limit: densityState.limit, kept: densityFilter(filterDanmaku(danmakuList)).length }; },
+    get diag() { return window.__bplayerDiag || []; },
     get filter() { return filterDanmaku; }
   };
 })();
