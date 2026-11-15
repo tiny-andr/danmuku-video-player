@@ -14,6 +14,74 @@ use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStderr, ChildStdout, Command, Stdio};
+
+// 子进程不允许新建控制台窗口：ffmpeg.exe 是控制台程序，Tauri 主程序是 GUI 子系统，
+// 不加 CREATE_NO_WINDOW 时 Windows 会给每个 ffmpeg 弹一个黑框（转码、抽字幕时都会闪）。
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+/// 统一的子进程外壳：Windows 上隐藏控制台窗口。
+fn hidden_command(program: impl AsRef<std::ffi::OsStr>) -> Command {
+    let mut cmd = Command::new(program);
+    #[cfg(windows)]
+    cmd.creation_flags(CREATE_NO_WINDOW);
+    cmd
+}
+
+// 子进程绑进带 KILL_ON_JOB_CLOSE 的 Job Object：父进程无论怎么死（点关闭、崩溃、
+// 任务管理器强杀），内核都会连带杀掉 job 里的 ffmpeg。光靠 window 事件回调不够 ——
+// 强杀时回调根本不执行，ffmpeg 会变孤儿继续占磁盘 IO 转两分钟。
+#[cfg(windows)]
+mod job {
+    use std::process::Child;
+    use std::sync::OnceLock;
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows_sys::Win32::System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
+        SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    };
+
+    pub struct JobHandle(HANDLE);
+    unsafe impl Send for JobHandle {}
+    unsafe impl Sync for JobHandle {}
+
+    static JOB: OnceLock<Option<JobHandle>> = OnceLock::new();
+
+    fn job() -> Option<&'static JobHandle> {
+        JOB.get_or_init(|| unsafe {
+            let h = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+            if h.is_null() {
+                return None;
+            }
+            let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
+            info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            let ok = SetInformationJobObject(
+                h,
+                JobObjectExtendedLimitInformation,
+                &info as *const _ as *const core::ffi::c_void,
+                std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+            );
+            if ok == 0 {
+                CloseHandle(h);
+                return None;
+            }
+            Some(JobHandle(h))
+        })
+        .as_ref()
+    }
+
+    /// 把已启动的子进程收进 job；失败只是失去兜底，不影响转码本身
+    pub fn assign(child: &Child) -> bool {
+        use std::os::windows::io::AsRawHandle;
+        match job() {
+            Some(h) => unsafe { AssignProcessToJobObject(h.0, child.as_raw_handle() as HANDLE) != 0 },
+            None => false,
+        }
+    }
+}
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter, Manager};
@@ -100,7 +168,7 @@ fn find_ffmpeg() -> Result<PathBuf, String> {
             return Ok(sibling);
         }
     }
-    let probe = Command::new("ffmpeg")
+    let probe = hidden_command("ffmpeg")
         .arg("-version")
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -154,10 +222,14 @@ fn ffmpeg_sub_args(src: &Path, sub_index: usize, out: &Path) -> Vec<String> {
 /// 拉起 ffmpeg；stdout 是 `-progress` 进度流，stderr 是错误输出。
 /// 两个管道必须立刻有人读，否则缓冲写满 ffmpeg 会被卡死。
 fn spawn_ffmpeg(ffmpeg: &Path, args: &[String]) -> Result<(Child, ChildStdout, ChildStderr), String> {
-    let mut cmd = Command::new(ffmpeg);
+    let mut cmd = hidden_command(ffmpeg);
     cmd.args(args);
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut child = cmd.spawn().map_err(|e| format!("启动 ffmpeg 失败: {e}"))?;
+    #[cfg(windows)]
+    {
+        job::assign(&child);
+    }
     let stdout = child.stdout.take().unwrap();
     let stderr = child.stderr.take().unwrap();
     Ok((child, stdout, stderr))
@@ -380,6 +452,32 @@ pub fn transcode_audio_cancel(state: tauri::State<'_, JobState>) -> bool {
     false
 }
 
+/// 清掉同一部片遗留的半成品：上一次被强杀/崩溃时工作线程来不及删的
+/// `基名 (音轨N).tmp.mka` / `基名 (字幕N).tmp.srt`。只删基名和 `.tmp.` 都匹配的本应用产物。
+#[tauri::command]
+pub fn clean_sidecar_tmp(video_path: String) -> u32 {
+    let vp = Path::new(&video_path);
+    let Some(dir) = vp.parent() else { return 0 };
+    let stem = vp.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+    if stem.is_empty() {
+        return 0;
+    }
+    let prefix = format!("{stem} (");
+    let mut n = 0;
+    if let Ok(rd) = fs::read_dir(dir) {
+        for e in rd.flatten() {
+            let name = e.file_name().to_string_lossy().into_owned();
+            if !name.starts_with(&prefix) || !name.contains(".tmp.") {
+                continue;
+            }
+            let p = e.path();
+            if p.is_file() && fs::remove_file(&p).is_ok() {
+                n += 1;
+            }
+        }
+    }
+    n
+}
 #[cfg(test)]
 mod tests {
     use super::*;

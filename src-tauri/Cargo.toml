@@ -20,6 +20,10 @@ rfd = "0.15"
 libpgs = "0.6"
 png = "0.17"
 
+# ffmpeg 子进程绑进 Job Object：父进程被强杀时内核连带杀掉它们，不留孤儿
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_System_JobObjects", "Win32_System_Threading"] }
+
 [profile.release]
 opt-level = 3
 lto = true

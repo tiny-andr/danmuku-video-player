@@ -268,6 +268,7 @@ pub fn run() {
             transcode::transcode_audio_start,
             transcode::extract_subtitle_start,
             transcode::transcode_audio_cancel,
+            transcode::clean_sidecar_tmp,
             pgs_render::pgs_open,
             pgs_render::pgs_image,
             pgs_render::pgs_close,

@@ -1615,8 +1615,18 @@
       pendingSub = null;
       pillLabel = '音轨';
       if (art) art.subtitle.style({ display: 'none' }); // 上一部的字幕先藏起来，扫描到新的会自动挂载
-      if (transcodeVideo && transcodeVideo !== currentVideoPath) hidePill(); // 旧任务继续后台跑，胶囊先收起
+      // 换片即中断上一部的后台处理（转码/抽字幕）：不让它在后台偷偷跑完占磁盘和 CPU。
+      // 半成品由 Rust 工作线程清理；关窗时另有 window Destroyed 兜底杀进程。
+      if (transcodeVideo && transcodeVideo !== currentVideoPath) {
+        hidePill();
+        try { invoke('transcode_audio_cancel').catch(function () { }); } catch (e) { }
+        transcodeVideo = '';
+        transcodeOrdinal = -1;
+        pendingSub = null;
+      }
       resetExternalAudio();
+      // 上一次被强杀/崩溃会留下 *.tmp.* 半成品，打开这部片时顺手清掉
+      try { invoke('clean_sidecar_tmp', { videoPath: path }).catch(function () { }); } catch (e) { }
       unmountPgs(); // 上一部的位图字幕数据（Rust 侧约 30 MB）随换片释放
       setVideoFromUrl(mediaUrl(path), name, st.size);
       handleAudioCodecs(path, name);
