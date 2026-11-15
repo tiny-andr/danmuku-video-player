@@ -418,7 +418,7 @@
         </div>
       </div>
 
-      <div class="settings-foot">两项自动转换默认关闭，避免在你没打算处理时占用磁盘和 CPU。同目录的外挂字幕、同名弹幕照旧自动加载。</div>
+      <div class="settings-foot">音轨自动转换默认开启：内核解不了的音轨会自动转成外挂 AAC 并静音原轨，不会放出错的轨道。字幕的自动转换要读整片，默认关闭。同目录的外挂字幕、同名弹幕照旧自动加载。</div>
     </div>
   </div>
 <div class="pill" id="pill" data-tip="转码速度取决于硬盘读取速度&#10;点击取消转码"></div>
@@ -441,20 +441,28 @@
 
   var CONFIG_KEY = 'bplayer_danmaku_config';
 
-  /* ---- 应用设置（齿轮页）：两项自动转换默认关闭 ---- */
+  /* ---- 应用设置（齿轮页）：音轨自动转换默认开，字幕默认关 ---- */
   var SETTINGS_KEY = 'bplayer_settings';
-  var appSettings = { autoAudio: false, autoSubtitle: false };
+  var SETTINGS_VER = 2; // 1.2.6 起音轨自动转换改为默认开启；旧存档没有版本号，一律按新默认走一次
+  var appSettings = { autoAudio: true, autoSubtitle: false };
 
   function loadAppSettings() {
     try {
       var c = JSON.parse(localStorage.getItem(SETTINGS_KEY)) || {};
+      if (c.ver !== SETTINGS_VER) return; // 旧版存档：沿用新的默认值
       appSettings.autoAudio = !!c.autoAudio;
       appSettings.autoSubtitle = !!c.autoSubtitle;
-    } catch (e) { /* 配置损坏按默认关闭 */ }
+    } catch (e) { /* 配置损坏按默认值 */ }
   }
 
   function saveAppSettings() {
-    try { localStorage.setItem(SETTINGS_KEY, JSON.stringify(appSettings)); } catch (e) { /* 忽略持久化失败 */ }
+    try {
+      localStorage.setItem(SETTINGS_KEY, JSON.stringify({
+        autoAudio: appSettings.autoAudio,
+        autoSubtitle: appSettings.autoSubtitle,
+        ver: SETTINGS_VER,
+      }));
+    } catch (e) { /* 忽略持久化失败 */ }
   }
 
   loadAppSettings();

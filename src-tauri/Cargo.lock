@@ -684,7 +684,7 @@ dependencies = [
 
 [[package]]
 name = "danmuku-video-player"
-version = "1.2.5"
+version = "1.2.6"
 dependencies = [
  "libpgs",
  "png 0.17.16",
