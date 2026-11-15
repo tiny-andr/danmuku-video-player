@@ -120,6 +120,12 @@ pub struct JobDone {
     pub out: String,
     /// 这一批的全部产物（一次 ffmpeg 调用可能抽出多条字幕轨）
     pub outs: Vec<String>,
+    /// 纯内存字幕：抽取结果直接随事件带回，不落盘
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+    /// 对应哪条字幕轨（0 基序号）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub index: Option<usize>,
 }
 
 #[derive(Serialize, Clone)]
@@ -138,6 +144,8 @@ pub fn mka_cache_path(video: &Path, audio_index: usize) -> PathBuf {
 }
 
 /// 内嵌字幕抽取产物：原基名 (字幕N).srt（N 为 1-based 字幕轨序号）。
+/// 现在内嵌字幕走纯内存，不再写这个文件；保留函数给旧缓存的兼容清理用。
+#[allow(dead_code)]
 pub fn srt_cache_path(video: &Path, sub_index: usize) -> PathBuf {
     let dir = video.parent().unwrap_or_else(|| Path::new("."));
     let stem = video.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
@@ -216,6 +224,7 @@ fn ffmpeg_audio_args(src: &Path, audio_index: usize, out: &Path, limit_secs: Opt
 /// 字幕轨 → SRT（文本轨道统一转 srt，ASS 样式丢弃，与前端 VTT 渲染一致）。
 /// 一次调用可以带多条轨：MKV 的音频块和字幕块遍布每个 cluster，读一遍盘就够，
 /// 每条轨单独起进程会把整部片重读一遍（30 GB 片子 3 条字幕 = 3 遍）。
+#[allow(dead_code)]
 fn ffmpeg_sub_args(src: &Path, subs: &[(usize, PathBuf)]) -> Vec<String> {
     let mut a = ffmpeg_header();
     a.extend(["-i".into(), src.to_string_lossy().into_owned()]);
@@ -397,6 +406,8 @@ fn spawn_job(app: AppHandle, state: tauri::State<'_, JobState>, spec: JobSpec) -
                                 video: video_str,
                                 out: first_out.clone(),
                                 outs: renamed,
+                                text: None,
+                                index: None,
                             },
                         );
                     }
@@ -470,67 +481,121 @@ pub struct SubTrack {
     pub ass: bool,
 }
 
-/// 启动内嵌字幕抽取（文本轨 → SRT）。
-/// 先尝试用 Cues 稀疏 seek 直接抽（一部 28 GB 的片子约 0.2 秒，产物与 ffmpeg 一致）；
-/// Cues 里没有该轨或解析失败时才回退到 ffmpeg 整片扫描。
-/// 返回已经就绪的文件路径，剩下的由后台任务继续。
+/// 抽取好的字幕文本（纯内存交给前端，不落盘）
+#[derive(Serialize, Clone)]
+pub struct SubText {
+    pub index: usize,
+    pub text: String,
+}
+
+/// 抽取内嵌文本字幕，结果**全部走内存**，不产生任何缓存文件。
+/// 有 Cues 索引的片子走稀疏 seek（28 GB 约 0.2 秒）；没有的回退 ffmpeg，
+/// 用 `-f srt pipe:1` 把结果读到内存，同样不落盘（代价是要顺序读整片）。
 #[tauri::command]
-pub fn extract_subtitle_start(
+pub fn extract_subtitle_text(
     app: AppHandle,
     state: tauri::State<'_, JobState>,
     video_path: String,
     subs: Vec<SubTrack>,
     duration_us: Option<u64>,
-) -> Result<Vec<String>, String> {
+) -> Result<Vec<SubText>, String> {
     let src = PathBuf::from(&video_path);
     if !src.is_file() {
         return Err("源视频不存在".into());
     }
-    let mut ready: Vec<String> = Vec::new();
-    let mut targets: Vec<(usize, PathBuf)> = Vec::new();
-    let mut outputs: Vec<(PathBuf, PathBuf)> = Vec::new();
+    let mut ready: Vec<SubText> = Vec::new();
+    let mut pending: Vec<SubTrack> = Vec::new();
 
-    for sub in &subs {
-        let out = srt_cache_path(&src, sub.index);
-        if out.is_file() {
-            ready.push(out.to_string_lossy().into_owned());
-            continue;
-        }
-        let mut written = false;
-        if let Ok(srt) = crate::mkv_sub::sparse_extract_srt(&src, sub.track, sub.ass) {
-            if !srt.trim().is_empty() {
-                let tmp = tmp_path(&out);
-                if fs::write(&tmp, srt.as_bytes()).is_ok() && fs::rename(&tmp, &out).is_ok() {
-                    ready.push(out.to_string_lossy().into_owned());
-                    written = true;
-                } else {
-                    let _ = fs::remove_file(&tmp);
-                }
-            }
-        }
-        if !written {
-            let tmp = tmp_path(&out);
-            targets.push((sub.index, tmp.clone()));
-            outputs.push((tmp, out));
+    for sub in subs {
+        match crate::mkv_sub::sparse_extract_srt(&src, sub.track, sub.ass) {
+            Ok(srt) if !srt.trim().is_empty() => ready.push(SubText { index: sub.index, text: srt }),
+            _ => pending.push(sub),
         }
     }
 
-    if !outputs.is_empty() {
-        let args = ffmpeg_sub_args(&src, &targets);
-        // 后台任务，产物稍后才 rename 出来，不能算进「已就绪」返回值
-        spawn_job(
-            app,
-            state,
-            JobSpec {
-                kind: "subtitle",
-                video: video_path,
-                args,
-                outputs,
-                duration_us,
-            },
-        )?;
+    // 没被稀疏抽出来的那条交给 ffmpeg，结果从 stdout 读回，仍然不写文件。
+    // 一次只跑一条：字幕走 pipe:1，一个进程只能有一个 stdout。
+    if let Some(first) = pending.into_iter().next() {
+        spawn_text_job(app, state, video_path, first, duration_us)?;
     }
     Ok(ready)
+}
+
+fn spawn_text_job(
+    app: AppHandle,
+    state: tauri::State<'_, JobState>,
+    video: String,
+    sub: SubTrack,
+    _duration_us: Option<u64>,
+) -> Result<(), String> {
+    let ffmpeg = find_ffmpeg()?;
+    let args: Vec<String> = vec![
+        "-hide_banner".into(),
+        "-loglevel".into(),
+        "error".into(),
+        "-nostdin".into(),
+        "-i".into(),
+        video.clone(),
+        "-map".into(),
+        format!("0:s:{}", sub.index),
+        "-c:s".into(),
+        "srt".into(),
+        "-f".into(),
+        "srt".into(),
+        "pipe:1".into(),
+    ];
+
+    let gen = {
+        let mut guard = state.lock().unwrap();
+        match guard.take() {
+            Some(mut old) => {
+                let _ = old.child.kill();
+                let _ = old.child.wait();
+                old.gen.wrapping_add(1)
+            }
+            None => 1,
+        }
+    };
+
+    let (child, stdout, stderr) = spawn_ffmpeg(&ffmpeg, &args)?;
+    *state.lock().unwrap() = Some(TranscodeJob { child, gen });
+
+    let index = sub.index;
+    let video_str = video;
+    let app2 = app.clone();
+    std::thread::spawn(move || {
+        let err_thread = std::thread::spawn(move || drain_stderr(stderr));
+        let mut raw = Vec::new();
+        let mut reader = BufReader::new(stdout);
+        use std::io::Read as _;
+        let _ = reader.read_to_end(&mut raw);
+        let err_tail = err_thread.join().unwrap_or_default();
+        let srt = String::from_utf8_lossy(&raw).into_owned();
+
+        let status = app2.state::<JobState>().lock().unwrap().take_if(|j| j.gen == gen);
+        let Some(mut job) = status else { return }; // 被取消/让位
+        let ok = job.child.wait().map(|s| s.success()).unwrap_or(false);
+        if ok && !srt.trim().is_empty() {
+            let _ = app2.emit(
+                "transcode://done",
+                JobDone {
+                    kind: "subtitle".into(),
+                    video: video_str,
+                    out: String::new(),
+                    outs: Vec::new(),
+                    text: Some(srt),
+                    index: Some(index),
+                },
+            );
+        } else {
+            let msg = if srt.trim().is_empty() { "没有可抽取的字幕内容".to_string() } else { last_err_line(&err_tail) };
+            let _ = app2.emit(
+                "transcode://error",
+                JobError { kind: "subtitle".into(), video: video_str, out: String::new(), message: msg },
+            );
+        }
+    });
+    Ok(())
 }
 
 /// 取消当前任务（若有）。半成品由工作线程清理。

@@ -322,7 +322,7 @@ pub fn run() {
             probe_mkv_tracks,
             transcode::transcode_target,
             transcode::transcode_audio_start,
-            transcode::extract_subtitle_start,
+            transcode::extract_subtitle_text,
             transcode::transcode_audio_cancel,
             transcode::clean_sidecar_tmp,
             autostart::get_autostart,

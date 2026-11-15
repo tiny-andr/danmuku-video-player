@@ -410,11 +410,11 @@
 
       <div class="settings-row">
         <label><input type="checkbox" id="optAutoSubtitle" /> 自动转换不支持的字幕</label>
-        <div class="settings-desc">开片时自动抽取内嵌文本字幕轨。抽取要顺序读一遍整个视频文件（40 GB 约 4 分钟），所以默认关闭；需要时在「字幕」菜单里手动选。PGS 位图字幕走即时解码，不受此项影响。</div>
+        <div class="settings-desc">开片时自动抽取内嵌文本字幕轨。有 Cues 索引的片子约 0.2 秒，没有的要顺序读一遍整个文件（40 GB 约 4 分钟），所以默认关闭；需要时在「字幕」菜单里手动选。PGS 位图字幕走即时解码，不受此项影响。</div>
         <div class="settings-path">
-          <span>产物：视频同目录 · <code>原片名 (字幕N).srt</code></span>
-          <span class="where" id="whereSub">—</span>
-          <button type="button" class="path-btn" id="openSubDir" disabled>打开位置</button>
+          <span>内嵌字幕只读进内存，<b>不写任何文件</b></span>
+          <span class="where" id="whereSub">旧的 (字幕N).srt 缓存可在此清理</span>
+          <button type="button" class="path-btn" id="openSubDir" disabled>打开视频目录</button>
         </div>
       </div>
 
@@ -1505,44 +1505,61 @@
         mountSubtitleUrl(mediaUrl(s.path), s, silent);
         return;
       }
-      // 内嵌：确保抽取出的 srt 存在，未抽取则后台转一次（完成事件里挂载）
-      var cachePath = subSrtPath(currentVideoPath, s.ordinal);
-      invoke('fs_stat', { path: cachePath }).then(function (st) {
-        if (st.kind === 'file') { mountSubtitleUrl(mediaUrl(cachePath), s, silent); return; }
-        pendingSub = s;
-        pillLabel = '字幕';
-        transcodeVideo = currentVideoPath;
-        transcodeOrdinal = -1;
-        updatePill(-1, 0);
-        // 一次把本片所有文本字幕轨都抽出来：读盘只读一遍，切别的语言就不用再等
-        var batch = subItems.filter(function (x) { return x.kind === 'embedded' && x.track; })
-          .map(function (x) { return { index: x.ordinal - 1, track: x.track, ass: x.codecLabel === 'ASS' }; });
-        if (!batch.some(function (b) { return b.index === s.ordinal - 1; })) {
-          batch.push({ index: s.ordinal - 1, track: s.track, ass: s.codecLabel === 'ASS' });
-        }
-        invoke('extract_subtitle_start', { videoPath: currentVideoPath, subs: batch, durationUs: probeDurationUs || null }).then(function () {
-          // 有 Cues 索引的片子是同步抽好的（毫秒级），直接挂；否则等后台任务
-          var wantPath = normPath(currentVideoPath);
-          var target = subSrtPath(currentVideoPath, s.ordinal);
-          invoke('fs_stat', { path: target }).then(function (st) {
-            if (normPath(currentVideoPath) !== wantPath) return; // 已经换片
-            if (st.kind === 'file') {
-              pendingSub = null;
-              hidePill();
-              transcodeVideo = '';
-              transcodeOrdinal = -1;
-              mountSubtitleUrl(mediaUrl(target), s, false);
-            } else if (transcodeVideo === currentVideoPath && pendingSub === s) {
-              toast('正在后台抽取内嵌字幕（本片 ' + batch.length + ' 条文本轨一次读完），完成后自动挂载', 7000);
-            }
-          }).catch(function () { });
-        }).catch(function (e) {
+      // 内嵌：整条链走内存，不产生缓存文件
+      pendingSub = s;
+      pillLabel = '字幕';
+      transcodeVideo = currentVideoPath;
+      transcodeOrdinal = -1;
+      updatePill(-1, 0);
+      // 一次把本片所有文本字幕轨都抽出来：有 Cues 索引时每条只要毫秒级
+      var batch = subItems.filter(function (x) { return x.kind === 'embedded' && x.track; })
+        .map(function (x) { return { index: x.ordinal - 1, track: x.track, ass: x.codecLabel === 'ASS' }; });
+      if (!batch.some(function (b) { return b.index === s.ordinal - 1; })) {
+        batch.push({ index: s.ordinal - 1, track: s.track, ass: s.codecLabel === 'ASS' });
+      }
+      invoke('extract_subtitle_text', { videoPath: currentVideoPath, subs: batch, durationUs: probeDurationUs || null }).then(function (got) {
+        var want = normPath(currentVideoPath);
+        var hit = (got || []).filter(function (x) { return x.index === s.ordinal - 1; })[0];
+        if (hit) {
+          pendingSub = null;
           hidePill();
           transcodeVideo = '';
-          pendingSub = null;
-          toast('字幕抽取未能启动：' + e, 8000);
-        });
-      }).catch(function () { });
+          transcodeOrdinal = -1;
+          if (normPath(currentVideoPath) === want) mountSubtitleText(hit.text, s, silent);
+        } else {
+          // 稀疏抽不出来：ffmpeg 管道后台跑，完成事件里带回文本。
+          // pendingSub / transcodeVideo 要留着，done 事件靠它们认领。
+          toast('正在后台抽取内嵌字幕，完成后自动挂载', 7000);
+        }
+      }).catch(function (e) {
+        hidePill();
+        transcodeVideo = '';
+        pendingSub = null;
+        toast('字幕抽取未能启动：' + e, 8000);
+      });
+    }
+
+    // 内存里的字幕文本直接交给播放器，用完释放上一个 blob
+    var lastSubBlobUrl = '';
+    function mountSubtitleText(text, s, silent) {
+      if (!art) return;
+      if (lastSubBlobUrl) { try { URL.revokeObjectURL(lastSubBlobUrl); } catch (e) { } lastSubBlobUrl = ''; }
+      var url;
+      try {
+        url = URL.createObjectURL(new Blob([text], { type: 'text/plain;charset=utf-8' }));
+        lastSubBlobUrl = url;
+      } catch (e) {
+        toast('字幕加载失败：' + e, 6000);
+        return;
+      }
+      art.subtitle.switch(url, { name: s.name, type: 'srt', encoding: 'utf-8' }).then(function () {
+        mountedSubId = s.id;
+        art.subtitle.style({ display: 'block' });
+        refreshSubtitleMenu();
+        if (!silent) toast('已挂载字幕：' + s.name);
+      }).catch(function (e) {
+        toast('字幕加载失败：' + e, 6000);
+      });
     }
 
     function mountSubtitleUrl(url, s, silent) {
@@ -1889,11 +1906,12 @@
       $('optAutostart').checked = !!on;
     }).catch(function () { $('optAutostart').checked = false; });
     fillSidecarPath($('whereAudio'), $('openAudioDir'), /\.mka$/i);
-    fillSidecarPath($('whereSub'), $('openSubDir'), /\.srt$/i);
+    // 字幕不再落盘，这里只用来定位旧版留下的 (字幕N).srt
+    fillSidecarPath($('whereSub'), $('openSubDir'), /\.srt$/i, true);
   }
 
   // 缓存产物就在视频旁边，把目录和数量显示出来，方便用户自己清
-  function fillSidecarPath(whereEl, btnEl, wantExt) {
+  function fillSidecarPath(whereEl, btnEl, wantExt, legacyOnly) {
     if (!currentVideoPath) {
       whereEl.textContent = '打开视频后显示';
       whereEl.title = '';
@@ -1905,13 +1923,13 @@
     invoke('sidecar_cache_files', { videoPath: currentVideoPath }).then(function (files) {
       var hit = (files || []).filter(function (p) { return wantExt.test(p); });
       if (hit.length) {
-        whereEl.textContent = dir + '（' + hit.length + ' 个）';
+        whereEl.textContent = (legacyOnly ? '旧缓存 ' : '') + dir + '（' + hit.length + ' 个）';
         whereEl.title = hit.join('\n');
         btnEl.dataset.path = hit[0];
       } else {
-        whereEl.textContent = dir + '（暂无）';
+        whereEl.textContent = legacyOnly ? '没有旧的字幕缓存' : dir + '（暂无）';
         whereEl.title = dir;
-        btnEl.dataset.path = dir; // 没产物也让他打开片子目录看看
+        btnEl.dataset.path = dir;
       }
       btnEl.disabled = false;
     }).catch(function () {
@@ -2037,9 +2055,9 @@
       if (p.kind === 'subtitle') {
         var s = pendingSub;
         pendingSub = null;
-        if (s && normPath(currentVideoPath) === normPath(p.video)) {
-          // 一次抽一批，按本项目标轨的缓存路径挂载（不依赖事件里的第一个产物）
-          mountSubtitleUrl(mediaUrl(subSrtPath(currentVideoPath, s.ordinal)), s, false);
+        if (s && p.text && normPath(currentVideoPath) === normPath(p.video)) {
+          // 字幕走内存：ffmpeg 管道抽出的文本随事件带回，直接挂载
+          mountSubtitleText(p.text, s, false);
         }
       } else if (transcodeOrdinal > 0) {
         var ordinal = transcodeOrdinal;
