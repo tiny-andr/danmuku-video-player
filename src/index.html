@@ -1066,11 +1066,42 @@
       }).catch(function () { });
     }
 
+    // 外挂音轨接管音频时，用 WebAudio（gain=0）隔离 <video> 的音频输出。
+    // DTS / DTS-HD 这类编码 WebView2 自己能解核心音轨，不隔离就会和外挂 AAC 双声
+    // （实测潘神：video 的元素解码字节数持续增长，说明它确实在出声）。
+    // 只改音频管线，不动 video.volume / muted —— 音量图标和滑块仍是真实状态。
+    var audioSplitter = null;
+
+    function isolateVideoAudio() {
+      if (audioSplitter || !art || !art.video) return;
+      try {
+        var Ctx = window.AudioContext || window.webkitAudioContext;
+        if (!Ctx) return;
+        var ctx = new Ctx();
+        var srcNode = ctx.createMediaElementSource(art.video);
+        var gain = ctx.createGain();
+        gain.gain.value = 0;
+        srcNode.connect(gain);
+        gain.connect(ctx.destination);
+        if (ctx.state === 'suspended') { ctx.resume().catch(function () { }); }
+        audioSplitter = { ctx: ctx, gain: gain };
+        diag('video-audio-isolated');
+      } catch (e) {
+        diag('video-audio-isolate-fail', { err: String(e) });
+      }
+    }
+
+    function releaseVideoAudio() {
+      if (!audioSplitter) return;
+      try { audioSplitter.gain.gain.value = 1; } catch (e) { }
+    }
+
     // 挂载外挂音频（audio-track 插件用独立 Audio 元素跟视频同步；原音轨无声，不会打架）
     function engageExternalAudio(path, mkaPath, ordinal, silent) {
       diag('engage', { hasTrack: !!audioTrack, samePath: normPath(currentVideoPath) === normPath(path) });
       if (!audioTrack || normPath(currentVideoPath) !== normPath(path)) return;
       externalOrdinal = ordinal;
+      isolateVideoAudio();
       audioTrack.update({ url: mediaUrl(mkaPath) });
       diag('engaged');
       refreshAudioMenu();
@@ -1078,6 +1109,7 @@
     }
 
     function resetExternalAudio() {
+      releaseVideoAudio();
       if (audioTrack) {
         try {
           audioTrack.audio.pause();
