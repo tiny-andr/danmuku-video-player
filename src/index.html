@@ -1192,7 +1192,7 @@
           if (st.kind === 'file') { engageExternalAudio(path, mkaPath, ordinal, true); return; }
           if (!manual && !appSettings.autoAudio) {
             toast('音轨' + ordinal + '（' + label + '）内核无法解码，且没有现成的外挂音轨，已静音。'
-              + '需要声音请到「音轨」菜单点这条轨道开始转换', 9000);
+              + '需要声音请到「音轨」菜单点这条轨道开始转换；也可以在设置中开启自动音轨处理', 9000);
             return;
           }
           if (transcodeVideo === normPath(path) && transcodeOrdinal === ordinal) return; // 这条已在转
