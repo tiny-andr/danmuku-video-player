@@ -229,6 +229,27 @@
     accent-color: var(--accent); width: 16px; height: 16px; cursor: pointer;
   }
   .settings-desc { font-size: 11px; color: var(--muted); line-height: 1.65; padding-left: 24px; }
+  .settings-path {
+    font-size: 11px; color: var(--muted); line-height: 1.7; padding-left: 24px;
+    display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  }
+  .settings-path code {
+    font-family: Consolas, "Courier New", monospace; font-size: 10.5px;
+    background: #232733; border: 1px solid var(--line); border-radius: 4px;
+    padding: 1px 5px; color: var(--text);
+  }
+  .settings-path .where {
+    color: var(--text); max-width: 240px;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    direction: rtl; text-align: left;
+  }
+  .settings-path .path-btn {
+    background: none; border: 1px solid var(--line); color: var(--muted);
+    border-radius: 6px; padding: 2px 9px; font-size: 11px; font-family: inherit;
+    cursor: pointer; transition: color .15s, border-color .15s;
+  }
+  .settings-path .path-btn:hover:not(:disabled) { color: var(--accent); border-color: var(--accent); }
+  .settings-path .path-btn:disabled { opacity: .4; cursor: default; }
   .settings-foot {
     font-size: 11px; color: var(--muted); line-height: 1.65;
     border-top: 1px solid var(--line); padding-top: 10px;
@@ -380,11 +401,21 @@
       <div class="settings-row">
         <label><input type="checkbox" id="optAutoAudio" /> 自动转换不支持的音轨</label>
         <div class="settings-desc">开片时若音轨内核解不了（DTS / TrueHD / AC-4 等），后台转成 AAC 外挂音轨。关闭后不自动转，需要在「音轨」菜单里点那条轨道才开始。</div>
+        <div class="settings-path">
+          <span>产物：视频同目录 · <code>原片名 (音轨N).mka</code></span>
+          <span class="where" id="whereAudio">—</span>
+          <button type="button" class="path-btn" id="openAudioDir" disabled>打开位置</button>
+        </div>
       </div>
 
       <div class="settings-row">
         <label><input type="checkbox" id="optAutoSubtitle" /> 自动转换不支持的字幕</label>
         <div class="settings-desc">开片时自动抽取内嵌文本字幕轨。抽取要顺序读一遍整个视频文件（40 GB 约 4 分钟），所以默认关闭；需要时在「字幕」菜单里手动选。PGS 位图字幕走即时解码，不受此项影响。</div>
+        <div class="settings-path">
+          <span>产物：视频同目录 · <code>原片名 (字幕N).srt</code></span>
+          <span class="where" id="whereSub">—</span>
+          <button type="button" class="path-btn" id="openSubDir" disabled>打开位置</button>
+        </div>
       </div>
 
       <div class="settings-foot">两项自动转换默认关闭，避免在你没打算处理时占用磁盘和 CPU。同目录的外挂字幕、同名弹幕照旧自动加载。</div>
@@ -1843,7 +1874,48 @@
     invoke('get_autostart').then(function (on) {
       $('optAutostart').checked = !!on;
     }).catch(function () { $('optAutostart').checked = false; });
+    fillSidecarPath($('whereAudio'), $('openAudioDir'), /\.mka$/i);
+    fillSidecarPath($('whereSub'), $('openSubDir'), /\.srt$/i);
   }
+
+  // 缓存产物就在视频旁边，把目录和数量显示出来，方便用户自己清
+  function fillSidecarPath(whereEl, btnEl, wantExt) {
+    if (!currentVideoPath) {
+      whereEl.textContent = '打开视频后显示';
+      whereEl.title = '';
+      btnEl.disabled = true;
+      btnEl.dataset.path = '';
+      return;
+    }
+    var dir = currentVideoPath.replace(/[\\/][^\\/]+$/, '');
+    invoke('sidecar_cache_files', { videoPath: currentVideoPath }).then(function (files) {
+      var hit = (files || []).filter(function (p) { return wantExt.test(p); });
+      if (hit.length) {
+        whereEl.textContent = dir + '（' + hit.length + ' 个）';
+        whereEl.title = hit.join('\n');
+        btnEl.dataset.path = hit[0];
+      } else {
+        whereEl.textContent = dir + '（暂无）';
+        whereEl.title = dir;
+        btnEl.dataset.path = dir; // 没产物也让他打开片子目录看看
+      }
+      btnEl.disabled = false;
+    }).catch(function () {
+      whereEl.textContent = dir;
+      whereEl.title = dir;
+      btnEl.dataset.path = dir;
+      btnEl.disabled = false;
+    });
+  }
+
+  function openSidecarPath(btn) {
+    var p = btn.dataset.path;
+    if (!p) return;
+    invoke('reveal_path', { path: p }).catch(function (e) { toast('打开位置失败：' + e, 6000); });
+  }
+
+  $('openAudioDir').addEventListener('click', function () { openSidecarPath(this); });
+  $('openSubDir').addEventListener('click', function () { openSidecarPath(this); });
 
   function closeSettings() { $('settingsMask').hidden = true; }
 

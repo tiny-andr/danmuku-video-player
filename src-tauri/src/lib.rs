@@ -254,6 +254,60 @@ fn pick_folder() -> Option<String> {
         .map(|p| p.to_string_lossy().to_string())
 }
 
+/// 在资源管理器里打开产物所在目录。
+/// 不用 `/select,` 选中文件：含中文/空格的路径上 explorer 会静默失败，
+/// 而这里的目的就是让用户能找到目录去清理缓存，打开目录足够。
+#[tauri::command]
+fn reveal_path(path: String) -> Result<(), String> {
+    // 前端路径可能带正斜杠，统一成 Windows 分隔符
+    let path = path.replace('/', "\\");
+    let p = Path::new(&path);
+    if path.trim().is_empty() {
+        return Err("还没有可定位的产物".into());
+    }
+    let dir: PathBuf = if p.is_dir() {
+        p.to_path_buf()
+    } else {
+        p.parent().map(|d| d.to_path_buf()).ok_or("路径无效")?
+    };
+    if !dir.is_dir() {
+        return Err(format!("目录不存在：{}", dir.to_string_lossy()));
+    }
+    std::process::Command::new("explorer.exe")
+        .arg(dir.as_os_str())
+        .spawn()
+        .map_err(|e| format!("打开资源管理器失败: {e}"))?;
+    Ok(())
+}
+
+/// 列出某部片在本目录下已生成的缓存产物（`(音轨N).mka` / `(字幕N).srt`）。
+/// 设置页用它告诉用户缓存到底在哪、有几个，方便手动清理。
+#[tauri::command]
+fn sidecar_cache_files(video_path: String) -> Vec<String> {
+    let vp = Path::new(&video_path);
+    let Some(dir) = vp.parent() else { return Vec::new() };
+    let stem = vp.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+    if stem.is_empty() {
+        return Vec::new();
+    }
+    let prefix = format!("{stem} (");
+    let mut out = Vec::new();
+    if let Ok(rd) = fs::read_dir(dir) {
+        for e in rd.flatten() {
+            let name = e.file_name().to_string_lossy().into_owned();
+            if !name.starts_with(&prefix) || name.contains(".tmp.") {
+                continue;
+            }
+            let lower = name.to_ascii_lowercase();
+            if lower.ends_with(".mka") || lower.ends_with(".srt") {
+                out.push(e.path().to_string_lossy().into_owned());
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -277,7 +331,9 @@ pub fn run() {
             pgs_render::pgs_close,
             pgs_render::pgs_current,
             pick_video,
-            pick_folder
+            pick_folder,
+            reveal_path,
+            sidecar_cache_files
         ])
         .manage(std::sync::Mutex::new(None::<transcode::TranscodeJob>))
         .manage::<pgs_render::PgsState>(std::sync::Mutex::new(None))
