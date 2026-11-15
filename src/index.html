@@ -883,10 +883,21 @@
     updateBlockMeta();
   }
 
+  // 这几个浮窗都固定在右上角同一个位置（right:16px; bottom:64px），同时只能开一个，
+  // 否则点完字幕再点音轨就会叠在一起。
+  function closeOtherPanels(keepId) {
+    ['audioPanel', 'subtitlePanel', 'densityPanel', 'blockPanel'].forEach(function (id) {
+      if (id === keepId) return;
+      var el = $(id);
+      if (el) el.hidden = true;
+    });
+  }
+
   function bindBlockPanel() {
     var panel = $('blockPanel');
     $('btnBlockEntry').addEventListener('click', function () {
       var opening = panel.hidden;
+      closeOtherPanels(opening ? 'blockPanel' : '');
       panel.hidden = !opening;
       if (opening) {
         $('blockEnabled').checked = blockState.enabled;
@@ -1008,6 +1019,7 @@
   function toggleDensityPanel() {
     var panel = $('densityPanel');
     var opening = panel.hidden;
+    closeOtherPanels(opening ? 'densityPanel' : '');
     panel.hidden = !opening;
     if (opening) updateDensityMeta();
   }
@@ -1899,6 +1911,7 @@
   // ---- 设置页 ----
   function openSettings() {
     hideToast(); // 设置页是模态，压在它上面的提示先收掉，免得挡住内容
+    closeOtherPanels(''); // 右侧浮窗也收掉，别从模态后面露出来
     $('settingsMask').hidden = false;
     $('optAutoAudio').checked = appSettings.autoAudio;
     $('optAutoSubtitle').checked = appSettings.autoSubtitle;
@@ -1983,9 +1996,19 @@
     toast(this.checked ? '已开启：自动转换内嵌字幕' : '已关闭：内嵌字幕需在「字幕」菜单里手动选择');
   });
     $('plClose').addEventListener('click', function () { $('playlist').classList.remove('open'); });
-    $('btnAudioEntry').addEventListener('click', function () { $('audioPanel').hidden = !$('audioPanel').hidden; });
+    $('btnAudioEntry').addEventListener('click', function () {
+      var panel = $('audioPanel');
+      var opening = panel.hidden;
+      closeOtherPanels(opening ? 'audioPanel' : '');
+      panel.hidden = !opening;
+    });
     $('audioClose').addEventListener('click', function () { $('audioPanel').hidden = true; });
-    $('btnSubtitleEntry').addEventListener('click', function () { $('subtitlePanel').hidden = !$('subtitlePanel').hidden; });
+    $('btnSubtitleEntry').addEventListener('click', function () {
+      var panel = $('subtitlePanel');
+      var opening = panel.hidden;
+      closeOtherPanels(opening ? 'subtitlePanel' : '');
+      panel.hidden = !opening;
+    });
     $('subtitleClose').addEventListener('click', function () { $('subtitlePanel').hidden = true; });
 
     // 播完自动下一集
