@@ -1,6 +1,6 @@
 {
   "name": "danmuku-video-player",
-  "version": "1.2.4",
+  "version": "1.2.5",
   "private": true,
   "description": "Danmuku Video Player 本地视频 + 弹幕播放器（Tauri 桌面版）",
   "scripts": {
