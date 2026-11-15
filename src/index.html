@@ -1040,6 +1040,10 @@
 
     // 确保某条音轨的外挂 mka 存在：命中直接挂载，未命中后台转换完成后挂载
     function ensureAudioTrack(path, durationUs, audioIdx, label) {
+      // 一旦决定走外挂音轨就先隔离视频音频：Chromium 自己会挑它解得了的那条轨
+      // （潘神实测：它跳过两条 DTS，直接播了第 3 条 AC-3），转码期间不隔离，
+      // 用户听到的就是那条错的轨道。
+      isolateVideoAudio();
       var ordinal = audioIdx + 1;
       invoke('transcode_target', { videoPath: path, audioIndex: audioIdx }).then(function (mkaPath) {
         diag('target', { ordinal: ordinal, tail: String(mkaPath).slice(-28) });
