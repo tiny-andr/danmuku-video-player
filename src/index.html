@@ -117,11 +117,13 @@
   .placeholder .sub { font-size: 13px; color: var(--muted); line-height: 1.8; }
   body.dragover #player { box-shadow: inset 0 0 0 3px rgba(139, 92, 246, .7); }
   .toast {
-    position: fixed; left: 50%; bottom: 28px; transform: translateX(-50%);
-    background: #232733; border: 1px solid var(--line); color: var(--text);
-    padding: 10px 18px; border-radius: 10px; font-size: 13px;
+    position: fixed; left: 50%; top: 50%; transform: translate(-50%, -50%);
+    background: #3b2a6b; border: 1px solid #a78bfa; color: #fff;
+    padding: 13px 24px; border-radius: 12px; font-size: 14px; font-weight: 500;
+    line-height: 1.65; text-align: center;
+    box-shadow: 0 18px 60px -16px rgba(0, 0, 0, .9), 0 0 0 1px rgba(167, 139, 250, .15);
     opacity: 0; transition: opacity .25s; pointer-events: none; z-index: 99;
-    width: max-content; max-width: 80vw;
+    width: max-content; max-width: min(80vw, 760px);
   }
   .toast.show { opacity: 1; }
   .pill {
@@ -187,6 +189,41 @@
   }
   .block-panel textarea:focus { outline: none; border-color: var(--accent); }
   .block-foot { font-size: 11px; color: var(--muted); line-height: 1.6; }
+  /* ---- 设置页（顶部齿轮打开，居中模态） ---- */
+  .settings-mask {
+    position: fixed; inset: 0; z-index: 90;
+    background: rgba(6, 8, 12, .64); backdrop-filter: blur(3px);
+    display: flex; align-items: center; justify-content: center;
+  }
+  .settings-mask[hidden] { display: none; }
+  .settings-modal {
+    width: 460px; max-width: calc(100vw - 40px); max-height: calc(100vh - 60px);
+    overflow-y: auto;
+    background: #1c1f27; border: 1px solid var(--line); border-radius: 14px;
+    padding: 18px 20px; box-shadow: 0 32px 96px -30px rgba(0, 0, 0, .88);
+    display: flex; flex-direction: column; gap: 14px;
+  }
+  .settings-head { display: flex; align-items: center; gap: 10px; }
+  .settings-head b { font-size: 15px; letter-spacing: .3px; }
+  .settings-head .spacer { flex: 1; }
+  .settings-head button {
+    background: none; border: 1px solid var(--line); color: var(--muted);
+    border-radius: 6px; width: 26px; height: 26px; cursor: pointer; font-family: inherit;
+  }
+  .settings-head button:hover { color: var(--text); border-color: var(--accent); }
+  .settings-row { display: flex; flex-direction: column; gap: 4px; }
+  .settings-row label {
+    display: inline-flex; align-items: center; gap: 8px;
+    font-size: 13px; color: var(--text); cursor: pointer;
+  }
+  .settings-row input[type=checkbox] {
+    accent-color: var(--accent); width: 16px; height: 16px; cursor: pointer;
+  }
+  .settings-desc { font-size: 11px; color: var(--muted); line-height: 1.65; padding-left: 24px; }
+  .settings-foot {
+    font-size: 11px; color: var(--muted); line-height: 1.65;
+    border-top: 1px solid var(--line); padding-top: 10px;
+  }
   .switch { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: var(--muted); cursor: pointer; }
   .switch input { accent-color: var(--accent); width: 15px; height: 15px; cursor: pointer; }
   /* ---- 弹幕密度滑块（浮窗复用 block-panel 外壳） ---- */
@@ -226,6 +263,7 @@
       <button type="button" id="btnOpenVideo" class="btn-folder" title="选择本地视频文件">🎬 打开视频</button>
       <button type="button" id="btnOpenFolder" class="btn-folder" title="选择剧集文件夹，生成播放列表">📂 打开文件夹</button>
       <button type="button" id="btnPlaylist" class="btn-folder" title="显示 / 隐藏剧集播放列表">📑 播放列表</button>
+      <button type="button" id="btnSettings" class="btn-folder" title="设置">⚙ 设置</button>
     </div>
     <div class="chips">
       <div class="chip" id="chipVideo">未加载视频</div>
@@ -316,6 +354,33 @@
   </aside>
 </div>
 <div class="toast" id="toast"></div>
+
+  <div class="settings-mask" id="settingsMask" hidden>
+    <div class="settings-modal" role="dialog" aria-label="设置">
+      <div class="settings-head">
+        <b>设置</b>
+        <span class="spacer"></span>
+        <button type="button" id="settingsClose" title="关闭">✕</button>
+      </div>
+
+      <div class="settings-row">
+        <label><input type="checkbox" id="optAutostart" /> 开机自动启动</label>
+        <div class="settings-desc">登录 Windows 后自动打开本播放器。写入当前用户的注册表启动项，取消勾选即移除。</div>
+      </div>
+
+      <div class="settings-row">
+        <label><input type="checkbox" id="optAutoAudio" /> 自动转换不支持的音轨</label>
+        <div class="settings-desc">开片时若音轨内核解不了（DTS / TrueHD / AC-4 等），后台转成 AAC 外挂音轨。关闭后不自动转，需要在「音轨」菜单里点那条轨道才开始。</div>
+      </div>
+
+      <div class="settings-row">
+        <label><input type="checkbox" id="optAutoSubtitle" /> 自动转换不支持的字幕</label>
+        <div class="settings-desc">开片时自动抽取内嵌文本字幕轨。抽取要顺序读一遍整个视频文件（40 GB 约 4 分钟），所以默认关闭；需要时在「字幕」菜单里手动选。PGS 位图字幕走即时解码，不受此项影响。</div>
+      </div>
+
+      <div class="settings-foot">两项自动转换默认关闭，避免在你没打算处理时占用磁盘和 CPU。同目录的外挂字幕、同名弹幕照旧自动加载。</div>
+    </div>
+  </div>
 <div class="pill" id="pill" data-tip="转码速度取决于硬盘读取速度&#10;点击取消转码"></div>
 
 <script src="vendor/artplayer.js"></script>
@@ -333,6 +398,24 @@
   var pillEl = $('pill');
 
   var CONFIG_KEY = 'bplayer_danmaku_config';
+
+  /* ---- 应用设置（齿轮页）：两项自动转换默认关闭 ---- */
+  var SETTINGS_KEY = 'bplayer_settings';
+  var appSettings = { autoAudio: false, autoSubtitle: false };
+
+  function loadAppSettings() {
+    try {
+      var c = JSON.parse(localStorage.getItem(SETTINGS_KEY)) || {};
+      appSettings.autoAudio = !!c.autoAudio;
+      appSettings.autoSubtitle = !!c.autoSubtitle;
+    } catch (e) { /* 配置损坏按默认关闭 */ }
+  }
+
+  function saveAppSettings() {
+    try { localStorage.setItem(SETTINGS_KEY, JSON.stringify(appSettings)); } catch (e) { /* 忽略持久化失败 */ }
+  }
+
+  loadAppSettings();
   var isMobile = document.documentElement.clientWidth < 768;
 
   // 速度档位（value = 一条弹幕从右边进入到完全离开左边所需的秒数，越大越慢）。
@@ -1054,6 +1137,13 @@
             toast('音轨编码（' + c.shakyNames.join(' / ') + '）解码不可靠（随 WebView2 版本而定），可能无声', 8000);
             return;
           }
+          if (!appSettings.autoAudio) {
+            // 设置里关掉了自动转换：不启动 ffmpeg，也不隔离视频音频（否则会完全没声）。
+            // 内核会自己挑一条它能解的轨道先播着，用户想要正确的轨就去音轨菜单点。
+            toast('音轨' + (c.audioIndex + 1) + '（' + c.deadNames.join(' / ') + '）内核无法解码；'
+              + '「自动转换不支持的音轨」已关闭，可在「音轨」菜单里点那条轨道开始转换', 9000);
+            return;
+          }
           diag('ensure', { idx: c.audioIndex });
           try { ensureAudioTrack(path, probeDurationUs, c.audioIndex, c.deadNames.join(' / ')); }
           catch (e) { diag('ensure-err', { err: String(e) }); }
@@ -1314,8 +1404,7 @@
         meta.className = 't-meta';
         var bits = [];
         if (s.kind === 'ext') bits.push('外挂');
-        if (s.kind === 'embedded') bits.push('内嵌');
-        if (s.kind === 'bitmap') bits.push('位图');
+        if (s.kind === 'bitmap') bits.push('位图'); // 内嵌轨的 name 里已经带「内嵌」前缀
         if (s.codecLabel) bits.push(s.codecLabel);
         else if (s.type) bits.push(s.type.toUpperCase());
         meta.textContent = bits.join(' · ');
@@ -1580,7 +1669,10 @@
       var embDefault = subItems.filter(function (s) { return s.kind === 'embedded' && s.default; });
       var embFirst = subItems.filter(function (s) { return s.kind === 'embedded'; });
       var extFirst = subItems.filter(function (s) { return s.kind === 'ext'; });
-      var cand = exact[0] || embDefault[0] || embFirst[0] || extFirst[0];
+      var cand = exact[0];
+      // 内嵌文本轨要抽 SRT（读整遍文件），只在你开启了自动转换时才自动挂
+      if (!cand && appSettings.autoSubtitle) cand = embDefault[0] || embFirst[0];
+      if (!cand) cand = extFirst[0];
       if (cand) mountSubtitle(cand, !!exact[0]);
     }
 
@@ -1684,6 +1776,50 @@
       if (d) { await loadPlaylist(d, true); toast('已加载播放列表 · ' + playlist.length + ' 集'); }
     });
     $('btnPlaylist').addEventListener('click', function () { $('playlist').classList.toggle('open'); });
+
+  // ---- 设置页 ----
+  function openSettings() {
+    $('settingsMask').hidden = false;
+    $('optAutoAudio').checked = appSettings.autoAudio;
+    $('optAutoSubtitle').checked = appSettings.autoSubtitle;
+    invoke('get_autostart').then(function (on) {
+      $('optAutostart').checked = !!on;
+    }).catch(function () { $('optAutostart').checked = false; });
+  }
+
+  function closeSettings() { $('settingsMask').hidden = true; }
+
+  $('btnSettings').addEventListener('click', openSettings);
+  $('settingsClose').addEventListener('click', closeSettings);
+  $('settingsMask').addEventListener('click', function (ev) {
+    if (ev.target === $('settingsMask')) closeSettings();
+  });
+  document.addEventListener('keydown', function (ev) {
+    if (ev.key === 'Escape' && !$('settingsMask').hidden) closeSettings();
+  });
+
+  $('optAutostart').addEventListener('change', function () {
+    var want = this.checked;
+    invoke('set_autostart', { enable: want }).then(function (actual) {
+      $('optAutostart').checked = !!actual;
+      toast(actual ? '已设置开机自动启动' : '已取消开机自动启动');
+    }).catch(function (e) {
+      $('optAutostart').checked = !want;
+      toast('设置开机自启动失败：' + e, 6000);
+    });
+  });
+
+  $('optAutoAudio').addEventListener('change', function () {
+    appSettings.autoAudio = this.checked;
+    saveAppSettings();
+    toast(this.checked ? '已开启：自动转换不支持的音轨' : '已关闭：不支持的音轨需在「音轨」菜单里手动点选');
+  });
+
+  $('optAutoSubtitle').addEventListener('change', function () {
+    appSettings.autoSubtitle = this.checked;
+    saveAppSettings();
+    toast(this.checked ? '已开启：自动转换内嵌字幕' : '已关闭：内嵌字幕需在「字幕」菜单里手动选择');
+  });
     $('plClose').addEventListener('click', function () { $('playlist').classList.remove('open'); });
     $('btnAudioEntry').addEventListener('click', function () { $('audioPanel').hidden = !$('audioPanel').hidden; });
     $('audioClose').addEventListener('click', function () { $('audioPanel').hidden = true; });

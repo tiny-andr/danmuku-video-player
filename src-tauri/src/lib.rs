@@ -7,6 +7,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use tauri::Manager;
 
+mod autostart;
 mod mkv_probe;
 mod pgs_render;
 mod transcode;
@@ -269,6 +270,8 @@ pub fn run() {
             transcode::extract_subtitle_start,
             transcode::transcode_audio_cancel,
             transcode::clean_sidecar_tmp,
+            autostart::get_autostart,
+            autostart::set_autostart,
             pgs_render::pgs_open,
             pgs_render::pgs_image,
             pgs_render::pgs_close,
