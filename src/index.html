@@ -119,13 +119,22 @@
   .toast {
     position: fixed; left: 50%; top: 50%; transform: translate(-50%, -50%);
     background: #3b2a6b; border: 1px solid #a78bfa; color: #fff;
-    padding: 13px 24px; border-radius: 12px; font-size: 14px; font-weight: 500;
+    padding: 13px 40px 13px 24px; border-radius: 12px; font-size: 14px; font-weight: 500;
     line-height: 1.65; text-align: center;
     box-shadow: 0 18px 60px -16px rgba(0, 0, 0, .9), 0 0 0 1px rgba(167, 139, 250, .15);
     opacity: 0; transition: opacity .25s; pointer-events: none; z-index: 99;
     width: max-content; max-width: min(80vw, 760px);
   }
   .toast.show { opacity: 1; }
+  .toast-close {
+    position: absolute; top: 5px; right: 7px;
+    width: 20px; height: 20px; padding: 0;
+    display: flex; align-items: center; justify-content: center;
+    background: none; border: none; border-radius: 5px;
+    color: rgba(255, 255, 255, .6); font-size: 13px; line-height: 1;
+    cursor: pointer; font-family: inherit; pointer-events: auto;
+  }
+  .toast-close:hover { color: #fff; background: rgba(255, 255, 255, .16); }
   .pill {
     position: fixed; right: 18px; bottom: 28px;
     background: #232733; border: 1px solid var(--line); color: var(--text);
@@ -353,7 +362,7 @@
     <ul class="pl-list" id="plList"></ul>
   </aside>
 </div>
-<div class="toast" id="toast"></div>
+<div class="toast" id="toast"><span id="toastText"></span><button type="button" class="toast-close" id="toastClose" title="关闭">✕</button></div>
 
   <div class="settings-mask" id="settingsMask" hidden>
     <div class="settings-modal" role="dialog" aria-label="设置">
@@ -395,6 +404,8 @@
   var chipVideo = $('chipVideo');
   var chipDanmaku = $('chipDanmaku');
   var toastEl = $('toast');
+  var toastTextEl = $('toastText');
+  var toastCloseEl = $('toastClose');
   var pillEl = $('pill');
 
   var CONFIG_KEY = 'bplayer_danmaku_config';
@@ -447,19 +458,29 @@
     }, 80);
   }
 
+  function hideToast() {
+    clearTimeout(toastTimer);
+    toastEl.classList.remove('show');
+  }
+
   function toast(msg, ms) {
-    toastEl.textContent = msg;
+    toastTextEl.textContent = msg;
     toastEl.classList.add('show');
     clearTimeout(toastTimer);
     var dur = ms || 2600;
-    // 短提示维持原时长；长提示按阅读速度（约 4 字/秒）给足时间，且至少翻倍。
-    // 只对超过 20 字的消息生效，避免把所有提示都拖长。
+    // 长提示按阅读速度给足时间（约 4 字/秒，上限 20 秒）；读得快的人用右上角 × 直接关掉。
     var len = String(msg || '').length;
     if (len > 20) {
       dur = Math.max(dur * 2, 1500 + len * 250);
     }
     toastTimer = setTimeout(function () { toastEl.classList.remove('show'); }, Math.min(dur, 20000));
   }
+
+  // 右上角 × 立刻关掉当前提示
+  toastCloseEl.addEventListener('click', function (ev) {
+    ev.stopPropagation();
+    hideToast();
+  });
 
   function fmtDuration(sec) {
     sec = Math.round(sec || 0);
@@ -1809,6 +1830,7 @@
 
   // ---- 设置页 ----
   function openSettings() {
+    hideToast(); // 设置页是模态，压在它上面的提示先收掉，免得挡住内容
     $('settingsMask').hidden = false;
     $('optAutoAudio').checked = appSettings.autoAudio;
     $('optAutoSubtitle').checked = appSettings.autoSubtitle;
