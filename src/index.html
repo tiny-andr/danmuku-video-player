@@ -983,6 +983,7 @@
     var fullCacheActive = false; // 已换到自包含 (AAC).mkv 播放
     var subItems = [];          // 字幕菜单条目（外挂文件 + 内嵌轨 + PGS 位图轨）
     var mountedSubId = '';      // 当前挂载的字幕条目 id；'' = 关闭
+    var droppedSubs = [];       // 拖进窗口的字幕文件（不在视频同目录也能用；换片清空）
     var pendingSub = null;      // 正在后台抽取的内嵌字幕条目
     var pillLabel = '音轨';     // 当前后台任务的类型标签
 
@@ -1264,6 +1265,16 @@
             subItems.push({ id: 'pgs:' + subOrdinal, kind: 'bitmap', name: '内嵌 ' + label + '（' + codecName(c) + ' 图形字幕，不支持）', disabled: true });
           }
         });
+        // 拖进来的字幕文件：不在视频同目录，模拟不了"同名扫描"，单独追加
+        droppedSubs.forEach(function (f) {
+          var exists = subItems.some(function (s) { return s.kind === 'ext' && normPath(s.path) === normPath(f); });
+          if (exists) return;
+          var ext = String(f).split('.').pop().toLowerCase();
+          subItems.push({
+            id: 'ext:' + f, kind: 'ext', name: pathName(f), path: f,
+            type: ext === 'ass' || ext === 'ssa' ? 'ass' : (ext === 'vtt' ? 'vtt' : 'srt'), dropped: true,
+          });
+        });
         refreshSubtitleMenu();
         if (!mountedSubId) autoMountSubtitle();
       }).catch(function () { });
@@ -1317,6 +1328,7 @@
       if (s.disabled || !currentVideoPath) return;
       $('subtitlePanel').hidden = true;
       if (s.kind === 'bitmap') { mountPgsSubtitle(s, silent); return; }
+      unmountPgs(); // 从位图字幕切到文本字幕：收起图像层
       if (s.kind === 'ext') {
         mountSubtitleUrl(mediaUrl(s.path), s, silent);
         return;
@@ -1358,6 +1370,27 @@
       }).catch(function (e) {
         toast('字幕加载失败：' + e, 6000);
       });
+    }
+
+    // 拖入的字幕文件：登记进菜单（同一路径只登记一次），返回菜单条目供立即挂载
+    function addDroppedSubtitle(p) {
+      if (!p) return null;
+      var np = normPath(p);
+      var dup = droppedSubs.some(function (f) { return normPath(f) === np; });
+      if (!dup) droppedSubs.push(p);
+      var hit = null;
+      subItems.forEach(function (s) {
+        if (s.kind === 'ext' && normPath(s.path) === np) hit = s;
+      });
+      if (hit) { refreshSubtitleMenu(); return hit; }
+      var ext = String(p).split('.').pop().toLowerCase();
+      var item = {
+        id: 'ext:' + p, kind: 'ext', name: pathName(p), path: p,
+        type: ext === 'ass' || ext === 'ssa' ? 'ass' : (ext === 'vtt' ? 'vtt' : 'srt'), dropped: true,
+      };
+      subItems.push(item);
+      refreshSubtitleMenu();
+      return item;
     }
 
     // ---- PGS 位图字幕 ----
@@ -1577,6 +1610,7 @@
       fullCacheActive = false;
       subItems = [];
       mountedSubId = '';
+      droppedSubs = []; // 拖入的字幕只对当前这部片有效
       pendingSub = null;
       pillLabel = '音轨';
       if (art) art.subtitle.style({ display: 'none' }); // 上一部的字幕先藏起来，扫描到新的会自动挂载
@@ -1612,6 +1646,8 @@
     }
     window.__BplayerDesktop = {
       loadVideo: desktopLoadVideo,
+      // 拖入字幕的入口（拖放回调与外部调试共用）
+      addSubtitle: addDroppedSubtitle,
       // 位图字幕调试入口：DevTools 里 `__BplayerDesktop.pgs` 可直接看索引/命中/缓存状态
       get pgs() {
         return {
@@ -1666,15 +1702,30 @@
         toast('已加载播放列表「' + scan.label + '」· ' + playlist.length + ' 集');
         return;
       }
-      var video = null, dan = null;
+      var video = null, dan = null, sub = null;
       for (var i = 0; i < paths.length; i++) {
         var n = pathName(paths[i]);
         if (!video && /\.(mp4|m4v|webm|mov|mkv|avi|ts|flv|wmv|mpg|mpeg)$/i.test(n)) video = paths[i];
         if (!dan && /\.(xml|json)$/i.test(n)) dan = paths[i];
+        if (!sub && /\.(srt|ass|ssa|vtt)$/i.test(n)) sub = paths[i];
       }
-      if (video) desktopLoadVideo(video, dan);
-      else if (dan) desktopLoadDanmaku(pathName(dan), await invoke('read_text', { path: dan }));
-      else toast('未识别的文件：请拖入视频（mp4 / webm…）或弹幕（xml / json）');
+      if (video) {
+        // 视频 + 字幕一起拖进来：先起视频，字幕等菜单建好后补上去
+        await desktopLoadVideo(video, dan);
+        if (sub) {
+          var vs = addDroppedSubtitle(sub);
+          if (vs) mountSubtitle(vs, false);
+        }
+        return;
+      }
+      if (sub) {
+        if (!currentVideoPath) { toast('先打开一个视频，再把字幕拖进来'); return; }
+        var s2 = addDroppedSubtitle(sub);
+        if (s2) mountSubtitle(s2, false);
+        return;
+      }
+      if (dan) desktopLoadDanmaku(pathName(dan), await invoke('read_text', { path: dan }));
+      else toast('未识别的文件：请拖入视频、弹幕（xml / json）或字幕（srt / ass / vtt）');
     });
 
     // 转码进度/完成/失败事件（Rust 侧 ffmpeg 工作线程发出）
