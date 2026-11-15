@@ -16,6 +16,9 @@ tauri = { version = "2", features = ["protocol-asset"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 rfd = "0.15"
+# PGS（蓝光位图字幕）：纯 Rust 的 MKV/SUP 抽取 + RLE 解码，按 Cues 索引只读字幕块
+libpgs = "0.6"
+png = "0.17"
 
 [profile.release]
 opt-level = 3

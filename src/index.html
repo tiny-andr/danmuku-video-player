@@ -302,7 +302,7 @@
       <button type="button" id="subtitleClose" title="关闭">✕</button>
     </div>
     <div id="subtitleList"></div>
-    <div class="block-foot">外挂字幕扫描同目录同名/变体文件 · 内嵌文本字幕需后台抽取为 SRT（PGS 图形字幕不支持）</div>
+    <div class="block-foot">外挂字幕扫描同目录同名/变体文件 · 内嵌文本字幕需后台抽取为 SRT · PGS 位图字幕由本地解码后直接叠加显示</div>
   </div>
 
   <aside class="playlist" id="playlist" aria-label="剧集播放列表">
@@ -981,7 +981,7 @@
     var probeTracks = null;     // 最近一次探测的音轨列表（仅 audio）
     var probeDurationUs = null;
     var fullCacheActive = false; // 已换到自包含 (AAC).mkv 播放
-    var subItems = [];          // 字幕菜单条目（外挂文件 + 内嵌轨 + PGS 占位）
+    var subItems = [];          // 字幕菜单条目（外挂文件 + 内嵌轨 + PGS 位图轨）
     var mountedSubId = '';      // 当前挂载的字幕条目 id；'' = 关闭
     var pendingSub = null;      // 正在后台抽取的内嵌字幕条目
     var pillLabel = '音轨';     // 当前后台任务的类型标签
@@ -1256,8 +1256,11 @@
           var label = t.name || t.lang || ('字幕' + subOrdinal);
           if (c.indexOf('S_TEXT') === 0) {
             subItems.push({ id: 'emb:' + subOrdinal, kind: 'embedded', ordinal: subOrdinal, name: '内嵌 ' + label, codecLabel: codecName(c), type: 'srt', default: !!t.default });
+          } else if (c.indexOf('S_HDMV/PGS') === 0 && t.number) {
+            // PGS 位图字幕：内核画不出来，由 Rust 解出位图、前端覆盖层显示（不转码、不落盘）
+            subItems.push({ id: 'pgs:' + subOrdinal, kind: 'bitmap', ordinal: subOrdinal, track: t.number, name: '内嵌 ' + label, codecLabel: 'PGS', default: !!t.default });
           } else {
-            // PGS / VobSub 等图形字幕：内核无法渲染，菜单里明确标出
+            // VobSub 等其他图形字幕：libpgs 只吃 PGS，这里仍标不支持
             subItems.push({ id: 'pgs:' + subOrdinal, kind: 'bitmap', name: '内嵌 ' + label + '（' + codecName(c) + ' 图形字幕，不支持）', disabled: true });
           }
         });
@@ -1300,6 +1303,7 @@
         var bits = [];
         if (s.kind === 'ext') bits.push('外挂');
         if (s.kind === 'embedded') bits.push('内嵌');
+        if (s.kind === 'bitmap') bits.push('位图');
         if (s.codecLabel) bits.push(s.codecLabel);
         else if (s.type) bits.push(s.type.toUpperCase());
         meta.textContent = bits.join(' · ');
@@ -1312,6 +1316,7 @@
     function mountSubtitle(s, silent) {
       if (s.disabled || !currentVideoPath) return;
       $('subtitlePanel').hidden = true;
+      if (s.kind === 'bitmap') { mountPgsSubtitle(s, silent); return; }
       if (s.kind === 'ext') {
         mountSubtitleUrl(mediaUrl(s.path), s, silent);
         return;
@@ -1355,9 +1360,177 @@
       });
     }
 
+    // ---- PGS 位图字幕 ----
+    // Rust 侧用 libpgs 按 MKV 的 Cues 索引只读字幕块（潘神 35.6 GB 只读 13.4 MB）解出位图，
+    // 这里只负责把它按时钟贴到画面上：不转码、不 OCR、不落盘。
+    var pgsIndexData = null; // { canvas_w, canvas_h, events: [{start,end,x,y,w,h}] }（毫秒）
+    var pgsTrackNo = -1;     // 已挂载的轨道号（MKV TrackNumber）
+    var pgsOwnerPath = '';   // 这份数据属于哪个视频
+    var pgsEl = null;        // 覆盖层容器
+    var pgsImg = null;       // 当前位图
+    var pgsCache = {};       // 事件序号 -> data URL
+    var pgsActiveIdx = -1;
+    var pgsToken = 0;        // 换片/换轨时作废在途请求
+
+    function pgsHost() {
+      if (!art) return null;
+      return (art.template && (art.template.$player || art.template.$container)) || $('player');
+    }
+
+    function ensurePgsLayer() {
+      var host = pgsHost();
+      if (!host) return null;
+      if (!pgsEl || !pgsEl.isConnected || pgsEl.parentElement !== host) {
+        if (pgsEl) pgsEl.remove();
+        pgsEl = document.createElement('div');
+        pgsEl.id = 'pgsLayer';
+        pgsEl.style.cssText = 'position:absolute;inset:0;pointer-events:none;z-index:20;overflow:hidden;display:none';
+        pgsImg = document.createElement('img');
+        pgsImg.alt = '';
+        pgsImg.style.cssText = 'position:absolute;left:0;top:0;width:0;height:0;display:none';
+        pgsEl.appendChild(pgsImg);
+        host.appendChild(pgsEl);
+      }
+      return pgsEl;
+    }
+
+    // 视频显示区域。Artplayer 的 .art-video 是 object-fit:fill（不是 contain），
+    // 画面被拉伸填满整个容器，所以内容框就是容器本身，PGS 画布按同样比例拉伸即可。
+    function videoContentBox() {
+      var v = art && art.video;
+      var host = pgsEl && pgsEl.parentElement;
+      if (!v || !host) return null;
+      var cw = host.clientWidth || 0;
+      var ch = host.clientHeight || 0;
+      if (!cw || !ch) return null;
+      return { x: 0, y: 0, w: cw, h: ch };
+    }
+
+    function layoutPgsImg(ev) {
+      if (!pgsImg || !pgsIndexData) return;
+      var box = videoContentBox();
+      if (!box) return;
+      var sx = box.w / (pgsIndexData.canvas_w || 1920);
+      var sy = box.h / (pgsIndexData.canvas_h || 1080);
+      pgsImg.style.left = (box.x + ev.x * sx) + 'px';
+      pgsImg.style.top = (box.y + ev.y * sy) + 'px';
+      pgsImg.style.width = (ev.w * sx) + 'px';
+      pgsImg.style.height = (ev.h * sy) + 'px';
+    }
+
+    function pgsEventAt(tSec) {
+      if (!pgsIndexData) return -1;
+      var ev = pgsIndexData.events;
+      var t = tSec * 1000;
+      var lo = 0;
+      var hi = ev.length - 1;
+      var best = -1;
+      while (lo <= hi) {
+        var mid = (lo + hi) >> 1;
+        if (ev[mid].start <= t) { best = mid; lo = mid + 1; } else { hi = mid - 1; }
+      }
+      if (best < 0) return -1;
+      return t < ev[best].end ? best : -1;
+    }
+
+    function pgsTrimCache(center) {
+      var keys = Object.keys(pgsCache);
+      if (keys.length < 80) return;
+      keys.forEach(function (k) {
+        if (Math.abs(Number(k) - center) > 40) delete pgsCache[k];
+      });
+    }
+
+    function pgsPump() {
+      if (!pgsIndexData || !pgsImg || !art) return;
+      var idx = pgsEventAt(art.currentTime || 0);
+      if (idx >= 0) layoutPgsImg(pgsIndexData.events[idx]); // 每次都对一遍，缩放/全屏也跟着变
+      if (idx === pgsActiveIdx) return;
+      pgsActiveIdx = idx;
+      if (idx < 0) { pgsImg.style.display = 'none'; return; }
+      pgsImg.style.display = '';
+      var cached = pgsCache[idx];
+      if (cached) { pgsImg.src = cached; return; }
+      var token = pgsToken;
+      invoke('pgs_image', { index: idx }).then(function (b64) {
+        if (token !== pgsToken) return;
+        var url = 'data:image/png;base64,' + b64;
+        pgsCache[idx] = url;
+        pgsTrimCache(idx);
+        if (pgsActiveIdx === idx && pgsImg) pgsImg.src = url;
+      }).catch(function () { });
+    }
+
+    // 位图字幕的时钟来源。注意：createPlayer 在外层作用域，看不到本块里的函数
+    // （块级函数声明不外泄），所以监听必须在这里绑，不能塞进 createPlayer。
+    function attachPgsEvents() {
+      var v = art && art.video;
+      if (!v || v.__pgsBound) return;
+      v.__pgsBound = true;
+      v.addEventListener('timeupdate', pgsPump);
+      v.addEventListener('seeking', pgsPump);
+      v.addEventListener('loadedmetadata', pgsPump);
+      v.addEventListener('play', pgsPump);
+    }
+
+    function mountPgsSubtitle(s, silent) {
+      if (!currentVideoPath || !art) return;
+      if (pgsIndexData && pgsTrackNo === s.track && pgsOwnerPath === currentVideoPath) {
+        mountedSubId = s.id;
+        if (art.subtitle) art.subtitle.style({ display: 'none' });
+        if (pgsEl) pgsEl.style.display = '';
+        ensurePgsLayer();
+        pgsActiveIdx = -1;
+        pgsPump();
+        refreshSubtitleMenu();
+        return;
+      }
+      unmountPgs();
+      var token = ++pgsToken;
+      var path = currentVideoPath;
+      pillLabel = '字幕';
+      updatePill(-1, 0);
+      toast('正在解析位图字幕（' + s.name + '）…', 4000);
+      invoke('pgs_open', { videoPath: path, track: s.track }).then(function (idx) {
+        if (token !== pgsToken) return;
+        hidePill();
+        if (!idx || !idx.events || !idx.events.length) { toast('这条字幕轨里没有可显示的位图', 6000); return; }
+        pgsIndexData = idx;
+        pgsTrackNo = s.track;
+        pgsOwnerPath = path;
+        pgsCache = {};
+        pgsActiveIdx = -1;
+        mountedSubId = s.id;
+        if (art.subtitle) art.subtitle.style({ display: 'none' });
+        ensurePgsLayer();
+        attachPgsEvents();
+        pgsEl.style.display = '';
+        pgsPump();
+        refreshSubtitleMenu();
+        if (!silent) toast('位图字幕已就绪：' + s.name + '（' + idx.events.length + ' 条）', 4000);
+      }).catch(function (e) {
+        if (token !== pgsToken) return;
+        hidePill();
+        toast('位图字幕解析失败：' + e, 8000);
+      });
+    }
+
+    function unmountPgs() {
+      pgsToken++;
+      if (pgsEl) pgsEl.style.display = 'none';
+      if (pgsImg) { pgsImg.removeAttribute('src'); pgsImg.style.display = 'none'; }
+      pgsCache = {};
+      pgsActiveIdx = -1;
+      pgsIndexData = null;
+      pgsTrackNo = -1;
+      pgsOwnerPath = '';
+      try { invoke('pgs_close').catch(function () { }); } catch (e) { }
+    }
+
     function unmountSubtitle() {
       mountedSubId = '';
       $('subtitlePanel').hidden = true;
+      unmountPgs();
       if (art) art.subtitle.style({ display: 'none' });
       refreshSubtitleMenu();
     }
@@ -1409,6 +1582,7 @@
       if (art) art.subtitle.style({ display: 'none' }); // 上一部的字幕先藏起来，扫描到新的会自动挂载
       if (transcodeVideo && transcodeVideo !== currentVideoPath) hidePill(); // 旧任务继续后台跑，胶囊先收起
       resetExternalAudio();
+      unmountPgs(); // 上一部的位图字幕数据（Rust 侧约 30 MB）随换片释放
       setVideoFromUrl(mediaUrl(path), name, st.size);
       handleAudioCodecs(path, name);
       // 外挂字幕扫描对全部视频类型生效（内嵌轨只有 MKV 能探测，由 handleAudioCodecs 补齐）
@@ -1436,7 +1610,23 @@
         }
       }
     }
-    window.__BplayerDesktop = { loadVideo: desktopLoadVideo };
+    window.__BplayerDesktop = {
+      loadVideo: desktopLoadVideo,
+      // 位图字幕调试入口：DevTools 里 `__BplayerDesktop.pgs` 可直接看索引/命中/缓存状态
+      get pgs() {
+        return {
+          hasIndex: !!pgsIndexData,
+          events: pgsIndexData ? pgsIndexData.events.length : 0,
+          canvas: pgsIndexData ? [pgsIndexData.canvas_w, pgsIndexData.canvas_h] : null,
+          active: pgsActiveIdx,
+          cache: Object.keys(pgsCache).length,
+          t: art ? +Number(art.currentTime).toFixed(2) : null,
+          hit: pgsIndexData ? pgsEventAt(art ? art.currentTime : 0) : null,
+          layer: pgsEl ? pgsEl.style.display : null,
+          img: pgsImg ? { len: (pgsImg.src || '').length, w: pgsImg.style.width, h: pgsImg.style.height, disp: pgsImg.style.display } : null
+        };
+      }
+    };
 
     $('btnOpenVideo').addEventListener('click', async function () {
       var p = await invoke('pick_video');

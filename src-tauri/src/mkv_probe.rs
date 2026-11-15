@@ -16,6 +16,7 @@ pub struct MkvTrack {
     pub codec: String, // CodecID：A_AAC / A_DTS / V_MPEGH/ISO/HEVC …
     pub lang: String,  // LanguageIETF 优先，回退旧 Language 字段
     pub name: String,  // 轨道标题，可能为空
+    pub number: u32,   // Matroska TrackNumber（PGS 位图渲染按它定位轨道）
     pub default: bool,
 }
 
@@ -32,6 +33,7 @@ const ID_TIMESTAMP_SCALE: u32 = 0x2AD7_B1;
 const ID_DURATION: u32 = 0x4489;
 const ID_TRACKS: u32 = 0x1654_AE6B;
 const ID_TRACK_ENTRY: u32 = 0xAE;
+const ID_TRACK_NUMBER: u32 = 0xD7;
 const ID_TRACK_TYPE: u32 = 0x83;
 const ID_FLAG_DEFAULT: u32 = 0x88;
 const ID_CODEC_ID: u32 = 0x86;
@@ -204,6 +206,7 @@ fn parse_track_entry(r: &mut BufReader<File>, size: u64) -> Result<MkvTrack, Str
     let mut lang_legacy = String::new();
     let mut lang_ietf = String::new();
     let mut name = String::new();
+    let mut number = 0u32; // TrackNumber：PGS 位图渲染按它定位轨道（libpgs 用同一个号）
     let mut default = true; // Matroska 规范中 FlagDefault 缺省为 1
     while r.stream_position().map_err(|e| e.to_string())? < end {
         match next_element(r).map_err(|e| e.to_string())? {
@@ -217,6 +220,7 @@ fn parse_track_entry(r: &mut BufReader<File>, size: u64) -> Result<MkvTrack, Str
                 };
             }
             Some((ID_FLAG_DEFAULT, size, false)) => default = read_uint(r, size)? != 0,
+            Some((ID_TRACK_NUMBER, size, false)) => number = read_uint(r, size)? as u32,
             Some((ID_CODEC_ID, size, false)) => codec = read_string(r, size)?,
             Some((ID_LANGUAGE, size, false)) => lang_legacy = read_string(r, size)?,
             Some((ID_LANG_IETF, size, false)) => lang_ietf = read_string(r, size)?,
@@ -229,6 +233,7 @@ fn parse_track_entry(r: &mut BufReader<File>, size: u64) -> Result<MkvTrack, Str
         codec,
         lang: if lang_ietf.is_empty() { lang_legacy } else { lang_ietf },
         name,
+        number,
         default,
     })
 }

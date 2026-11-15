@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use tauri::Manager;
 
 mod mkv_probe;
+mod pgs_render;
 mod transcode;
 
 const VIDEO_EXTS: &[&str] = &[
@@ -267,10 +268,15 @@ pub fn run() {
             transcode::transcode_audio_start,
             transcode::extract_subtitle_start,
             transcode::transcode_audio_cancel,
+            pgs_render::pgs_open,
+            pgs_render::pgs_image,
+            pgs_render::pgs_close,
+            pgs_render::pgs_current,
             pick_video,
             pick_folder
         ])
         .manage(std::sync::Mutex::new(None::<transcode::TranscodeJob>))
+        .manage::<pgs_render::PgsState>(std::sync::Mutex::new(None))
         .on_window_event(|window, event| {
             // 关窗即杀转码子进程，不让 ffmpeg 变孤儿
             if let tauri::WindowEvent::Destroyed = event {
