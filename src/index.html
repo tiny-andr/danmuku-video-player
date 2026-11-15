@@ -451,7 +451,14 @@
     toastEl.textContent = msg;
     toastEl.classList.add('show');
     clearTimeout(toastTimer);
-    toastTimer = setTimeout(function () { toastEl.classList.remove('show'); }, ms || 2600);
+    var dur = ms || 2600;
+    // 短提示维持原时长；长提示按阅读速度（约 4 字/秒）给足时间，且至少翻倍。
+    // 只对超过 20 字的消息生效，避免把所有提示都拖长。
+    var len = String(msg || '').length;
+    if (len > 20) {
+      dur = Math.max(dur * 2, 1500 + len * 250);
+    }
+    toastTimer = setTimeout(function () { toastEl.classList.remove('show'); }, Math.min(dur, 20000));
   }
 
   function fmtDuration(sec) {
