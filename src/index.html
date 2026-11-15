@@ -440,6 +440,8 @@
   var pillEl = $('pill');
 
   var CONFIG_KEY = 'bplayer_danmaku_config';
+  // 1.2.6：弹幕默认改为 极慢 / 同步速度 / 显示区域 1/4 / 不透明 100%，旧存档按新默认走一次
+  var CONFIG_VER = 2;
 
   /* ---- 应用设置（齿轮页）：音轨自动转换默认开，字幕默认关 ---- */
   var SETTINGS_KEY = 'bplayer_settings';
@@ -649,12 +651,13 @@
    * ------------------------------------------------------------------ */
   function defaultDanmakuOption() {
     return {
-      speed: isMobile ? 5 : 9,
-      antiOverlap: true,
-      synchronousPlayback: false,
-      fontSize: isMobile ? 14 : 25,
+      speed: 20,                 // 极慢（SPEED_STEPS 里 20 秒/屏）
+      antiOverlap: true,         // 防止弹幕重叠
+      synchronousPlayback: true, // 同步视频速度
+      fontSize: 25,
       theme: 'light',
-      margin: isMobile ? [10, '75%'] : [10, 10],
+      margin: [10, '75%'],       // 显示区域 1/4（插件里 MARGIN 的档位值）
+      opacity: 100,              // 不透明度，插件按 0~100 取值
       modes: [0, 1, 2]
     };
   }
@@ -662,6 +665,10 @@
   function loadSavedConfig() {
     try {
       var c = JSON.parse(localStorage.getItem(CONFIG_KEY)) || {};
+      // 1.2.6 调整了默认值（极慢 / 同步速度 / 显示区域 1/4）：旧存档没有版本号，
+      // 一律按新默认走一次，否则老用户看到的还是自己很久以前存的值
+      if (c.ver !== CONFIG_VER) return {};
+      delete c.ver;
       if (typeof c.speed === 'number') c.speed = snapSpeed(c.speed);
       return c;
     } catch (e) { return {}; }
@@ -677,7 +684,8 @@
         theme: opt.theme,
         margin: opt.margin,
         modes: opt.modes,
-        opacity: opt.opacity
+        opacity: opt.opacity,
+        ver: CONFIG_VER
       }));
     } catch (e) { /* 隐私模式等场景下忽略 */ }
   }
@@ -937,18 +945,21 @@
    * 抽样只依赖已解析的 danmakuList，与速度/字号/显示区域无关。
    * ------------------------------------------------------------------ */
   var DENSITY_KEY = 'bplayer_density_config';
+  var DENSITY_VER = 2; // 1.2.6 起默认 3 条/秒；旧存档没有版本号，按新默认走一次
   var DENSITY_STEPS = [0, 20, 12, 8, 5, 3, 2, 1];   // 0 = 不限，单位：条/秒
-  var densityState = { limit: 0 };
+  var densityState = { limit: 3 };
 
   function loadDensityConfig() {
     try {
       var c = JSON.parse(localStorage.getItem(DENSITY_KEY));
-      if (c && typeof c.limit === 'number') densityState.limit = densityStep(c.limit);
-    } catch (e) { /* 损坏的配置按「不限」处理 */ }
+      if (c && c.ver === DENSITY_VER && typeof c.limit === 'number') densityState.limit = densityStep(c.limit);
+    } catch (e) { /* 损坏的配置按默认值处理 */ }
   }
 
   function saveDensityConfig() {
-    try { localStorage.setItem(DENSITY_KEY, JSON.stringify(densityState)); } catch (e) { /* 忽略持久化失败 */ }
+    try {
+      localStorage.setItem(DENSITY_KEY, JSON.stringify({ limit: densityState.limit, ver: DENSITY_VER }));
+    } catch (e) { /* 忽略持久化失败 */ }
   }
 
   // 保存值对齐到最近档位（手改过配置文件也不会让滑块落空）
