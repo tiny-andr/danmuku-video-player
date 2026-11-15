@@ -544,7 +544,7 @@
 
     art = new Artplayer({
       container: $('player'),
-      url: url,
+      url: '',
       volume: isMobile ? 1 : 0.5,
       fullscreen: true,
       fullscreenWeb: !isMobile,
@@ -558,6 +558,16 @@
       lang: 'zh-cn',
       plugins: [artplayerPluginDanmuku(option)]
     });
+
+    // 必须在首次给 src 之前声明 CORS：视频走 http://asset.localhost，页面在
+    // http://tauri.localhost，两者跨域。没有 CORS 授权时 createMediaElementSource
+    // 抓到的是纯静音（Chromium 按规范屏蔽跨域媒体的音频），而这个 <video> 元素
+    // 终生只能挂一条 WebAudio 支路、无法解绑 —— 一旦为死编码音轨隔离过一次，
+    // 后面换任何文件都永久无声（gain 改回 1 也没用，链上输出是零）。
+    // 实测：同一元素加 crossOrigin 后捕获输出 RMS 0.025，不加为 0。
+    var vEl = art.video || (art.template && art.template.$video);
+    if (vEl) vEl.crossOrigin = 'anonymous';
+    art.url = url;
 
     // 外挂音轨：audio-track 插件，独立 Audio 元素跟随视频时钟（工厂函数直接接线，不走插件管理器）
     audioTrack = artplayerPluginAudioTrack({ url: '' })(art);
@@ -1088,7 +1098,14 @@
     var audioSplitter = null;
 
     function isolateVideoAudio() {
-      if (audioSplitter || !art || !art.video) return;
+      if (!art || !art.video) return;
+      // 支路已存在（上一部也是死编码音轨）：换文件时 releaseVideoAudio 会把增益
+      // 放回 1，这里必须重新压回 0，否则内核自己挑的那条可解码音轨会和外挂 AAC 双声。
+      if (audioSplitter) {
+        try { audioSplitter.gain.gain.value = 0; } catch (e) { }
+        try { if (audioSplitter.ctx.state === 'suspended') audioSplitter.ctx.resume().catch(function () { }); } catch (e) { }
+        return;
+      }
       try {
         var Ctx = window.AudioContext || window.webkitAudioContext;
         if (!Ctx) return;
@@ -1109,6 +1126,8 @@
     function releaseVideoAudio() {
       if (!audioSplitter) return;
       try { audioSplitter.gain.gain.value = 1; } catch (e) { }
+      // 上下文被系统挂起时增益放行也没声，顺手拉起来
+      try { if (audioSplitter.ctx.state === 'suspended') audioSplitter.ctx.resume().catch(function () { }); } catch (e) { }
     }
 
     // 挂载外挂音频（audio-track 插件用独立 Audio 元素跟视频同步；原音轨无声，不会打架）
