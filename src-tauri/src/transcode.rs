@@ -368,20 +368,26 @@ fn spawn_job(app: AppHandle, state: tauri::State<'_, JobState>, spec: JobSpec) -
                     let mut renamed = Vec::new();
                     let mut failed = None;
                     for (tmp, out) in &outputs {
-                        if fs::rename(tmp, out).is_ok() {
-                            renamed.push(out.to_string_lossy().into_owned());
-                        } else {
-                            failed = Some(out.to_string_lossy().into_owned());
+                        if fs::rename(tmp, out).is_err() {
+                            failed = Some((out.to_string_lossy().into_owned(), "产物改名失败".to_string()));
                             break;
                         }
+                        // 0 字节 = 实际没抽出内容（例如字幕时间戳全在视频时长之外）。
+                        // 当成失败处理，否则前端会挂载一条空字幕。
+                        if fs::metadata(out).map(|m| m.len() == 0).unwrap_or(true) {
+                            let _ = fs::remove_file(out);
+                            failed = Some((out.to_string_lossy().into_owned(), "没有可抽取的内容（产物为空）".to_string()));
+                            break;
+                        }
+                        renamed.push(out.to_string_lossy().into_owned());
                     }
-                    if let Some(bad) = failed {
+                    if let Some((bad, why)) = failed {
                         for (tmp, _) in &outputs {
                             let _ = fs::remove_file(tmp);
                         }
                         let _ = app2.emit(
                             "transcode://error",
-                            JobError { kind, video: video_str, out: bad, message: "产物改名失败".into() },
+                            JobError { kind, video: video_str, out: bad, message: why },
                         );
                     } else {
                         let _ = app2.emit(
@@ -453,47 +459,78 @@ pub fn transcode_audio_start(
     Ok(paths.into_iter().next().unwrap_or_default())
 }
 
-/// 启动后台内嵌字幕抽取（文本轨 → SRT）。
-/// `sub_indices` 一次给全：多条字幕轨共用同一个 ffmpeg 进程和同一次读盘，
-/// 已经有缓存的轨自动跳过。返回这一批真正产出的文件路径。
+/// 一条待抽取的字幕轨：`index` 是字幕轨序号（0 基，决定缓存文件名），
+/// `track` 是 Matroska TrackNumber（Cues 索引按它查）。
+#[derive(serde::Deserialize)]
+pub struct SubTrack {
+    pub index: usize,
+    pub track: u32,
+    /// 这条轨是不是 ASS/SSA（Matroska 里的负载格式与 SRT 不同）
+    #[serde(default)]
+    pub ass: bool,
+}
+
+/// 启动内嵌字幕抽取（文本轨 → SRT）。
+/// 先尝试用 Cues 稀疏 seek 直接抽（一部 28 GB 的片子约 0.2 秒，产物与 ffmpeg 一致）；
+/// Cues 里没有该轨或解析失败时才回退到 ffmpeg 整片扫描。
+/// 返回已经就绪的文件路径，剩下的由后台任务继续。
 #[tauri::command]
 pub fn extract_subtitle_start(
     app: AppHandle,
     state: tauri::State<'_, JobState>,
     video_path: String,
-    sub_indices: Vec<usize>,
+    subs: Vec<SubTrack>,
     duration_us: Option<u64>,
 ) -> Result<Vec<String>, String> {
     let src = PathBuf::from(&video_path);
     if !src.is_file() {
         return Err("源视频不存在".into());
     }
+    let mut ready: Vec<String> = Vec::new();
     let mut targets: Vec<(usize, PathBuf)> = Vec::new();
     let mut outputs: Vec<(PathBuf, PathBuf)> = Vec::new();
-    for idx in sub_indices {
-        let out = srt_cache_path(&src, idx);
+
+    for sub in &subs {
+        let out = srt_cache_path(&src, sub.index);
         if out.is_file() {
-            continue; // 已经有这条字幕了，不必再读盘
+            ready.push(out.to_string_lossy().into_owned());
+            continue;
         }
-        let tmp = tmp_path(&out);
-        targets.push((idx, tmp.clone()));
-        outputs.push((tmp, out));
+        let mut written = false;
+        if let Ok(srt) = crate::mkv_sub::sparse_extract_srt(&src, sub.track, sub.ass) {
+            if !srt.trim().is_empty() {
+                let tmp = tmp_path(&out);
+                if fs::write(&tmp, srt.as_bytes()).is_ok() && fs::rename(&tmp, &out).is_ok() {
+                    ready.push(out.to_string_lossy().into_owned());
+                    written = true;
+                } else {
+                    let _ = fs::remove_file(&tmp);
+                }
+            }
+        }
+        if !written {
+            let tmp = tmp_path(&out);
+            targets.push((sub.index, tmp.clone()));
+            outputs.push((tmp, out));
+        }
     }
-    if outputs.is_empty() {
-        return Ok(Vec::new());
+
+    if !outputs.is_empty() {
+        let args = ffmpeg_sub_args(&src, &targets);
+        // 后台任务，产物稍后才 rename 出来，不能算进「已就绪」返回值
+        spawn_job(
+            app,
+            state,
+            JobSpec {
+                kind: "subtitle",
+                video: video_path,
+                args,
+                outputs,
+                duration_us,
+            },
+        )?;
     }
-    let args = ffmpeg_sub_args(&src, &targets);
-    spawn_job(
-        app,
-        state,
-        JobSpec {
-            kind: "subtitle",
-            video: video_path,
-            args,
-            outputs,
-            duration_us,
-        },
-    )
+    Ok(ready)
 }
 
 /// 取消当前任务（若有）。半成品由工作线程清理。

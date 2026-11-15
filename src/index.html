@@ -1429,7 +1429,7 @@
           var c = String(t.codec || '').toUpperCase();
           var label = t.name || t.lang || ('字幕' + subOrdinal);
           if (c.indexOf('S_TEXT') === 0) {
-            subItems.push({ id: 'emb:' + subOrdinal, kind: 'embedded', ordinal: subOrdinal, name: '内嵌 ' + label, codecLabel: codecName(c), type: 'srt', default: !!t.default });
+            subItems.push({ id: 'emb:' + subOrdinal, kind: 'embedded', ordinal: subOrdinal, track: t.number, name: '内嵌 ' + label, codecLabel: codecName(c), type: 'srt', default: !!t.default });
           } else if (c.indexOf('S_HDMV/PGS') === 0 && t.number) {
             // PGS 位图字幕：内核画不出来，由 Rust 解出位图、前端覆盖层显示（不转码、不落盘）
             subItems.push({ id: 'pgs:' + subOrdinal, kind: 'bitmap', ordinal: subOrdinal, track: t.number, name: '内嵌 ' + label, codecLabel: 'PGS', default: !!t.default });
@@ -1515,13 +1515,27 @@
         transcodeOrdinal = -1;
         updatePill(-1, 0);
         // 一次把本片所有文本字幕轨都抽出来：读盘只读一遍，切别的语言就不用再等
-        var batch = subItems.filter(function (x) { return x.kind === 'embedded'; })
-          .map(function (x) { return x.ordinal - 1; });
-        if (batch.indexOf(s.ordinal - 1) < 0) batch.push(s.ordinal - 1);
-        invoke('extract_subtitle_start', { videoPath: currentVideoPath, subIndices: batch, durationUs: probeDurationUs || null }).then(function () {
-          if (transcodeVideo === currentVideoPath && pendingSub === s) {
-            toast('正在后台抽取内嵌字幕（本片 ' + batch.length + ' 条文本轨一次读完），完成后自动挂载', 7000);
-          }
+        var batch = subItems.filter(function (x) { return x.kind === 'embedded' && x.track; })
+          .map(function (x) { return { index: x.ordinal - 1, track: x.track, ass: x.codecLabel === 'ASS' }; });
+        if (!batch.some(function (b) { return b.index === s.ordinal - 1; })) {
+          batch.push({ index: s.ordinal - 1, track: s.track, ass: s.codecLabel === 'ASS' });
+        }
+        invoke('extract_subtitle_start', { videoPath: currentVideoPath, subs: batch, durationUs: probeDurationUs || null }).then(function () {
+          // 有 Cues 索引的片子是同步抽好的（毫秒级），直接挂；否则等后台任务
+          var wantPath = normPath(currentVideoPath);
+          var target = subSrtPath(currentVideoPath, s.ordinal);
+          invoke('fs_stat', { path: target }).then(function (st) {
+            if (normPath(currentVideoPath) !== wantPath) return; // 已经换片
+            if (st.kind === 'file') {
+              pendingSub = null;
+              hidePill();
+              transcodeVideo = '';
+              transcodeOrdinal = -1;
+              mountSubtitleUrl(mediaUrl(target), s, false);
+            } else if (transcodeVideo === currentVideoPath && pendingSub === s) {
+              toast('正在后台抽取内嵌字幕（本片 ' + batch.length + ' 条文本轨一次读完），完成后自动挂载', 7000);
+            }
+          }).catch(function () { });
         }).catch(function (e) {
           hidePill();
           transcodeVideo = '';

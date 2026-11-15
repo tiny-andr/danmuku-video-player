@@ -9,6 +9,7 @@ use tauri::Manager;
 
 mod autostart;
 mod mkv_probe;
+mod mkv_sub;
 mod pgs_render;
 mod transcode;
 
