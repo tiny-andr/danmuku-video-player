@@ -1483,8 +1483,14 @@
         transcodeVideo = currentVideoPath;
         transcodeOrdinal = -1;
         updatePill(-1, 0);
-        invoke('extract_subtitle_start', { videoPath: currentVideoPath, subIndex: s.ordinal - 1, durationUs: probeDurationUs || null }).then(function () {
-          if (transcodeVideo === currentVideoPath && pendingSub === s) toast('正在后台抽取内嵌字幕，完成后自动挂载', 6000);
+        // 一次把本片所有文本字幕轨都抽出来：读盘只读一遍，切别的语言就不用再等
+        var batch = subItems.filter(function (x) { return x.kind === 'embedded'; })
+          .map(function (x) { return x.ordinal - 1; });
+        if (batch.indexOf(s.ordinal - 1) < 0) batch.push(s.ordinal - 1);
+        invoke('extract_subtitle_start', { videoPath: currentVideoPath, subIndices: batch, durationUs: probeDurationUs || null }).then(function () {
+          if (transcodeVideo === currentVideoPath && pendingSub === s) {
+            toast('正在后台抽取内嵌字幕（本片 ' + batch.length + ' 条文本轨一次读完），完成后自动挂载', 7000);
+          }
         }).catch(function (e) {
           hidePill();
           transcodeVideo = '';
@@ -1946,7 +1952,8 @@
         var s = pendingSub;
         pendingSub = null;
         if (s && normPath(currentVideoPath) === normPath(p.video)) {
-          mountSubtitleUrl(mediaUrl(p.out), s, false); // 正播这个文件：直接挂载抽取好的字幕
+          // 一次抽一批，按本项目标轨的缓存路径挂载（不依赖事件里的第一个产物）
+          mountSubtitleUrl(mediaUrl(subSrtPath(currentVideoPath, s.ordinal)), s, false);
         }
       } else if (transcodeOrdinal > 0) {
         var ordinal = transcodeOrdinal;

@@ -118,6 +118,8 @@ pub struct JobDone {
     pub kind: String,
     pub video: String,
     pub out: String,
+    /// 这一批的全部产物（一次 ffmpeg 调用可能抽出多条字幕轨）
+    pub outs: Vec<String>,
 }
 
 #[derive(Serialize, Clone)]
@@ -211,11 +213,21 @@ fn ffmpeg_audio_args(src: &Path, audio_index: usize, out: &Path, limit_secs: Opt
     a
 }
 
-/// 字幕轨 → SRT（文本轨道统一转 srt，ASS 样式丢弃，与前端 VTT 渲染一致）。字幕轨稀疏读取，无需限速。
-fn ffmpeg_sub_args(src: &Path, sub_index: usize, out: &Path) -> Vec<String> {
+/// 字幕轨 → SRT（文本轨道统一转 srt，ASS 样式丢弃，与前端 VTT 渲染一致）。
+/// 一次调用可以带多条轨：MKV 的音频块和字幕块遍布每个 cluster，读一遍盘就够，
+/// 每条轨单独起进程会把整部片重读一遍（30 GB 片子 3 条字幕 = 3 遍）。
+fn ffmpeg_sub_args(src: &Path, subs: &[(usize, PathBuf)]) -> Vec<String> {
     let mut a = ffmpeg_header();
-    a.extend(["-i".into(), src.to_string_lossy().into_owned(), "-map".into(), format!("0:s:{sub_index}"), "-c:s".into(), "srt".into()]);
-    a.push(out.to_string_lossy().into_owned());
+    a.extend(["-i".into(), src.to_string_lossy().into_owned()]);
+    for (index, out) in subs {
+        a.extend([
+            "-map".into(),
+            format!("0:s:{index}"),
+            "-c:s".into(),
+            "srt".into(),
+            out.to_string_lossy().into_owned(),
+        ]);
+    }
     a
 }
 
@@ -297,16 +309,18 @@ struct JobSpec {
     kind: &'static str, // "audio" | "subtitle"
     video: String,
     args: Vec<String>,
-    tmp: PathBuf,
-    out: PathBuf,
+    /// 每个产物：(临时文件, 最终文件)。多于一个表示一次 ffmpeg 调用产出多个文件 ——
+    /// 音频块和字幕块遍布每个 cluster，读取次数才是成本，多路输出共用同一次 demux。
+    outputs: Vec<(PathBuf, PathBuf)>,
     duration_us: Option<u64>,
 }
 
 /// 单任务启动器：杀旧任务 → 拉起新 ffmpeg → 进度/收尾线程（改名 + 发事件）。
-fn spawn_job(app: AppHandle, state: tauri::State<'_, JobState>, spec: JobSpec) -> Result<String, String> {
+/// 返回这一批的全部产物路径。
+fn spawn_job(app: AppHandle, state: tauri::State<'_, JobState>, spec: JobSpec) -> Result<Vec<String>, String> {
     let ffmpeg = find_ffmpeg()?;
-    if spec.out.is_file() {
-        return Ok(spec.out.to_string_lossy().into_owned()); // 缓存已存在
+    if spec.outputs.is_empty() {
+        return Ok(Vec::new());
     }
 
     // 让位：同步杀旧任务并回收，确保 tmp 文件句柄已释放
@@ -327,17 +341,21 @@ fn spawn_job(app: AppHandle, state: tauri::State<'_, JobState>, spec: JobSpec) -
 
     let kind = spec.kind.to_string();
     let video_str = spec.video.clone();
-    let out_str = spec.out.to_string_lossy().into_owned();
-    let tmp2 = spec.tmp.clone();
-    let out2 = spec.out.clone();
+    let outputs = spec.outputs.clone();
+    let first_out = outputs
+        .first()
+        .map(|(_, o)| o.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let all_outs: Vec<String> = outputs.iter().map(|(_, o)| o.to_string_lossy().into_owned()).collect();
     let duration_us = spec.duration_us;
     let app2 = app.clone();
     std::thread::spawn(move || {
         let err_thread = std::thread::spawn(move || drain_stderr(stderr));
+        let out_for_progress = first_out.clone();
         pump_progress(stdout, duration_us, |percent, written| {
             let _ = app2.emit(
                 "transcode://progress",
-                JobProgress { kind: kind.clone(), video: video_str.clone(), out: out_str.clone(), percent, written },
+                JobProgress { kind: kind.clone(), video: video_str.clone(), out: out_for_progress.clone(), percent, written },
             );
         });
         let err_tail = err_thread.join().unwrap_or_default();
@@ -347,31 +365,55 @@ fn spawn_job(app: AppHandle, state: tauri::State<'_, JobState>, spec: JobSpec) -
             Some(mut job) => {
                 let ok = job.child.wait().map(|s| s.success()).unwrap_or(false);
                 if ok {
-                    if fs::rename(&tmp2, &out2).is_ok() {
-                        let _ = app2.emit("transcode://done", JobDone { kind, video: video_str, out: out_str });
-                    } else {
-                        let _ = fs::remove_file(&tmp2);
+                    let mut renamed = Vec::new();
+                    let mut failed = None;
+                    for (tmp, out) in &outputs {
+                        if fs::rename(tmp, out).is_ok() {
+                            renamed.push(out.to_string_lossy().into_owned());
+                        } else {
+                            failed = Some(out.to_string_lossy().into_owned());
+                            break;
+                        }
+                    }
+                    if let Some(bad) = failed {
+                        for (tmp, _) in &outputs {
+                            let _ = fs::remove_file(tmp);
+                        }
                         let _ = app2.emit(
                             "transcode://error",
-                            JobError { kind, video: video_str, out: out_str, message: "产物改名失败".into() },
+                            JobError { kind, video: video_str, out: bad, message: "产物改名失败".into() },
+                        );
+                    } else {
+                        let _ = app2.emit(
+                            "transcode://done",
+                            JobDone {
+                                kind,
+                                video: video_str,
+                                out: first_out.clone(),
+                                outs: renamed,
+                            },
                         );
                     }
                 } else {
-                    let _ = fs::remove_file(&tmp2);
+                    for (tmp, _) in &outputs {
+                        let _ = fs::remove_file(tmp);
+                    }
                     let _ = app2.emit(
                         "transcode://error",
-                        JobError { kind, video: video_str, out: out_str, message: last_err_line(&err_tail) },
+                        JobError { kind, video: video_str, out: first_out.clone(), message: last_err_line(&err_tail) },
                     );
                 }
             }
             // 被取消或让位：静默清理半成品
             None => {
-                let _ = fs::remove_file(&tmp2);
+                for (tmp, _) in &outputs {
+                    let _ = fs::remove_file(tmp);
+                }
             }
         }
     });
 
-    Ok(spec.out.to_string_lossy().into_owned())
+    Ok(all_outs)
 }
 
 // ---- Tauri 命令 ----
@@ -397,44 +439,58 @@ pub fn transcode_audio_start(
     }
     let out = mka_cache_path(&src, audio_index);
     let tmp = tmp_path(&out);
-    spawn_job(
+    let paths = spawn_job(
         app,
         state,
         JobSpec {
             kind: "audio",
             video: video_path,
             args: ffmpeg_audio_args(&src, audio_index, &tmp, None),
-            tmp,
-            out,
+            outputs: vec![(tmp, out)],
             duration_us,
         },
-    )
+    )?;
+    Ok(paths.into_iter().next().unwrap_or_default())
 }
 
 /// 启动后台内嵌字幕抽取（文本轨 → SRT）。
+/// `sub_indices` 一次给全：多条字幕轨共用同一个 ffmpeg 进程和同一次读盘，
+/// 已经有缓存的轨自动跳过。返回这一批真正产出的文件路径。
 #[tauri::command]
 pub fn extract_subtitle_start(
     app: AppHandle,
     state: tauri::State<'_, JobState>,
     video_path: String,
-    sub_index: usize,
+    sub_indices: Vec<usize>,
     duration_us: Option<u64>,
-) -> Result<String, String> {
+) -> Result<Vec<String>, String> {
     let src = PathBuf::from(&video_path);
     if !src.is_file() {
         return Err("源视频不存在".into());
     }
-    let out = srt_cache_path(&src, sub_index);
-    let tmp = tmp_path(&out);
+    let mut targets: Vec<(usize, PathBuf)> = Vec::new();
+    let mut outputs: Vec<(PathBuf, PathBuf)> = Vec::new();
+    for idx in sub_indices {
+        let out = srt_cache_path(&src, idx);
+        if out.is_file() {
+            continue; // 已经有这条字幕了，不必再读盘
+        }
+        let tmp = tmp_path(&out);
+        targets.push((idx, tmp.clone()));
+        outputs.push((tmp, out));
+    }
+    if outputs.is_empty() {
+        return Ok(Vec::new());
+    }
+    let args = ffmpeg_sub_args(&src, &targets);
     spawn_job(
         app,
         state,
         JobSpec {
             kind: "subtitle",
             video: video_path,
-            args: ffmpeg_sub_args(&src, sub_index, &tmp),
-            tmp,
-            out,
+            args,
+            outputs,
             duration_us,
         },
     )
@@ -518,7 +574,7 @@ mod tests {
         let sub_index = std::env::var("TRANSCODE_TEST_SUB").ok().and_then(|v| v.parse::<usize>().ok());
         let src_path = Path::new(&src);
         let args = match sub_index {
-            Some(i) => ffmpeg_sub_args(src_path, i, Path::new(&out)),
+            Some(i) => ffmpeg_sub_args(src_path, &[(i, PathBuf::from(&out))]),
             None => ffmpeg_audio_args(src_path, 0, Path::new(&out), None),
         };
         // 字幕轨开头经常没有对白，窗口放大到 10 分钟
