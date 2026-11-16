@@ -481,6 +481,45 @@ pub struct SubTrack {
     pub ass: bool,
 }
 
+/// 把外挂字幕（ASS/SSA 等）转成 SRT 文本，结果只回给前端，不落盘。
+/// Artplayer 的字幕只认 vtt/srt，外挂 .ass 直接挂上去会「显示已挂载但什么都不出现」，
+/// 交给 ffmpeg 转一次最稳：编码、特效行、样式标记它都处理得掉。
+#[tauri::command]
+pub fn subtitle_to_srt_text(path: String) -> Result<String, String> {
+    let src = PathBuf::from(&path);
+    if !src.is_file() {
+        return Err("字幕文件不存在".into());
+    }
+    let ffmpeg = find_ffmpeg()?;
+    let mut cmd = hidden_command(&ffmpeg);
+    cmd.args([
+        "-hide_banner",
+        "-nostdin",
+        "-loglevel",
+        "error",
+        "-i",
+        &path,
+        "-f",
+        "srt",
+        "pipe:1",
+    ]);
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let out = cmd
+        .output()
+        .map_err(|e| format!("启动 ffmpeg 失败: {e}"))?;
+    if !out.status.success() {
+        let msg = String::from_utf8_lossy(&out.stderr);
+        return Err(format!("字幕转换失败：{}", last_err_line(&msg)));
+    }
+    // ffmpeg 转 ASS 时会生成 <font face=...> 这类样式标签，播放器不解析标签、
+    // 会原样显示在画面上，所以这里统一剥掉，只留纯文本。
+    let srt = crate::mkv_sub::strip_markup(&String::from_utf8_lossy(&out.stdout));
+    if srt.trim().is_empty() {
+        return Err("这条字幕没有可显示的内容".into());
+    }
+    Ok(srt)
+}
+
 /// 抽取好的字幕文本（纯内存交给前端，不落盘）
 #[derive(Serialize, Clone)]
 pub struct SubText {
@@ -570,7 +609,8 @@ fn spawn_text_job(
         use std::io::Read as _;
         let _ = reader.read_to_end(&mut raw);
         let err_tail = err_thread.join().unwrap_or_default();
-        let srt = String::from_utf8_lossy(&raw).into_owned();
+        // 同样要剥标签：内嵌 ASS 走 ffmpeg 回退时会带上 <font face=...>
+        let srt = crate::mkv_sub::strip_markup(&String::from_utf8_lossy(&raw));
 
         let status = app2.state::<JobState>().lock().unwrap().take_if(|j| j.gen == gen);
         let Some(mut job) = status else { return }; // 被取消/让位

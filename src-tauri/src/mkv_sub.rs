@@ -297,6 +297,24 @@ struct SubEntry {
     text: String,
 }
 
+/// 去掉字幕文本里的 HTML 风格标签（`<font face=...>`、`<i>`、`</font>` 等）。
+///
+/// 播放器把 cue 文本用 textContent 写进 DOM，不解析标签，所以这些会原样显示在画面上。
+/// SRT 文本里 `<` 极罕见，时间轴用的 `-->` 不含 `<`，整段扫一遍是安全的。
+pub fn strip_markup(srt: &str) -> String {
+    let mut out = String::with_capacity(srt.len());
+    let mut inside = false;
+    for ch in srt.chars() {
+        match ch {
+            '<' => inside = true,
+            '>' if inside => inside = false,
+            _ if !inside => out.push(ch),
+            _ => {}
+        }
+    }
+    out
+}
+
 /// 稀疏抽出某条文本字幕轨，返回 SRT 内容。
 ///
 /// 全程 fail-closed：任何一条 cue 解析不出（缺 CueRelativePosition、block 带 lacing、
@@ -422,7 +440,7 @@ pub fn sparse_extract_srt(path: &Path, track_number: u32, is_ass: bool) -> Resul
         };
         out.push_str(&format!("{}\n{} --> {}\n{}\n\n", i + 1, fmt_ts(e.start_ms), fmt_ts(end), e.text));
     }
-    Ok(out)
+    Ok(strip_markup(&out))
 }
 
 #[cfg(test)]

@@ -323,6 +323,7 @@ pub fn run() {
             transcode::transcode_target,
             transcode::transcode_audio_start,
             transcode::extract_subtitle_text,
+            transcode::subtitle_to_srt_text,
             transcode::transcode_audio_cancel,
             transcode::clean_sidecar_tmp,
             autostart::get_autostart,

@@ -1341,7 +1341,21 @@
       if (!audioTrack || normPath(currentVideoPath) !== normPath(path)) return;
       externalOrdinal = ordinal;
       isolateVideoAudio();
-      audioTrack.update({ url: mediaUrl(mkaPath) });
+      var url = mediaUrl(mkaPath);
+      // 插件 update() 只在 e.url !== 内部缓存 n 时才真正设 src，而换片时
+      // resetExternalAudio() 会把 <audio> 的 src 清掉、插件的 n 却停在旧值。
+      // 于是重复打开同一个文件时 update 被短路，外挂音轨一直是空的 —— 表现为没声音。
+      // 所以这里以元素的实际 src 为准，不用插件的 diff 判断。
+      if (audioTrack.audio.src !== url) {
+        try {
+          audioTrack.audio.src = url;
+          audioTrack.audio.load();
+        } catch (e) { }
+      }
+      audioTrack.update({ url: url }); // 同步插件内部记录，后面 play 事件才认这条音轨
+      if (art && art.playing) {
+        try { audioTrack.audio.play().catch(function () { }); } catch (e) { }
+      }
       diag('engaged');
       refreshAudioMenu();
       if (!silent) toast('音轨' + ordinal + ' 外挂音频已挂载');
@@ -1417,7 +1431,9 @@
     function switchAudioTrack(i) {
       if (fullCacheActive || !hasDeadAudio() || !probeTracks || !probeTracks[i] || !currentVideoPath) return;
       $('audioPanel').hidden = true;
-      if (externalOrdinal === i + 1) return;
+      // 已选中但底层 audio 其实没有 src（换片时被清空）时不能直接 return，
+      // 否则用户点这条音轨也救不回来，只能听着静音。
+      if (externalOrdinal === i + 1 && audioTrack && audioTrack.audio.getAttribute('src')) return;
       var t = probeTracks[i];
       var label = codecName(String(t.codec || '').toUpperCase()) || '未知编码';
       ensureAudioTrack(currentVideoPath, probeDurationUs, i, label, true); // 手动点选：总是允许转码
@@ -1533,7 +1549,16 @@
       if (s.kind === 'bitmap') { mountPgsSubtitle(s, silent); return; }
       unmountPgs(); // 从位图字幕切到文本字幕：收起图像层
       if (s.kind === 'ext') {
-        mountSubtitleUrl(mediaUrl(s.path), s, silent);
+        // 外挂字幕全部先转成干净的 SRT 文本再挂：
+        // Artplayer 内置的 assToVtt 生成的 VTT 不合法（WEBVTT 后无换行、序号和时间轴挤在一行），
+        // 结果是「菜单显示已挂载、画面一个字都没有」；而它又用 textContent 渲染，
+        // <font> / <i> 这些标签会原样显示在画面上。交给 ffmpeg 统一转换 + 后端剥标签，
+        // 编码 / GBK / 样式标签一并处理掉。
+        invoke('subtitle_to_srt_text', { path: s.path }).then(function (srt) {
+          mountSubtitleText(srt, { id: s.id, name: s.name }, silent);
+        }).catch(function (e) {
+          toast('字幕加载失败：' + e, 6000);
+        });
         return;
       }
       // 内嵌：整条链走内存，不产生缓存文件
