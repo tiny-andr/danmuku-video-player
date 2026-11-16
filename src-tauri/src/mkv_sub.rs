@@ -65,6 +65,12 @@ fn children(buf: &[u8], mut pos: usize, end: usize) -> Vec<(u64, usize, Option<u
     while pos < end {
         let Some((id, p2)) = vint(buf, pos, true) else { break };
         let Some((size, p3)) = vint(buf, p2, false) else { break };
+        // 头本身就越过父范围时直接收尾。以前照样 push，会产出 start > end 的元素，
+        // 下游 read_uint 切片立刻 panic；而这个 panic 发生在 spawn_blocking 里，
+        // 前端只会看到一个永不 settle 的进度胶囊。
+        if p3 > end {
+            break;
+        }
         // 未知长度（尺寸位全 1）会算出超大值，超界即视为不可解析，直接收尾
         let stop = p3.checked_add(size as usize).filter(|e| *e <= end);
         out.push((id, p3, stop));
@@ -88,30 +94,37 @@ fn find_child(buf: &[u8], start: usize, end: usize, want: u64) -> Option<(usize,
 
 fn read_uint(buf: &[u8], start: usize, end: usize) -> u64 {
     let mut v = 0u64;
-    for b in &buf[start..end.min(buf.len())] {
+    // 不用 `&buf[start..end]`：损坏的字节流能让 start 跑到 end 之后，切片直接 panic。
+    // 区间非法时按 0 处理（跟"元素缺失"同义），交给上层已有的 fail-closed 校验去拒绝。
+    let Some(bytes) = buf.get(start..end.min(buf.len())) else { return 0 };
+    for b in bytes {
         v = (v << 8) | *b as u64;
     }
     v
 }
 
+/// 从已读进内存的文件头里取 TimestampScale。
+/// 返回 None 表示这段窗口里没有 Info，或 Info 里没有该元素——调用方必须 fail-closed。
+fn read_timestamp_scale(head: &[u8], seg_data: usize) -> Option<u64> {
+    let (info_start, info_end) = find_child(head, seg_data, head.len(), ID_INFO)?;
+    let (s, e) = find_child(head, info_start, info_end, ID_TIMESTAMP_SCALE)?;
+    Some(read_uint(head, s, e))
+}
+
 /// 通过 SeekHead 找到 Cues 的绝对位置，同时返回 Segment 数据区起点和 TimestampScale。
-/// TimestampScale 必须读到：所有时间戳换算成毫秒都靠它，猜错了整条字幕的时间轴会整体偏移。
-fn locate_cues(f: &mut File) -> Option<(u64, u64, u64)> {
+/// TimestampScale 必须读到：所有时间戳换算成毫秒都靠它。只读前 2 MB 就够不到 Info 的片子
+/// （4K 片首簇常超 2 MB）以前静默按 1e6 猜，实际值非 1e6 时整条时间轴按比例错位，
+/// 产出却是一份看起来正常的 SRT —— 所以读不到就返回 Err 让调用方回退 ffmpeg。
+fn locate_cues(f: &mut File) -> Result<(u64, u64, u64), String> {
     let mut head = vec![0u8; 2 * 1024 * 1024];
-    f.seek(SeekFrom::Start(0)).ok()?;
-    let n = f.read(&mut head).ok()?;
+    f.seek(SeekFrom::Start(0)).map_err(|e| e.to_string())?;
+    let n = f.read(&mut head).map_err(|e| e.to_string())?;
     head.truncate(n);
 
-    let seg = find_child(&head, 0, head.len(), ID_SEGMENT)?;
+    let seg = find_child(&head, 0, head.len(), ID_SEGMENT).ok_or("不是有效的 MKV：找不到 Segment")?;
     let seg_data = seg.0 as u64;
-
-    // Info → TimestampScale（缺省按规范是 1000000 ns = 1 ms）
-    let mut timestamp_scale = 1_000_000u64;
-    if let Some((ids, ide)) = find_child(&head, seg_data as usize, head.len(), ID_INFO) {
-        if let Some((s, e)) = find_child(&head, ids, ide, ID_TIMESTAMP_SCALE) {
-            timestamp_scale = read_uint(&head, s, e);
-        }
-    }
+    let timestamp_scale = read_timestamp_scale(&head, seg_data as usize)
+        .ok_or("头部 2 MB 内没读到 TimestampScale，时间轴无法确定，回退整片抽取")?;
 
     for (id, ds, de) in children(&head, seg_data as usize, head.len()) {
         if id != ID_SEEK_HEAD {
@@ -128,19 +141,21 @@ fn locate_cues(f: &mut File) -> Option<(u64, u64, u64)> {
             for (cid, cds, cde) in children(&head, sds, seek_end) {
                 let e = cde.unwrap_or(seek_end);
                 match cid {
-                    ID_SEEK_ID => seek_id = Some(&head[cds..e]),
+                    // 用 get 而不是直接切片：长度是文件里读来的，损坏时可能越过缓冲区
+                    ID_SEEK_ID => seek_id = head.get(cds..e),
                     ID_SEEK_POS => seek_pos = Some(read_uint(&head, cds, e)),
                     _ => {}
                 }
             }
             if seek_id == Some(CUE_BYTES) {
                 if let Some(p) = seek_pos {
-                    return Some((seg_data + p, seg_data, timestamp_scale));
+                    let abs = seg_data.checked_add(p).ok_or("Cues 位置溢出，回退整片抽取")?;
+                    return Ok((abs, seg_data, timestamp_scale));
                 }
             }
         }
     }
-    None
+    Err("没有 Cues 索引".into())
 }
 
 #[derive(Debug, Clone)]
@@ -248,10 +263,13 @@ fn parse_block(buf: &[u8], start: usize, _track_hint: u32) -> Option<(u32, i64, 
     p += 2;
     let flags = buf[p];
     p += 1;
-    if eid == ID_SIMPLE_BLOCK && flags & 0x06 != 0 {
-        return None; // 带 lacing 的字幕极罕见，交给 ffmpeg 回退
+    // Block 与 SimpleBlock 的 flags 布局相同（bit1-2 = lacing）。以前只查了 SimpleBlock，
+    // BlockGroup 里的 Block 带 lacing 时正文前面是 lace 头，会被当成字幕字节 →
+    // 乱码却不报错，用户只觉得"这段字怎么不对"。两种都拒绝，交给 ffmpeg 回退。
+    if flags & 0x06 != 0 {
+        return None;
     }
-    Some((track as u32, rel_ts, duration, buf[p..de].to_vec()))
+    buf.get(p..de).map(|b| (track as u32, rel_ts, duration, b.to_vec()))
 }
 
 pub(crate) fn fmt_ts(ms: i64) -> String {
@@ -344,7 +362,7 @@ pub fn strip_markup(srt: &str) -> String {
 /// 用户只会觉得"这段怎么没字幕"，而且没有任何自动修复途径。
 pub fn sparse_extract_srt(path: &Path, track_number: u32, is_ass: bool) -> Result<String, String> {
     let mut f = File::open(path).map_err(|e| e.to_string())?;
-    let (cues_pos, seg_data, timestamp_scale) = locate_cues(&mut f).ok_or("没有 Cues 索引")?;
+    let (cues_pos, seg_data, timestamp_scale) = locate_cues(&mut f)?;
     if timestamp_scale != 1_000_000 {
         return Err(format!("TimestampScale={timestamp_scale}，非 1ms 时间基，回退整片抽取"));
     }
@@ -359,7 +377,12 @@ pub fn sparse_extract_srt(path: &Path, track_number: u32, is_ass: bool) -> Resul
     let mut dropped = 0usize;
 
     for cue in &cues {
-        let cluster_abs = seg_data + cue.cluster;
+        // 下面这些加法的两个操作数都是文件里读出来的 u64，溢出在 debug 下会 panic、
+        // release 下会回绕到一个随便的位置——两种都是错数据，统一按"这条 cue 解析失败"处理。
+        let Some(cluster_abs) = seg_data.checked_add(cue.cluster) else {
+            dropped += 1;
+            continue;
+        };
         // 没有 CueRelativePosition 就没法定位到 block，只能整轨回退
         let Some(relative) = cue.relative else {
             return Err("Cues 缺少 CueRelativePosition，无法精确定位字幕块".into());
@@ -384,13 +407,20 @@ pub fn sparse_extract_srt(path: &Path, track_number: u32, is_ass: bool) -> Resul
         };
         let cluster_ts = read_uint(&head[..hn], ts_s, ts_e);
 
-        let block_off = cdata + relative as usize;
+        let Some(block_off) = usize::try_from(relative).ok().and_then(|r| cdata.checked_add(r)) else {
+            dropped += 1;
+            continue;
+        };
         let mut got = None;
         if block_off < hn.saturating_sub(16) {
             got = parse_block(&head[..hn], block_off, track_number);
         }
         if got.is_none() {
-            f.seek(SeekFrom::Start(cluster_abs + block_off as u64)).map_err(|e| e.to_string())?;
+            let Some(abs) = cluster_abs.checked_add(block_off as u64) else {
+                dropped += 1;
+                continue;
+            };
+            f.seek(SeekFrom::Start(abs)).map_err(|e| e.to_string())?;
             let n = f.read(&mut buf).map_err(|e| e.to_string())?;
             got = parse_block(&buf[..n], 0, track_number);
         }
@@ -403,6 +433,10 @@ pub fn sparse_extract_srt(path: &Path, track_number: u32, is_ass: bool) -> Resul
             continue;
         }
         let Ok(base_ms) = i64::try_from(cluster_ts) else {
+            dropped += 1;
+            continue;
+        };
+        let Some(start_ms) = base_ms.checked_add(rel_ts) else {
             dropped += 1;
             continue;
         };
@@ -434,7 +468,7 @@ pub fn sparse_extract_srt(path: &Path, track_number: u32, is_ass: bool) -> Resul
             continue; // 空字幕块是合法的，不算失败
         }
         entries.push(SubEntry {
-            start_ms: base_ms + rel_ts,
+            start_ms,
             duration,
             text,
         });
@@ -451,9 +485,12 @@ pub fn sparse_extract_srt(path: &Path, track_number: u32, is_ass: bool) -> Resul
 
     let mut out = String::with_capacity(entries.len() * 64);
     for (i, e) in entries.iter().enumerate() {
-        let end = match e.duration {
-            Some(d) if d > 0 => e.start_ms + d as i64,
-            _ => entries
+        // BlockDuration 是文件里读来的 u64，超出 i64 的畸形值以前会 as 成负数，
+        // 产出一条 end < start 的坏 SRT；这种值按"没有时长"处理，退回下一条 cue 推算。
+        let dur = e.duration.and_then(|d| i64::try_from(d).ok()).filter(|d| *d > 0);
+        let end = match dur {
+            Some(d) => e.start_ms.saturating_add(d),
+            None => entries
                 .get(i + 1)
                 .map(|n| n.start_ms)
                 .filter(|n| *n > e.start_ms)
@@ -503,5 +540,96 @@ mod tests {
             Ok(srt) => println!("OK {} bytes\n{}", srt.len(), srt.chars().take(400).collect::<String>()),
             Err(e) => println!("ERR: {e}"),
         }
+    }
+
+    fn temp_mkv_path(tag: &str) -> std::path::PathBuf {
+        let mut p = std::env::temp_dir();
+        // 带进程号：同一进程里并行跑的测试不会撞名，也避开本机其它进程的临时文件
+        p.push(format!("bplayer_mkv_sub_{}_{tag}.mkv", std::process::id()));
+        p
+    }
+
+    /// BlockGroup 里的 Block 与 SimpleBlock 的 flags 布局相同，带 lacing 时正文前面是
+    /// lace 头。以前只拒绝了 SimpleBlock 的 lacing，BlockGroup 这条会把 lace 头当字幕字节。
+    #[test]
+    fn block_group_with_lacing_is_rejected() {
+        // BlockGroup { Block [track=1, rel_ts=0, flags=0x02(Xiph lacing), "hi"] }
+        let mut buf = vec![0xA0, 0x88, 0xA1, 0x86, 0x81, 0x00, 0x00, 0x02, b'h', b'i'];
+        assert!(
+            parse_block(&buf, 0, 1).is_none(),
+            "BlockGroup 里带 lacing 的 Block 必须被拒绝"
+        );
+        // 同一条 Block 去掉 lacing 位后要能正常解析，证明判的是 flags 而不是整类元素
+        buf[7] = 0x00;
+        let (track, rel_ts, duration, payload) =
+            parse_block(&buf, 0, 1).expect("无 lacing 的 Block 应能解析");
+        assert_eq!(track, 1);
+        assert_eq!(rel_ts, 0);
+        assert!(duration.is_none());
+        assert_eq!(payload, b"hi".to_vec());
+    }
+
+    /// 截断元素会让 payload 起点越过父范围。以前 children 照样把它 push 出去，
+    /// read_uint 拿 start > end 去切片就 panic；panic 落在 spawn_blocking 里会变成
+    /// JoinError / 永不 settle 的 Promise，前端进度胶囊卡死。
+    #[test]
+    fn children_never_emit_start_beyond_end() {
+        // 只有 ID + 尺寸头、没有内容：p3(=2) 已经越过 end(=1)
+        let out = children(&[0xA0, 0x81], 0, 1);
+        assert!(out.is_empty(), "越过父范围的元素不应进入结果：{out:?}");
+        for raw_end in 0..=4usize {
+            for buf in [
+                &b"\xA0"[..],
+                &b"\xA0\x81"[..],
+                &b"\xA0\x88\x81"[..],
+                &b"\xA1\xFF\xFF"[..],
+            ] {
+                let end = raw_end.min(buf.len());
+                for (_id, ds, de) in children(buf, 0, end) {
+                    assert!(ds <= end, "元素起点 {ds} 越过父范围 {end}");
+                    if let Some(de) = de {
+                        assert!(de >= ds && de <= end, "非法区间 {ds}..{de}（父范围到 {end}）");
+                    }
+                    // 以前这一行会 panic
+                    let _ = read_uint(buf, ds, de.unwrap_or(end));
+                }
+            }
+        }
+        // read_uint 自己收到非法区间也只能返回 0，不能切片 panic
+        assert_eq!(read_uint(b"abc", 3, 1), 0);
+        assert_eq!(read_uint(b"abc", 99, 100), 0);
+    }
+
+    /// TimestampScale 只从文件头 2 MB 里找。Info 落在首个 Cluster 之后时（4K 片首簇常
+    /// 超 2 MB）读不到，以前静默按 1e6 猜 —— 实际值非 1e6 就整条时间轴错位。
+    /// 现在必须走 Err，让调用方回退 ffmpeg。
+    #[test]
+    fn timestamp_scale_missing_is_fail_closed() {
+        // 最小 MKV：EBML 头 + 未知长度的 Segment，Segment 里故意没有 Info
+        let bytes = vec![
+            0x1A, 0x45, 0xDF, 0xA3, 0x84, 0x42, 0x86, 0x81, 0x01, // EBML
+            0x18, 0x53, 0x80, 0x67, 0xFF, // Segment（未知长度）
+        ];
+        assert_eq!(read_timestamp_scale(&bytes, 14), None, "没有 Info 时不能编出一个 scale");
+        let path = temp_mkv_path("no_scale");
+        std::fs::write(&path, &bytes).unwrap();
+        let err = sparse_extract_srt(&path, 1, false).expect_err("缺 TimestampScale 必须整体 Err");
+        let _ = std::fs::remove_file(&path);
+        assert!(
+            err.contains("TimestampScale"),
+            "必须是 TimestampScale 缺失导致的 Err（而不是猜 1e6 后继续解析），实际：{err}"
+        );
+    }
+
+    /// 有 Info 时要正常读到 1e6，别把上面那条 fail-closed 修成对正常片源也拒绝。
+    #[test]
+    fn timestamp_scale_is_read_from_info() {
+        let bytes = vec![
+            0x1A, 0x45, 0xDF, 0xA3, 0x84, 0x42, 0x86, 0x81, 0x01, // EBML
+            0x18, 0x53, 0x80, 0x67, 0xFF, // Segment（未知长度）
+            // Info { TimestampScale = 1000000 }
+            0x15, 0x49, 0xA9, 0x66, 0x87, 0x2A, 0xD7, 0xB1, 0x83, 0x0F, 0x42, 0x40,
+        ];
+        assert_eq!(read_timestamp_scale(&bytes, 14), Some(1_000_000));
     }
 }

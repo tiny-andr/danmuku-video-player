@@ -8,14 +8,16 @@
 // srt / vtt / ass / ssa 全是纯文本容器，所谓"转换"只是重排时间轴、丢掉样式，
 // 不需要任何解码器。这里自己实现，ffmpeg 只留给这套解析认不出来的格式兜底。
 
-use std::fs;
 use std::path::Path;
 
 use crate::mkv_sub::{ass_clean_text, fmt_ts, strip_markup};
 
 /// 读字幕文件并转成规范化的 SRT 文本（已剥掉样式标签）。
 pub fn to_srt(path: &Path) -> Result<String, String> {
-    let bytes = fs::read(path).map_err(|e| format!("读取字幕失败：{e}"))?;
+    // 走带上限的读：外挂字幕也整读进内存，一个几十 GB 的假 .ass 能把进程读崩。
+    // 上限与弹幕/文本共用 64 MB —— 30 万条的超大 ASS 实测 19 MB，够用。
+    let bytes = crate::read_capped(&path.to_string_lossy(), crate::MAX_READ_BYTES)
+        .map_err(|e| format!("读取字幕失败：{e}"))?;
     if bytes.is_empty() {
         return Err("字幕文件是空的".into());
     }
@@ -264,6 +266,7 @@ fn strip_prefix_ci<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
     use std::path::PathBuf;
 
     /// 每个用例一个独立临时目录，跑完删掉；不进仓库、不碰媒体目录。

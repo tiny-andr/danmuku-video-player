@@ -116,16 +116,37 @@
   .placeholder .title { font-size: 18px; font-weight: 600; }
   .placeholder .sub { font-size: 13px; color: var(--muted); line-height: 1.8; }
   body.dragover #player { box-shadow: inset 0 0 0 3px rgba(139, 92, 246, .7); }
-  .toast {
+  /* 提示改成容器 + 动态节点：以前只有一个 toast 节点，后一条提示会改写前一条的文本并
+     重置计时器，连发两条时用户只看得见最后一条（「已挂载字幕」被「同步完成」吃掉）。
+     容器只负责居中与排列，每条提示各自管自己的寿命和倒计时条。 */
+  .toast-stack {
     position: fixed; left: 50%; top: 50%; transform: translate(-50%, -50%);
+    display: flex; flex-direction: column; gap: 10px; align-items: center;
+    z-index: 99; pointer-events: none; max-width: min(80vw, 760px);
+  }
+  .toast {
+    position: relative;
     background: #3b2a6b; border: 1px solid #a78bfa; color: #fff;
     padding: 13px 40px 13px 24px; border-radius: 12px; font-size: 14px; font-weight: 500;
     line-height: 1.65; text-align: center;
     box-shadow: 0 18px 60px -16px rgba(0, 0, 0, .9), 0 0 0 1px rgba(167, 139, 250, .15);
-    opacity: 0; transition: opacity .25s; pointer-events: none; z-index: 99;
+    opacity: 0; transition: opacity .25s; pointer-events: none;
     width: max-content; max-width: min(80vw, 760px);
   }
   .toast.show { opacity: 1; }
+  /* 倒计时窄条：提示时长是按文字长度算出来的，光看文字猜不到什么时候消失。
+     一条随剩余时间匀速缩短的细条比数字更直观，也不用额外读数。 */
+  .toast-bar {
+    position: absolute; left: 0; right: 0; bottom: 0; height: 3px;
+    border-radius: 0 0 11px 11px; overflow: hidden;
+    background: rgba(255, 255, 255, .12);
+    pointer-events: none;
+  }
+  .toast-bar i {
+    display: block; height: 100%; width: 100%;
+    background: linear-gradient(90deg, #a78bfa, #f472b6);
+    border-radius: inherit;
+  }
   .toast-close {
     position: absolute; top: 5px; right: 7px;
     width: 20px; height: 20px; padding: 0;
@@ -135,13 +156,28 @@
     cursor: pointer; font-family: inherit; pointer-events: auto;
   }
   .toast-close:hover { color: #fff; background: rgba(255, 255, 255, .16); }
-  .pill {
+  /* 音轨转码与字幕抽取是后端两个独立任务槽，各亮一颗胶囊：共用一个元素时两条进度流
+     会互相改写标签，用户看不出后台到底还剩几个任务在跑。
+     未显示的胶囊必须退出布局（display:none）——flex 的 gap 不会因为兄弟节点是透明的
+     就不占位，否则只剩一颗时它会被隐形的另一颗顶离右下角；淡入改用一次性动画补回来。 */
+  .pill-stack {
     position: fixed; right: 18px; bottom: 28px;
+    display: flex; flex-direction: column-reverse; gap: 8px; align-items: flex-end;
+    z-index: 99;
+  }
+  .pill {
+    position: relative; display: none;
     background: #232733; border: 1px solid var(--line); color: var(--text);
     padding: 8px 14px; border-radius: 10px; font-size: 12px;
-    opacity: 0; transition: opacity .25s; pointer-events: none; z-index: 99;
   }
-  .pill.show { opacity: 1; pointer-events: auto; cursor: pointer; }
+  .pill.show {
+    display: block; pointer-events: auto; cursor: pointer;
+    animation: pill-in .25s ease both;
+  }
+  /* 两颗胶囊上下叠着，后一个兄弟节点默认盖住前一个：悬停下面那颗时它的 tooltip
+     会被上面的胶囊挡住，所以把正在悬停的那颗整体提到最上层 */
+  .pill:hover { z-index: 2; }
+  @keyframes pill-in { from { opacity: 0; } to { opacity: 1; } }
   /* 悬浮提示：转码速度受磁盘读取限制的说明 */
   .pill::after {
     content: attr(data-tip);
@@ -254,6 +290,11 @@
     font-size: 11px; color: var(--muted); line-height: 1.65;
     border-top: 1px solid var(--line); padding-top: 10px;
   }
+  /* 版本行：用户报问题时唯一能自报的标识，弱化到不抢上面说明文字的位置 */
+  .settings-ver {
+    font-size: 11px; color: var(--muted); line-height: 1.6;
+    margin-top: -6px; opacity: .8;
+  }
   .switch { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: var(--muted); cursor: pointer; }
   .switch input { accent-color: var(--accent); width: 15px; height: 15px; cursor: pointer; }
   /* ---- 弹幕密度滑块（浮窗复用 block-panel 外壳） ---- */
@@ -273,9 +314,17 @@
     cursor: pointer; line-height: 1.5;
     transition: border-color .15s, color .15s;
   }
+  /* 名字是 flex item，默认 min-width:auto 会拒绝收缩 —— 字幕文件名一长
+     （Transformers...x264-CHD.srt）就顶穿面板右边界。必须显式允许收缩，
+     再靠两行截断 + 省略号兜住；完整文件名走 title 悬停提示。 */
+  .track-item .t-name {
+    flex: 1 1 auto; min-width: 0;
+    display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2;
+    overflow: hidden; word-break: break-all; overflow-wrap: anywhere;
+  }
   .track-item:hover { border-color: var(--accent); }
   .track-item.current { border-color: var(--accent); color: var(--accent); }
-  .track-item .t-meta { color: var(--muted); font-size: 11px; margin-left: auto; }
+  .track-item .t-meta { color: var(--muted); font-size: 11px; margin-left: auto; flex: 0 0 auto; }
   .track-item.current .t-meta { color: var(--accent); }
   .track-item.disabled { opacity: .45; cursor: default; }
   .track-item.disabled:hover { border-color: var(--line); }
@@ -383,7 +432,7 @@
     <ul class="pl-list" id="plList"></ul>
   </aside>
 </div>
-<div class="toast" id="toast"><span id="toastText"></span><button type="button" class="toast-close" id="toastClose" title="关闭">✕</button></div>
+<div class="toast-stack" id="toastStack"></div>
 
   <div class="settings-mask" id="settingsMask" hidden>
     <div class="settings-modal" role="dialog" aria-label="设置">
@@ -419,9 +468,13 @@
       </div>
 
       <div class="settings-foot">音轨自动转换默认开启：内核解不了的音轨会自动转成外挂 AAC 并静音原轨，不会放出错的轨道。字幕的自动转换要读整片，默认关闭。同目录的外挂字幕、同名弹幕照旧自动加载。</div>
+      <div class="settings-ver" id="settingsVer">版本 —</div>
     </div>
   </div>
-<div class="pill" id="pill" data-tip="转码速度取决于硬盘读取速度&#10;点击取消转码"></div>
+<div class="pill-stack" id="pillStack">
+  <div class="pill" id="pillAudio" data-tip="音轨转码速度取决于硬盘读取速度&#10;点击取消后台处理"></div>
+  <div class="pill" id="pillSub" data-tip="字幕抽取速度取决于硬盘读取速度&#10;点击取消后台处理"></div>
+</div>
 
 <script src="vendor/artplayer.js"></script>
 <script src="vendor/artplayer-plugin-danmuku.js"></script>
@@ -434,10 +487,10 @@
   var placeholder = $('placeholder');
   var chipVideo = $('chipVideo');
   var chipDanmaku = $('chipDanmaku');
-  var toastEl = $('toast');
-  var toastTextEl = $('toastText');
-  var toastCloseEl = $('toastClose');
-  var pillEl = $('pill');
+  var toastStackEl = $('toastStack');
+  var pillStackEl = $('pillStack');
+  // 音轨 / 字幕各一颗胶囊，键名与后端事件的 kind 对齐（'audio' / 'subtitle'）
+  var pillEls = { audio: $('pillAudio'), subtitle: $('pillSub') };
 
   var CONFIG_KEY = 'bplayer_danmaku_config';
   // 1.2.6：弹幕默认改为 极慢 / 同步速度 / 显示区域 1/4 / 不透明 100%，旧存档按新默认走一次
@@ -486,7 +539,6 @@
   var audioTrack = null;        // audio-track 插件接线（外挂音轨的 Audio 元素句柄）
   var danmakuList = [];         // 播放器格式弹幕数组
   var debugQueue = [];          // 插件内部队列引用（调试/验证用）
-  var toastTimer = null;
   var seekFlushTimer = null;    // seek 清屏防抖
 
   // 跳转后立即清掉旧画面残留弹幕（插件原版会让旧弹幕滚完才消失）。
@@ -499,29 +551,113 @@
     }, 80);
   }
 
+  // 同时最多三条：再多就把播放画面糊住了，新提示永远比旧提示更贴近用户此刻的操作
+  var TOAST_MAX = 3;
+
+  // 正在倒计时的提示（已经淡出的不算，否则「顶掉最旧一条」会反复抓到同一条已死节点）
+  function liveToasts() {
+    var out = [];
+    var all = toastStackEl.children;
+    for (var i = 0; i < all.length; i++) {
+      if (all[i].getAttribute('data-dead') !== '1') out.push(all[i]);
+    }
+    return out;
+  }
+
+  // 底部窄条随剩余时间匀速缩短。用 width 过渡而不是 CSS 动画，是因为时长每次
+  // 都由文字长度算出来，直接改 transition-duration 最省事。
+  function startToastCountdown(fillEl, ms) {
+    fillEl.style.transition = 'none';
+    fillEl.style.width = '100%';
+    void fillEl.offsetWidth; // 强制一次回流：连着两次 toast 共用过渡会从半截续跑
+    fillEl.style.transition = 'width ' + ms + 'ms linear';
+    fillEl.style.width = '0%';
+  }
+
+  // 提示提前消失（点 ×、到点、被新提示顶掉）时把窄条冻在当前宽度，
+  // 淡出的那一瞬不会看到它跳回满格或突然清零。
+  function stopToastCountdown(fillEl) {
+    if (!fillEl) return;
+    var w = fillEl.getBoundingClientRect().width;
+    fillEl.style.transition = 'none';
+    fillEl.style.width = w + 'px';
+  }
+
+  // 提示一条条读：只有队首（最早那条）在倒计时，它消失后下一条才开始。
+  // 之前是每条各自计时、到点一起消失 —— 人是逐条读的，后面的还没被读就没影了。
+  // 排队中的提示倒计时条满格静止，轮到它才动，用户一眼能看出"现在在读哪条"。
+  function tickToasts() {
+    var head = liveToasts()[0];
+    if (!head || head._ticking) return;
+    head._ticking = true;
+    startToastCountdown(head._fill, head._dur);
+    head._timer = setTimeout(function () { removeToast(head); }, head._dur);
+  }
+
+  // 单条提示的收尾：计时器与手动关闭可能同时到达，用 data-dead 保证只淡出一次
+  function removeToast(el) {
+    if (!el || el.getAttribute('data-dead') === '1') return;
+    el.setAttribute('data-dead', '1');
+    el._ticking = false;
+    clearTimeout(el._timer);
+    clearTimeout(el._gone);
+    stopToastCountdown(el._fill);
+    el.classList.remove('show');
+    // 等淡出结束再摘节点：立刻 removeChild 会看见提示「啪」地消失，没有过渡
+    el._gone = setTimeout(function () {
+      if (el.parentNode) el.parentNode.removeChild(el);
+    }, 280);
+    // 队首走了，让下一条开始读
+    tickToasts();
+  }
+
+  // 清空所有提示：设置页是模态，底下压着一堆提示很难看
   function hideToast() {
-    clearTimeout(toastTimer);
-    toastEl.classList.remove('show');
+    var list = liveToasts();
+    for (var i = 0; i < list.length; i++) removeToast(list[i]);
   }
 
   function toast(msg, ms) {
-    toastTextEl.textContent = msg;
-    toastEl.classList.add('show');
-    clearTimeout(toastTimer);
     var dur = ms || 2600;
     // 长提示按阅读速度给足时间（约 4 字/秒，上限 20 秒）；读得快的人用右上角 × 直接关掉。
     var len = String(msg || '').length;
     if (len > 20) {
       dur = Math.max(dur * 2, 1500 + len * 250);
     }
-    toastTimer = setTimeout(function () { toastEl.classList.remove('show'); }, Math.min(dur, 20000));
-  }
+    var total = Math.min(dur, 20000);
 
-  // 右上角 × 立刻关掉当前提示
-  toastCloseEl.addEventListener('click', function (ev) {
-    ev.stopPropagation();
-    hideToast();
-  });
+    var alive = liveToasts();
+    while (alive.length >= TOAST_MAX) removeToast(alive.shift());
+
+    var el = document.createElement('div');
+    el.className = 'toast';
+    var textEl = document.createElement('span');
+    textEl.textContent = msg; // 提示文本里混着文件名，走 textContent 免得被当成标签
+    var closeEl = document.createElement('button');
+    closeEl.type = 'button';
+    closeEl.className = 'toast-close';
+    closeEl.title = '关闭';
+    closeEl.textContent = '✕';
+    var barEl = document.createElement('div');
+    barEl.className = 'toast-bar';
+    var fillEl = document.createElement('i');
+    barEl.appendChild(fillEl);
+    el.appendChild(textEl);
+    el.appendChild(closeEl);
+    el.appendChild(barEl);
+    el._fill = fillEl;
+    el._dur = total; // 轮到自己时才按这个时长倒计时，不是创建时就开始
+    closeEl.addEventListener('click', function (ev) {
+      ev.stopPropagation();
+      removeToast(el);
+    });
+    toastStackEl.appendChild(el);
+    // 先落进 DOM 并算一次样式，再加 show：同帧内 append + 改 class 浏览器会合并成一次
+    // 样式计算，opacity 没有起始值可插值，淡入就看不见了
+    void el.offsetWidth;
+    el.classList.add('show');
+    tickToasts(); // 当前没有人在读（比如这是唯一一条）就立刻开始，否则排队等着
+  }
 
   function fmtDuration(sec) {
     sec = Math.round(sec || 0);
@@ -1148,8 +1284,11 @@
     // 死编码 → 后台把指定音轨转成独立 (音轨N).mka（视频不动，仍从原文件播），audio-track 插件同步外挂；
     // 已有 (AAC).mkv 整片缓存 → 直接换源自包含播放；只有 AC-3 等不可靠编码 → 仅提示不转换。
     var probeToken = 0;
-    var transcodeVideo = '';    // 正在转换的源视频（归一化路径）
-    var transcodeOrdinal = -1;  // 正在转换的音轨序号（1-based）
+    // 音轨转码与字幕抽取是后端两个独立的任务槽，前端必须各记各的：
+    // 两者共用一组全局记账位时，音轨先完成后会把字幕任务的状态一起清掉，
+    // 随后到达的字幕完成事件会被当成过期事件丢弃 —— 字幕永远挂不上，等待状态还残留。
+    var audioJob = { video: '', ordinal: -1 };          // 音轨转码（ordinal 1-based）
+    var subJob = { video: '', index: -1, item: null };  // 内嵌字幕抽取（index 只作记录/诊断用）
     var currentVideoPath = '';  // 当前播放的源视频（归一化路径）
     var externalOrdinal = -1;   // 当前挂载的外挂音轨序号；-1 = 无
     var probeTracks = null;     // 最近一次探测的音轨列表（仅 audio）
@@ -1158,8 +1297,6 @@
     var subItems = [];          // 字幕菜单条目（外挂文件 + 内嵌轨 + PGS 位图轨）
     var mountedSubId = '';      // 当前挂载的字幕条目 id；'' = 关闭
     var droppedSubs = [];       // 拖进窗口的字幕文件（不在视频同目录也能用；换片清空）
-    var pendingSub = null;      // 正在后台抽取的内嵌字幕条目
-    var pillLabel = '音轨';     // 当前后台任务的类型标签
 
     function codecName(c) {
       if (c.indexOf('A_DTS') === 0) return 'DTS（含 DTS-HD）';
@@ -1316,21 +1453,19 @@
               + '需要声音请到「音轨」菜单点这条轨道开始转换；也可以在设置中开启自动音轨处理', 9000);
             return;
           }
-          if (transcodeVideo === normPath(path) && transcodeOrdinal === ordinal) return; // 这条已在转
-          transcodeVideo = normPath(path);
-          transcodeOrdinal = ordinal;
-          updatePill(-1, 0);
+          if (audioJob.video === normPath(path) && audioJob.ordinal === ordinal) return; // 这条已在转
+          audioJob.video = normPath(path);
+          audioJob.ordinal = ordinal;
+          updatePill('audio', -1, 0);
           invoke('transcode_audio_start', { videoPath: path, audioIndex: audioIdx, durationUs: durationUs || null }).then(function () {
-            if (transcodeVideo === normPath(path)) {
+            if (audioJob.video === normPath(path)) {
               var why2 = reason === 'pin'
                 ? '（' + label + '）是默认音轨，但本内核会跳过它'
                 : '（' + label + '）本内核无法解码';
               toast('音轨' + ordinal + why2 + '，正在后台转换为 AAC 外挂音轨', 6000);
             }
           }).catch(function (e) {
-            hidePill();
-            transcodeVideo = '';
-            transcodeOrdinal = -1;
+            clearAudioJob();
             toast('音轨转换未能启动：' + e, 8000);
           });
         }).catch(function () { });
@@ -1452,6 +1587,7 @@
         var item = document.createElement('div');
         item.className = 'track-item' + (externalOrdinal === ordinal ? ' current' : '');
         var main = document.createElement('span');
+        main.className = 't-name';
         main.textContent = '音轨' + ordinal + (t.default ? '（默认）' : '');
         item.appendChild(main);
         var meta = document.createElement('span');
@@ -1549,20 +1685,29 @@
       list.innerHTML = '';
       var off = document.createElement('div');
       off.className = 'track-item' + (mountedSubId === '' ? ' current' : '');
-      off.textContent = '关闭字幕';
+      var offName = document.createElement('span');
+      offName.className = 't-name';
+      offName.textContent = '关闭字幕';
+      off.appendChild(offName);
       off.addEventListener('click', unmountSubtitle);
       list.appendChild(off);
       subItems.forEach(function (s) {
         var item = document.createElement('div');
         if (s.disabled) {
           item.className = 'track-item disabled';
-          item.textContent = s.name;
+          var dn = document.createElement('span');
+          dn.className = 't-name';
+          dn.textContent = s.name;
+          dn.title = s.name;
+          item.appendChild(dn);
           list.appendChild(item);
           return;
         }
         item.className = 'track-item' + (mountedSubId === s.id ? ' current' : '');
         var main = document.createElement('span');
+        main.className = 't-name';
         main.textContent = s.name;
+        main.title = s.name; // 名字被截断成两行时，悬停仍能看到完整文件名
         item.appendChild(main);
         var meta = document.createElement('span');
         meta.className = 't-meta';
@@ -1600,45 +1745,46 @@
         return;
       }
       // 内嵌：整条链走内存，不产生缓存文件
-      pendingSub = s;
-      pillLabel = '字幕';
-      transcodeVideo = currentVideoPath;
-      transcodeOrdinal = -1;
-      updatePill(-1, 0);
-      // 一次把本片所有文本字幕轨都抽出来：有 Cues 索引时每条只要毫秒级
-      var batch = subItems.filter(function (x) { return x.kind === 'embedded' && x.track; })
-        .map(function (x) { return { index: x.ordinal - 1, track: x.track, ass: x.codecLabel === 'ASS' }; });
-      if (!batch.some(function (b) { return b.index === s.ordinal - 1; })) {
-        batch.push({ index: s.ordinal - 1, track: s.track, ass: s.codecLabel === 'ASS' });
-      }
+      subJob.video = currentVideoPath;
+      subJob.index = s.ordinal - 1;
+      subJob.item = s;
+      updatePill('subtitle', -1, 0);
+      // 只请求用户点的这一条。后端对稀疏抽不出的轨只把 pending[0] 交给 ffmpeg
+      // （ffmpeg 写 pipe:1，一次只能跑一条），批量请求时点「英文」拿回的可能
+      // 就是第一条轨（如「简体」）的文本，前端却按点击项挂载 —— 字幕语言错配；
+      // 而稀疏路径本来就是毫秒级，多请求的轨前端也只用得到 hit 那一条，没有预取价值。
+      var batch = [{ index: s.ordinal - 1, track: s.track, ass: s.codecLabel === 'ASS' }];
       var embedWant = normPath(currentVideoPath); // 发起时捕获，回调里读当前值等于没校验
       invoke('extract_subtitle_text', { videoPath: currentVideoPath, subs: batch, durationUs: probeDurationUs || null }).then(function (got) {
         if (normPath(currentVideoPath) !== embedWant) return; // 已经换片，整个结果作废
         var hit = (got || []).filter(function (x) { return x.index === s.ordinal - 1; })[0];
         if (hit) {
-          pendingSub = null;
-          hidePill();
-          transcodeVideo = '';
-          transcodeOrdinal = -1;
+          clearSubJob(); // 稀疏直接抽出来了，没有后台任务要等
           mountSubtitleText(hit.text, s, silent);
         } else {
           // 稀疏抽不出来：ffmpeg 管道后台跑，完成事件里带回文本。
-          // pendingSub / transcodeVideo 要留着，done 事件靠它们认领。
+          // subJob 要留着，done 事件靠它认领。
           toast('正在后台抽取内嵌字幕，完成后自动挂载', 7000);
         }
       }).catch(function (e) {
         if (normPath(currentVideoPath) !== embedWant) return;
-        hidePill();
-        transcodeVideo = '';
-        pendingSub = null;
+        clearSubJob();
         toast('字幕抽取未能启动：' + e, 8000);
       });
     }
 
     // 内存里的字幕文本直接交给播放器，用完释放上一个 blob
     var lastSubBlobUrl = '';
+    // 归属已经变了：这条 blob 再也挂不到任何人身上，立刻释放，别留到下次换片才回收
+    function dropStaleSubBlob(url) {
+      try { URL.revokeObjectURL(url); } catch (e) { }
+      if (lastSubBlobUrl === url) lastSubBlobUrl = '';
+    }
     function mountSubtitleText(text, s, silent) {
       if (!art) return;
+      // 发起时记下归属：建 blob 和 switch 都是异步的（外挂字幕转换要几百毫秒），
+      // 中途换片回调照样会跑，不校验就会把上一部的字幕记成当前这部已挂载。
+      var wantPath = normPath(currentVideoPath);
       if (lastSubBlobUrl) { try { URL.revokeObjectURL(lastSubBlobUrl); } catch (e) { } lastSubBlobUrl = ''; }
       var url;
       try {
@@ -1649,30 +1795,41 @@
         return;
       }
       art.subtitle.switch(url, { name: s.name, type: 'srt', encoding: 'utf-8' }).then(function () {
+        if (normPath(currentVideoPath) !== wantPath) { dropStaleSubBlob(url); return; }
         mountedSubId = s.id;
         art.subtitle.style({ display: 'block' });
         refreshSubtitleMenu();
         if (!silent) toast('已挂载字幕：' + s.name);
       }).catch(function (e) {
+        // 换片导致的失败不是用户的错，别在新片上弹一条莫名其妙的报错
+        if (normPath(currentVideoPath) !== wantPath) { dropStaleSubBlob(url); return; }
         toast('字幕加载失败：' + e, 6000);
       });
     }
 
     function mountSubtitleUrl(url, s, silent) {
       if (!art) return;
+      // 和 mountSubtitleText 同理：编码探测 + switch 期间换了片，回调不能再认这条字幕
+      var wantPath = normPath(currentVideoPath);
       var opt = { name: s.name, type: s.type };
       var encPromise = s.encoding
         ? Promise.resolve(s.encoding)
         : (s.kind === 'ext' ? detectEncoding(s.path) : Promise.resolve('utf-8'));
       encPromise.then(function (enc) {
+        if (normPath(currentVideoPath) !== wantPath) { try { URL.revokeObjectURL(url); } catch (e) { } return; }
         if (enc) { s.encoding = enc; opt.encoding = enc; }
         return art.subtitle.switch(url, opt);
       }).then(function () {
+        if (normPath(currentVideoPath) !== wantPath) { try { URL.revokeObjectURL(url); } catch (e) { } return; }
         mountedSubId = s.id;
         art.subtitle.style({ display: 'block' });
         refreshSubtitleMenu();
         if (!silent) toast('已挂载字幕：' + s.name);
       }).catch(function (e) {
+        if (normPath(currentVideoPath) !== wantPath) {
+          try { URL.revokeObjectURL(url); } catch (e2) { }
+          return;
+        }
         toast('字幕加载失败：' + e, 6000);
       });
     }
@@ -1826,12 +1983,13 @@
       unmountPgs();
       var token = ++pgsToken;
       var path = currentVideoPath;
-      pillLabel = '字幕';
-      updatePill(-1, 0);
+      // 位图解析不是后台转码任务，只借字幕胶囊给个「还在解析」的反馈；
+      // 字幕抽取正在跑时不能抢那颗胶囊，否则进度文字会被这行覆盖掉
+      if (!subJob.video) updatePill('subtitle', -1, 0);
       toast('正在解析位图字幕（' + s.name + '）…', 4000);
       invoke('pgs_open', { videoPath: path, track: s.track }).then(function (idx) {
         if (token !== pgsToken) return;
-        hidePill();
+        syncPill(); // 位图解析不是后台转码任务，别把同时在跑的音轨进度胶囊一起收掉
         if (!idx || !idx.events || !idx.events.length) { toast('这条字幕轨里没有可显示的位图', 6000); return; }
         pgsIndexData = idx;
         pgsTrackNo = s.track;
@@ -1848,7 +2006,7 @@
         if (!silent) toast('位图字幕已就绪：' + s.name + '（' + idx.events.length + ' 条）', 4000);
       }).catch(function (e) {
         if (token !== pgsToken) return;
-        hidePill();
+        syncPill();
         toast('位图字幕解析失败：' + e, 8000);
       });
     }
@@ -1891,21 +2049,43 @@
       if (cand) mountSubtitle(cand, !!exact[0]);
     }
 
-    function pillText(percent, written) {
-      var s = '⏳ 后台处理' + pillLabel;
+    // 音轨和字幕各占一颗胶囊，标签由 kind 决定，不再有「当前任务类型」这种全局态
+    var PILL_KIND_TEXT = { audio: '音轨', subtitle: '字幕' };
+    function pillText(kind, percent, written) {
+      var s = '⏳ 后台处理' + PILL_KIND_TEXT[kind];
       if (percent >= 0) s += ' ' + Math.round(percent) + '%';
       if (written) s += ' · ' + fmtBytes(written);
       return s;
     }
-    function updatePill(percent, written) {
-      pillEl.textContent = pillText(percent, written);
-      pillEl.classList.add('show');
+    function updatePill(kind, percent, written) {
+      var el = pillEls[kind];
+      if (!el) return;
+      el.textContent = pillText(kind, percent, written);
+      el.classList.add('show');
     }
-    function hidePill() { pillEl.classList.remove('show'); }
-    pillEl.addEventListener('click', function () {
-      invoke('transcode_audio_cancel').then(function (ok) {
-        if (ok) { hidePill(); transcodeVideo = ''; transcodeOrdinal = -1; pendingSub = null; toast('已取消后台处理'); }
-      });
+    function hidePill(kind) {
+      var el = pillEls[kind];
+      if (el) el.classList.remove('show');
+    }
+    // 换片 / 用户点胶囊取消：两组都收，不看记账位
+    function hideAllPills() { hidePill('audio'); hidePill('subtitle'); }
+    // 一个任务收尾只收自己那颗胶囊：按各自的记账位判断，另一组还在跑就不动它
+    function syncPill() {
+      if (!audioJob.video) hidePill('audio');
+      if (!subJob.video) hidePill('subtitle');
+    }
+    // 清记账位后统一走 syncPill：只清自己那组、只收自己那颗胶囊
+    function clearAudioJob() { audioJob.video = ''; audioJob.ordinal = -1; syncPill(); }
+    function clearSubJob() { subJob.video = ''; subJob.index = -1; subJob.item = null; syncPill(); }
+    // 点哪颗胶囊都取消全部：音轨和字幕是两个独立任务槽，只取消 audio 会让字幕继续在后台跑完。
+    pillStackEl.addEventListener('click', function () {
+      // 命令改成返回 Result 之后必须接 catch，否则 reject 会变成 unhandled rejection。
+      invoke('transcode_cancel_all').then(function (n) {
+        clearAudioJob();
+        clearSubJob();
+        hideAllPills(); // 用户手动取消：不管后端有没有数出来，胶囊都该立刻收
+        if (n) toast('已取消后台处理');
+      }).catch(function () { });
     });
 
     async function desktopLoadVideo(path, manualDanPath, epIndex) {
@@ -1919,18 +2099,15 @@
       subItems = [];
       mountedSubId = '';
       droppedSubs = []; // 拖入的字幕只对当前这部片有效
-      pendingSub = null;
-      pillLabel = '音轨';
       if (art) art.subtitle.style({ display: 'none' }); // 上一部的字幕先藏起来，扫描到新的会自动挂载
       // 换片即中断上一部的后台处理（转码/抽字幕）：不让它在后台偷偷跑完占磁盘和 CPU。
+      // 音轨和字幕抽取是两个独立的任务槽，必须一起取消；而且不能靠记账位判断有没有活干
+      // —— 前端没记账不代表后端手上没有任务（刚完成一条又起了另一条）。
       // 半成品由 Rust 工作线程清理；关窗时另有 window Destroyed 兜底杀进程。
-      if (transcodeVideo && transcodeVideo !== currentVideoPath) {
-        hidePill();
-        try { invoke('transcode_audio_cancel').catch(function () { }); } catch (e) { }
-        transcodeVideo = '';
-        transcodeOrdinal = -1;
-        pendingSub = null;
-      }
+      try { invoke('transcode_cancel_all').catch(function () { }); } catch (e) { }
+      clearAudioJob();
+      clearSubJob();
+      hideAllPills(); // 新片从零开始，旧片两颗胶囊一律收掉
       resetExternalAudio();
       // 上一次被强杀/崩溃会留下 *.tmp.* 半成品，打开这部片时顺手清掉
       try { invoke('clean_sidecar_tmp', { videoPath: path }).catch(function () { }); } catch (e) { }
@@ -1947,12 +2124,17 @@
       }
       currentEpIndex = epIndex;
       renderPlaylist();
-      // 弹幕：手动拖入优先，否则零授权同名配对（直接打开 (AAC) 缓存时按原文件名配对）
+      // 弹幕：手动拖入优先，否则零授权同名配对（直接打开 (AAC) 缓存时按原文件名配对）。
+      // 读盘期间用户可能已经换了片：结果回来时先确认当前片还是本部，不等就整段作废。
+      // 否则 A 片的弹幕晚到会滚到 B 片上（B 自己刚挂好的弹幕被覆盖，或者 B 被误清空）。
       if (manualDanPath) {
-        desktopLoadDanmaku(pathName(manualDanPath), await invoke('read_text', { path: manualDanPath }));
+        var manualText = await invoke('read_text', { path: manualDanPath });
+        if (normPath(currentVideoPath) !== normPath(path)) return; // 已换片，丢弃
+        desktopLoadDanmaku(pathName(manualDanPath), manualText);
       } else {
         var pairPath = / \(AAC\)\.mkv$/i.test(name) ? path.replace(/ \(AAC\)\.mkv$/i, '.mkv') : path;
         var pair = await invoke('pair_danmaku', { videoPath: pairPath });
+        if (normPath(currentVideoPath) !== normPath(path)) return; // 已换片，丢弃；下面的 toast / clearDanmaku 也不能执行
         if (pair) {
           desktopLoadDanmaku(pair.name, pair.text);
           toast('已自动加载同名弹幕：' + pair.name);
@@ -2144,43 +2326,78 @@
       else toast('未识别的文件：请拖入视频、弹幕（xml / json）或字幕（srt / ass / vtt）');
     });
 
-    // 转码进度/完成/失败事件（Rust 侧 ffmpeg 工作线程发出）
+    // 转码进度/完成/失败事件（Rust 侧 ffmpeg 工作线程发出）。
+    // 后端有 audio / subtitle 两个独立槽，事件必须按 kind 分流到各自的记账位，
+    // 否则一个槽的收尾会把另一个槽还在跑的任务当成过期事件丢掉。
     T.event.listen('transcode://progress', function (ev) {
       var p = ev.payload || {};
-      if (normPath(p.video) !== transcodeVideo) return;
-      pillLabel = p.kind === 'subtitle' ? '字幕' : '音轨';
-      updatePill(p.percent, p.written);
+      var vid = p.video ? normPath(p.video) : '';
+      var job = p.kind === 'subtitle' ? subJob : audioJob;
+      if (!vid || vid !== job.video) return;
+      updatePill(p.kind === 'subtitle' ? 'subtitle' : 'audio', p.percent, p.written);
     });
     T.event.listen('transcode://done', function (ev) {
       var p = ev.payload || {};
-      hidePill();
-      if (normPath(p.video) !== transcodeVideo) {
-        toast('「' + baseName(pathName(p.video)) + '」后台处理完成');
+      var isSub = p.kind === 'subtitle';
+      var job = isSub ? subJob : audioJob;
+      var vid = p.video ? normPath(p.video) : '';
+      if (!vid || vid !== job.video) {
+        // 迟到的完成通知（属于上一部片、换片时没来得及杀掉的）：只提示，别动当前记账
+        toast('「' + baseName(pathName(p.video || '')) + '」后台处理完成');
         return;
       }
-      transcodeVideo = '';
-      if (p.kind === 'subtitle') {
-        var s = pendingSub;
-        pendingSub = null;
-        if (s && p.text && normPath(currentVideoPath) === normPath(p.video)) {
+      if (isSub) {
+        var s = subJob.item;
+        clearSubJob(); // 只清字幕槽：音轨槽还可能在跑，syncPill 自己判断要不要收胶囊
+        if (s && p.text && normPath(currentVideoPath) === vid) {
           // 字幕走内存：ffmpeg 管道抽出的文本随事件带回，直接挂载
           mountSubtitleText(p.text, s, false);
         }
-      } else if (transcodeOrdinal > 0) {
-        var ordinal = transcodeOrdinal;
-        transcodeOrdinal = -1;
-        engageExternalAudio(p.video, p.out, ordinal, false); // 正播这个文件：直接挂载外挂音频
+      } else {
+        var ordinal = audioJob.ordinal;
+        clearAudioJob();
+        if (ordinal > 0) engageExternalAudio(p.video, p.out, ordinal, false); // 正播这个文件：直接挂载外挂音频
       }
     });
     T.event.listen('transcode://error', function (ev) {
       var p = ev.payload || {};
-      if (normPath(p.video) !== transcodeVideo) return;
-      hidePill();
-      transcodeVideo = '';
-      transcodeOrdinal = -1;
-      pendingSub = null;
-      toast((p.kind === 'subtitle' ? '字幕抽取失败：' : '音轨转换失败：') + (p.message || '未知错误'), 8000);
+      var isSub = p.kind === 'subtitle';
+      var job = isSub ? subJob : audioJob;
+      var vid = p.video ? normPath(p.video) : '';
+      if (!vid || vid !== job.video) return; // 不是当前记账的任务：别动别的槽，也别弹错
+      if (isSub) clearSubJob(); else clearAudioJob();
+      toast((isSub ? '字幕抽取失败：' : '音轨转换失败：') + (p.message || '未知错误'), 8000);
     });
+    // 任务被取消/让位（换片、换轨、点 pill）时后端发这个事件。它**只做 UI 提示**，
+    // 绝不清记账位：同一部片里换轨时旧任务被让位杀掉，cancelled 会先到、新任务的 done
+    // 后到；在这里清账的话，紧随其后的新 done 会被当成过期事件丢掉，产物永远认领不上。
+    // 状态清理的责任在发起方（换片 / 点 pill 自己调的 transcode_cancel_all 回调），不依赖事件。
+    T.event.listen('transcode://cancelled', function (ev) {
+      var p = ev.payload || {};
+      var isSub = p.kind === 'subtitle';
+      var job = isSub ? subJob : audioJob;
+      var vid = p.video ? normPath(p.video) : '';
+      if (!vid || vid !== job.video) return; // 上一部片被取消（换片时），不该提示
+      // 这里只能按各自记账位判断能不能收（syncPill），不能直接 hidePill(kind)：片内换轨收到的
+      // 是旧任务的 cancelled，此时新任务正在同一个槽里跑，直接收胶囊会把新任务的进度条误藏掉。
+      // 同样的判断也保证「音轨让位」不会顺手收掉字幕那颗还在跑的胶囊。
+      syncPill();
+      toast(isSub ? '上一条字幕抽取已被中断' : '音轨转换已被中断', 5000);
+    });
+
+    // 版本号由后端 app_version 命令供给。前端先落地、命令可能还没注册，
+    // 所以任何失败都停在占位「—」：设置页不能因为读不到版本就报错或空一块。
+    function loadAppVersion() {
+      var el = $('settingsVer');
+      try {
+        invoke('app_version').then(function (v) {
+          // 后端可能给 "1.2.6"，也可能哪天带上 "v" 前缀；统一归一，别显示出 "vv1.2.6"
+          var s = String(v || '').replace(/^\s*v/i, '').trim();
+          el.textContent = '版本 ' + (s ? 'v' + s : '—');
+        }).catch(function () { /* 命令未注册 / 调用失败：保持占位 */ });
+      } catch (e) { /* 同上：绝不让版本号拖垮设置页 */ }
+    }
+    loadAppVersion();
 
     renderPlaylist();
   }

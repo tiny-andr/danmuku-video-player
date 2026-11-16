@@ -82,9 +82,22 @@ mod job {
         }
     }
 }
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter, Manager};
+
+/// 任务代际号，只增不减。
+///
+/// 早先的写法是"槽里的 gen + 1，槽为空则从 1 开始"。问题在于取消/让位会把槽清空，
+/// 于是下一个任务又从 1 开始编号，而上一单的 worker 收尾时正是靠
+/// `take_if(|j| j.gen == gen)` 认领"自己那一单" —— 号一重合，旧 worker 就会把新任务
+/// 摘走，然后拿着上一单的产物清单去改名/删 tmp。取消一次之后必然踩到。
+static JOB_GEN: AtomicU64 = AtomicU64::new(0);
+
+fn next_gen() -> u64 {
+    JOB_GEN.fetch_add(1, Ordering::Relaxed) + 1
+}
 
 /// 音轨缓存标记（加在基名后、扩展名前）；scan_folder 跳过这类文件避免播放列表重复。
 pub const CACHE_TAG: &str = " (AAC)";
@@ -102,7 +115,79 @@ impl TranscodeJob {
     }
 }
 
-pub type JobState = Mutex<Option<TranscodeJob>>;
+/// 任务归属的槽。音轨转码与字幕抽取是两件互不相干的事，各自占一个槽 ——
+/// 早先共用一个单槽，字幕兜底一启动就把正在转的音轨杀掉，反过来也一样。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Slot {
+    Audio,
+    Subtitle,
+}
+
+impl Slot {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Slot::Audio => "audio",
+            Slot::Subtitle => "subtitle",
+        }
+    }
+}
+
+pub struct JobSlots {
+    audio: Mutex<Option<TranscodeJob>>,
+    subtitle: Mutex<Option<TranscodeJob>>,
+}
+
+impl Default for JobSlots {
+    fn default() -> Self {
+        Self { audio: Mutex::new(None), subtitle: Mutex::new(None) }
+    }
+}
+
+pub type JobState = JobSlots;
+
+impl JobSlots {
+    fn slot(&self, slot: Slot) -> &Mutex<Option<TranscodeJob>> {
+        match slot {
+            Slot::Audio => &self.audio,
+            Slot::Subtitle => &self.subtitle,
+        }
+    }
+
+    /// 摘出槽里的任务但不在锁里 kill：等子进程退出可能要几百毫秒，
+    /// 拿着锁等会把另一个槽的命令一起卡住。
+    fn take(&self, slot: Slot) -> Option<TranscodeJob> {
+        self.slot(slot).lock().unwrap().take()
+    }
+
+    /// 只有槽里仍然是"我这一代"的任务时才摘走。摘到 Some = 这单是自然跑完的；
+    /// None = 已被取消或已被新任务让位。
+    fn take_if_gen(&self, slot: Slot, gen: u64) -> Option<TranscodeJob> {
+        self.slot(slot).lock().unwrap().take_if(|j| j.gen == gen)
+    }
+
+    /// 放进新任务，并把可能同时挤进来的旧任务交还给调用方去 kill
+    /// （两个命令几乎同时启动时，只靠"进锁前先 take"仍可能漏掉一个）。
+    fn install(&self, slot: Slot, job: TranscodeJob) -> Option<TranscodeJob> {
+        self.slot(slot).lock().unwrap().replace(job)
+    }
+
+    /// 取消一个槽，返回是否真的杀掉了任务。
+    /// 被杀的 worker 收尾时自己会广播 `transcode://cancelled`，这里不重复发。
+    pub fn cancel(&self, slot: Slot) -> bool {
+        match self.take(slot) {
+            Some(mut job) => {
+                job.kill_now();
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// 换片/关窗时一把全取消，返回取消的数量。
+    pub fn cancel_all(&self) -> u32 {
+        [Slot::Audio, Slot::Subtitle].into_iter().filter(|s| self.cancel(*s)).count() as u32
+    }
+}
 
 #[derive(Serialize, Clone)]
 pub struct JobProgress {
@@ -134,6 +219,19 @@ pub struct JobError {
     pub video: String,
     pub out: String,
     pub message: String,
+}
+
+/// 任务被取消或被新任务让位。
+///
+/// 之前这条路径是完全静默的：前端只有 done/error 两个出口，一旦字幕任务在半路被
+/// 顶掉，`pendingSub` 就永远等不到 done，那条轨的"加载中"状态会一直挂着。
+/// 所以让位/取消也必须显式通知一次。
+#[derive(Serialize, Clone)]
+pub struct JobCancelled {
+    pub kind: String, // "audio" | "subtitle"
+    pub video: String,
+    /// 字幕轨 0 基序号；音轨没有这个概念，序列化成 null
+    pub index: Option<usize>,
 }
 
 /// 外挂音轨产物：原基名 (音轨N).mka（N 为 1-based 音轨序号），纯计算不发 IO。
@@ -315,7 +413,7 @@ fn last_err_line(tail: &str) -> String {
 }
 
 struct JobSpec {
-    kind: &'static str, // "audio" | "subtitle"
+    slot: Slot,
     video: String,
     args: Vec<String>,
     /// 每个产物：(临时文件, 最终文件)。多于一个表示一次 ffmpeg 调用产出多个文件 ——
@@ -326,29 +424,25 @@ struct JobSpec {
 
 /// 单任务启动器：杀旧任务 → 拉起新 ffmpeg → 进度/收尾线程（改名 + 发事件）。
 /// 返回这一批的全部产物路径。
-fn spawn_job(app: AppHandle, state: tauri::State<'_, JobState>, spec: JobSpec) -> Result<Vec<String>, String> {
+fn spawn_job(app: &AppHandle, spec: JobSpec) -> Result<Vec<String>, String> {
     let ffmpeg = find_ffmpeg()?;
     if spec.outputs.is_empty() {
         return Ok(Vec::new());
     }
+    let slot = spec.slot;
+    let gen = next_gen();
 
     // 让位：同步杀旧任务并回收，确保 tmp 文件句柄已释放
-    let gen = {
-        let mut guard = state.lock().unwrap();
-        match guard.take() {
-            Some(mut old) => {
-                let _ = old.child.kill();
-                let _ = old.child.wait();
-                old.gen.wrapping_add(1)
-            }
-            None => 1,
-        }
-    };
+    if let Some(mut old) = app.state::<JobState>().take(slot) {
+        old.kill_now();
+    }
 
     let (child, stdout, stderr) = spawn_ffmpeg(&ffmpeg, &spec.args)?;
-    *state.lock().unwrap() = Some(TranscodeJob { child, gen });
+    if let Some(mut displaced) = app.state::<JobState>().install(slot, TranscodeJob { child, gen }) {
+        displaced.kill_now();
+    }
 
-    let kind = spec.kind.to_string();
+    let kind = slot.as_str().to_string();
     let video_str = spec.video.clone();
     let outputs = spec.outputs.clone();
     let first_out = outputs
@@ -368,7 +462,7 @@ fn spawn_job(app: AppHandle, state: tauri::State<'_, JobState>, spec: JobSpec) -
             );
         });
         let err_tail = err_thread.join().unwrap_or_default();
-        let status = app2.state::<JobState>().lock().unwrap().take_if(|j| j.gen == gen);
+        let status = app2.state::<JobState>().take_if_gen(slot, gen);
         match status {
             // 我这单还挂在状态里 = 自然跑完（被杀/让位的单已被摘走）
             Some(mut job) => {
@@ -421,11 +515,16 @@ fn spawn_job(app: AppHandle, state: tauri::State<'_, JobState>, spec: JobSpec) -
                     );
                 }
             }
-            // 被取消或让位：静默清理半成品
+            // 被取消或让位：清掉半成品，并且必须告诉前端 —— 它等的是 done，
+            // 少这一条就永远等不到。
             None => {
                 for (tmp, _) in &outputs {
                     let _ = fs::remove_file(tmp);
                 }
+                let _ = app2.emit(
+                    "transcode://cancelled",
+                    JobCancelled { kind, video: video_str, index: None },
+                );
             }
         }
     });
@@ -442,10 +541,23 @@ pub fn transcode_target(video_path: String, audio_index: usize) -> String {
 }
 
 /// 启动后台音轨转换（输出独立 .mka，视频仍从原文件播放）。
+///
+/// 声明成 async + spawn_blocking：里面有 PATH 探测、旧任务回收（等子进程退出）
+/// 和文件系统探测，跑在同步命令里会卡住 webview 主线程。
 #[tauri::command]
-pub fn transcode_audio_start(
+pub async fn transcode_audio_start(
     app: AppHandle,
-    state: tauri::State<'_, JobState>,
+    video_path: String,
+    audio_index: usize,
+    duration_us: Option<u64>,
+) -> Result<String, String> {
+    crate::blocking::blocking(move || transcode_audio_start_impl(&app, video_path, audio_index, duration_us))
+        .await?
+}
+
+/// 实现体：参数只有 AppHandle（发事件/取状态用），其余全是普通类型。
+fn transcode_audio_start_impl(
+    app: &AppHandle,
     video_path: String,
     audio_index: usize,
     duration_us: Option<u64>,
@@ -458,9 +570,8 @@ pub fn transcode_audio_start(
     let tmp = tmp_path(&out);
     let paths = spawn_job(
         app,
-        state,
         JobSpec {
-            kind: "audio",
+            slot: Slot::Audio,
             video: video_path,
             args: ffmpeg_audio_args(&src, audio_index, &tmp, None),
             outputs: vec![(tmp, out)],
@@ -493,7 +604,11 @@ pub struct SubTrack {
 /// （WEBVTT 后无换行、序号和时间轴挤在一行），结果是「菜单显示已挂载、画面一个字
 /// 都没有」；它又是 innerHTML + escape 渲染，`<font>` / `<i>` 会被显示成原文。
 #[tauri::command]
-pub fn subtitle_to_srt_text(path: String) -> Result<String, String> {
+pub async fn subtitle_to_srt_text(path: String) -> Result<String, String> {
+    crate::blocking::blocking(move || subtitle_to_srt_text_impl(path)).await?
+}
+
+fn subtitle_to_srt_text_impl(path: String) -> Result<String, String> {
     let src = PathBuf::from(&path);
     if !src.is_file() {
         return Err("字幕文件不存在".into());
@@ -543,9 +658,17 @@ pub struct SubText {
 /// 有 Cues 索引的片子走稀疏 seek（28 GB 约 0.2 秒）；没有的回退 ffmpeg，
 /// 用 `-f srt pipe:1` 把结果读到内存，同样不落盘（代价是要顺序读整片）。
 #[tauri::command]
-pub fn extract_subtitle_text(
+pub async fn extract_subtitle_text(
     app: AppHandle,
-    state: tauri::State<'_, JobState>,
+    video_path: String,
+    subs: Vec<SubTrack>,
+    duration_us: Option<u64>,
+) -> Result<Vec<SubText>, String> {
+    crate::blocking::blocking(move || extract_subtitle_text_impl(&app, video_path, subs, duration_us)).await?
+}
+
+fn extract_subtitle_text_impl(
+    app: &AppHandle,
     video_path: String,
     subs: Vec<SubTrack>,
     duration_us: Option<u64>,
@@ -567,18 +690,12 @@ pub fn extract_subtitle_text(
     // 没被稀疏抽出来的那条交给 ffmpeg，结果从 stdout 读回，仍然不写文件。
     // 一次只跑一条：字幕走 pipe:1，一个进程只能有一个 stdout。
     if let Some(first) = pending.into_iter().next() {
-        spawn_text_job(app, state, video_path, first, duration_us)?;
+        spawn_text_job(app, video_path, first, duration_us)?;
     }
     Ok(ready)
 }
 
-fn spawn_text_job(
-    app: AppHandle,
-    state: tauri::State<'_, JobState>,
-    video: String,
-    sub: SubTrack,
-    _duration_us: Option<u64>,
-) -> Result<(), String> {
+fn spawn_text_job(app: &AppHandle, video: String, sub: SubTrack, _duration_us: Option<u64>) -> Result<(), String> {
     let ffmpeg = find_ffmpeg()?;
     let args: Vec<String> = vec![
         "-hide_banner".into(),
@@ -596,20 +713,15 @@ fn spawn_text_job(
         "pipe:1".into(),
     ];
 
-    let gen = {
-        let mut guard = state.lock().unwrap();
-        match guard.take() {
-            Some(mut old) => {
-                let _ = old.child.kill();
-                let _ = old.child.wait();
-                old.gen.wrapping_add(1)
-            }
-            None => 1,
-        }
-    };
-
+    let gen = next_gen();
+    // 字幕只占字幕槽：让位时只杀上一条字幕抽取，音轨转码照旧在跑
+    if let Some(mut old) = app.state::<JobState>().take(Slot::Subtitle) {
+        old.kill_now();
+    }
     let (child, stdout, stderr) = spawn_ffmpeg(&ffmpeg, &args)?;
-    *state.lock().unwrap() = Some(TranscodeJob { child, gen });
+    if let Some(mut displaced) = app.state::<JobState>().install(Slot::Subtitle, TranscodeJob { child, gen }) {
+        displaced.kill_now();
+    }
 
     let index = sub.index;
     let video_str = video;
@@ -617,17 +729,26 @@ fn spawn_text_job(
     std::thread::spawn(move || {
         let err_thread = std::thread::spawn(move || drain_stderr(stderr));
         let mut raw = Vec::new();
-        let mut reader = BufReader::new(stdout);
+        let reader = BufReader::new(stdout);
         use std::io::Read as _;
-        let _ = reader.read_to_end(&mut raw);
+        // 输出量不受输入文件大小约束：损坏轨或极端时间戳能让 ffmpeg 吐出远超片源的文本，
+        // 无上限 read_to_end 会把内存吃穿。多读 1 字节用来判断"到底超没超"。
+        let _ = reader.take(crate::MAX_READ_BYTES + 1).read_to_end(&mut raw);
+        let oversize = raw.len() as u64 > crate::MAX_READ_BYTES;
         let err_tail = err_thread.join().unwrap_or_default();
         // 同样要剥标签：内嵌 ASS 走 ffmpeg 回退时会带上 <font face=...>
         let srt = crate::mkv_sub::strip_markup(&String::from_utf8_lossy(&raw));
 
-        let status = app2.state::<JobState>().lock().unwrap().take_if(|j| j.gen == gen);
-        let Some(mut job) = status else { return }; // 被取消/让位
+        let Some(mut job) = app2.state::<JobState>().take_if_gen(Slot::Subtitle, gen) else {
+            // 被取消/让位：前端还在等这条轨的 done，得告诉它别等了
+            let _ = app2.emit(
+                "transcode://cancelled",
+                JobCancelled { kind: Slot::Subtitle.as_str().into(), video: video_str, index: Some(index) },
+            );
+            return;
+        };
         let ok = job.child.wait().map(|s| s.success()).unwrap_or(false);
-        if ok && !srt.trim().is_empty() {
+        if ok && !oversize && !srt.trim().is_empty() {
             let _ = app2.emit(
                 "transcode://done",
                 JobDone {
@@ -640,7 +761,13 @@ fn spawn_text_job(
                 },
             );
         } else {
-            let msg = if srt.trim().is_empty() { "没有可抽取的字幕内容".to_string() } else { last_err_line(&err_tail) };
+            let msg = if oversize {
+                format!("字幕文本超过 {} MB 上限，已放弃", crate::MAX_READ_BYTES / (1024 * 1024))
+            } else if srt.trim().is_empty() {
+                "没有可抽取的字幕内容".to_string()
+            } else {
+                last_err_line(&err_tail)
+            };
             let _ = app2.emit(
                 "transcode://error",
                 JobError { kind: "subtitle".into(), video: video_str, out: String::new(), message: msg },
@@ -650,16 +777,24 @@ fn spawn_text_job(
     Ok(())
 }
 
-/// 取消当前任务（若有）。半成品由工作线程清理。
+/// 取消音轨任务（若有）。半成品由工作线程清理，cancelled 事件也由它发。
+///
+/// 返回 `Result<bool, ()>` 而不是 `Result<bool, String>`：前端只拿它决定要不要提示，
+/// 出错只可能是线程池崩了，再带一段字符串过去没有消费方。
 #[tauri::command]
-pub fn transcode_audio_cancel(state: tauri::State<'_, JobState>) -> bool {
-    let mut guard = state.lock().unwrap();
-    if let Some(mut job) = guard.take() {
-        let _ = job.child.kill();
-        let _ = job.child.wait();
-        return true;
-    }
-    false
+pub async fn transcode_audio_cancel(app: AppHandle) -> Result<bool, ()> {
+    crate::blocking::blocking(move || app.state::<JobState>().cancel(Slot::Audio))
+        .await
+        .map_err(|_| ())
+}
+
+/// 取消两个槽里的所有后台任务（换片时用），返回取消的数量。
+/// 换片时前端改调这个：只取消音轨会漏掉正在抽的那条字幕。
+#[tauri::command]
+pub async fn transcode_cancel_all(app: AppHandle) -> u32 {
+    crate::blocking::blocking(move || app.state::<JobState>().cancel_all())
+        .await
+        .unwrap_or(0)
 }
 
 /// 判断某个文件名是不是本应用留下的半成品：`{stem} (音轨N).tmp.mka` /
@@ -691,8 +826,17 @@ pub fn is_our_sidecar_tmp(stem: &str, name: &str) -> bool {
 
 /// 清掉同一部片遗留的半成品：上一次被强杀/崩溃时工作线程来不及删的
 /// `基名 (音轨N).tmp.mka` / `基名 (字幕N).tmp.srt`。
+///
+/// 走 spawn_blocking：片源经常在 NAS/SMB 上，一次 read_dir 在断连时能卡几十秒。
+/// 返回数量是给用户看的，原本就永不 reject，所以线程池异常时用 0 兜底。
 #[tauri::command]
-pub fn clean_sidecar_tmp(video_path: String) -> u32 {
+pub async fn clean_sidecar_tmp(video_path: String) -> u32 {
+    crate::blocking::blocking(move || clean_sidecar_tmp_impl(video_path))
+        .await
+        .unwrap_or(0)
+}
+
+fn clean_sidecar_tmp_impl(video_path: String) -> u32 {
     let vp = Path::new(&video_path);
     let Some(dir) = vp.parent() else { return 0 };
     let stem = vp.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
@@ -822,7 +966,7 @@ mod tests {
         for n in ours.iter().chain(users.iter()) {
             fs::write(dir.join(n), b"x").unwrap();
         }
-        let n = clean_sidecar_tmp(video.to_string_lossy().into_owned());
+        let n = clean_sidecar_tmp_impl(video.to_string_lossy().into_owned());
         assert_eq!(n, ours.len() as u32, "删除数量不对：{n}");
         for name in ours {
             assert!(!dir.join(name).exists(), "半成品没删掉：{name}");
@@ -831,5 +975,87 @@ mod tests {
             assert!(dir.join(name).exists(), "用户文件被误删：{name}");
         }
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    // ---- 任务调度（槽 + 代际号 + cancelled 事件）----
+
+    /// 造一个"活着但立刻可杀"的子进程来占槽。
+    /// 不拉真 ffmpeg：这里验证的是槽的归属，跑什么进程无关。
+    fn dummy_job(gen: u64) -> TranscodeJob {
+        let child = hidden_command("cmd")
+            .args(["/c", "ping", "-n", "10", "127.0.0.1"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("测试需要能启动 cmd ping");
+        TranscodeJob { child, gen }
+    }
+
+    /// 代际号必须严格递增：只要还回退，旧 worker 就可能认领新任务。
+    #[test]
+    fn job_gen_never_goes_backwards() {
+        let mut last = next_gen();
+        for _ in 0..1000 {
+            let g = next_gen();
+            assert!(g > last, "代际号回退：{g} 不大于 {last}");
+            last = g;
+        }
+    }
+
+    /// 槽被清空（取消/让位）后旧 worker 收尾时，不能摘走新任务。
+    #[test]
+    fn stale_gen_cannot_claim_new_job() {
+        let state = JobState::default();
+        state.install(Slot::Audio, dummy_job(7));
+        assert!(state.take_if_gen(Slot::Audio, 6).is_none(), "旧代际号不该认领新任务");
+        let mut job = state.take_if_gen(Slot::Audio, 7).expect("当前代际号应该能摘走自己的任务");
+        job.kill_now();
+    }
+
+    /// 音轨与字幕各自一个槽：取消/让位一边不能把另一边杀掉。
+    #[test]
+    fn audio_and_subtitle_slots_are_independent() {
+        let state = JobState::default();
+        state.install(Slot::Audio, dummy_job(1));
+        state.install(Slot::Subtitle, dummy_job(2));
+
+        assert!(state.cancel(Slot::Audio), "音轨槽里应该有任务");
+        let mut sub = state.take_if_gen(Slot::Subtitle, 2).expect("取消音轨不该动到字幕槽");
+        sub.kill_now();
+        assert!(!state.cancel(Slot::Audio), "音轨槽已经空了");
+
+        // 计数语义：只算真正被杀掉的任务
+        state.install(Slot::Subtitle, dummy_job(3));
+        assert_eq!(state.cancel_all(), 1);
+        assert_eq!(state.cancel_all(), 0);
+    }
+
+    /// cancelled 的 payload 前端直接读字段：音轨的 index 必须是显式 null（不是缺字段），
+    /// 字幕必须带 0 基序号，否则 pendingSub 认领不到。
+    #[test]
+    fn cancelled_payload_shape() {
+        let audio = serde_json::to_value(JobCancelled { kind: "audio".into(), video: r"D:\影\a.mkv".into(), index: None }).unwrap();
+        assert_eq!(
+            audio,
+            serde_json::json!({ "kind": "audio", "video": r"D:\影\a.mkv", "index": null })
+        );
+
+        let sub = serde_json::to_value(JobCancelled {
+            kind: "subtitle".into(),
+            video: "a.mkv".into(),
+            index: Some(2),
+        })
+        .unwrap();
+        assert_eq!(
+            sub,
+            serde_json::json!({ "kind": "subtitle", "video": "a.mkv", "index": 2 })
+        );
+    }
+
+    /// 事件里 kind 的取值是前后端契约，改名会让前端认不出事件类型。
+    #[test]
+    fn slot_labels_match_frontend_contract() {
+        assert_eq!(Slot::Audio.as_str(), "audio");
+        assert_eq!(Slot::Subtitle.as_str(), "subtitle");
     }
 }

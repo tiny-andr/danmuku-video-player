@@ -7,7 +7,7 @@
 Tauri 2 桌面播放器：打开本机视频，自动配同目录的弹幕 XML 与字幕一起播。
 
 - 前端**没有构建步骤**：`src/index.html` 是唯一入口，CSS 与 JS 全部内联，`src/vendor/` 下的 Artplayer 与两个插件是本地化副本，不走 CDN。
-- 后端是 Rust，8 个模块，多数命令是"调外部 ffmpeg / 读二进制 / 开系统对话框"的薄封装。
+- 后端是 Rust，9 个模块，多数命令是"调外部 ffmpeg / 读二进制 / 开系统对话框"的薄封装。
 
 ## 2. 代码地图
 
@@ -21,7 +21,8 @@ Tauri 2 桌面播放器：打开本机视频，自动配同目录的弹幕 XML �
 | `src-tauri/src/mkv_sub.rs` | 用 Cues 索引稀疏抽取文本字幕（核心性能点） |
 | `src-tauri/src/pgs_render.rs` | libpgs 解码 PGS 位图 → base64 PNG |
 | `src-tauri/src/subtitle_text.rs` | 外挂字幕（srt/vtt/ass/ssa）纯 Rust → SRT，**不依赖 ffmpeg** |
-| `src-tauri/src/transcode.rs` | 音轨转码、字幕抽取兜底、后台任务状态机、Job Object |
+| `src-tauri/src/blocking.rs` | `blocking()`：把阻塞 IO 丢进 spawn_blocking 线程池，命令薄壳统一用它 |
+| `src-tauri/src/transcode.rs` | 音轨转码、字幕抽取兜底、audio/subtitle 双任务槽、Job Object |
 | `src-tauri/src/autostart.rs` | 注册表 `Run` 项自启动 |
 
 ## 3. 构建与验证
@@ -74,7 +75,26 @@ $env:SPARSE_TEST_SRC='<mkv>'; $env:SPARSE_TEST_TRACK='9'; $env:SPARSE_TEST_ASS='
 
 **ffmpeg 调用**：必须走 `hidden_command()`（`CREATE_NO_WINDOW`），否则会弹黑框；必须 `job::assign()` 进 Job Object，否则宿主被强杀后留下孤儿进程；同时把 `.tmp.*` 半成品清掉。
 
-**后台任务可中断**：换片或关窗要杀当前任务（`transcode_audio_cancel`）。换片时杀在跑的任务，用户换片后新片才不会因为磁盘 IO 抢不到而卡缓冲。
+**CSP 有两个不能动的例外**：`tauri.conf.json` 配了 CSP，但
+- `style-src` 必须带 `'unsafe-inline'`，**并且**必须把 `style-src` 写进 `dangerousDisableAssetCspModification`。Tauri 编译期会给 style-src 注入 nonce，而 CSP 规范规定「sources 里有 nonce/hash 时 `unsafe-inline` 被忽略」，于是 Artplayer 运行时动态创建的 `<style>` 全被挡（实测 24 条 violation、界面样式失效）。
+- `connect-src` 必须允许 `blob:`。Artplayer 挂字幕是 `fetch(blobUrl)` 读文本的，少这一条字幕会**静默**挂不上（菜单显示已挂载、画面没字）。
+其余指令保持收紧（`script-src 'self'` 靠 Tauri 的 hash、`object-src 'none'`、`base-uri`、`frame-ancestors`）。改完用 `H:\tmp\bplayer-audit\verify-csp.mjs` 跑一遍，要求 violation = 0。
+
+**读文件一律走 `read_capped`**：`MAX_READ_BYTES = 64 MB`，`read_text` / `read_bytes` / `pair_danmaku` / `subtitle_text::to_srt` / ffmpeg 字幕 stdout 全走它。新增任何"整读进内存"的路径也必须走——一个几 GB 的损坏 .xml/.ass 能把进程 OOM 掉（不是报错，是进程直接消失）。弹幕路径超限按「没有弹幕」静默处理，文本/字幕路径返回 Err 给 toast。
+
+**单实例**：`single_instance.rs` 用命名互斥量（`Local\danmuku-video-player-single-instance`）拦第二个实例，必须在 `run()` 最前面调，第二个实例连 webview 都不建就 `exit(0)`。放行条件是 `CreateMutexW` 返回 null 时 fail-open——宁可两实例，也不能让播放器打不开。两个实例同时对同一片转码，会让两个 ffmpeg 写同一个 `.tmp.mka`。
+
+**命令必须 async + 走 `blocking()`**：Tauri 2 的同步命令**不冻窗口消息循环**（实测 3 秒的 SMB `fs_stat` 期间窗口 Responding 一直 True），但**所有 invoke 共用一条串行通道** —— 同一时刻慢命令 2997 ms，并发发起的本地快命令也是 2997 ms；改成 async + `crate::blocking::blocking(...)` 后快命令 2 ms。所以凡是做文件 IO / 等子进程 / 目录遍历的命令都要这么写，否则一条 SMB 断连能把挂字幕、探音轨、刷进度全堵在后面几十秒。例外不用改：`pick_video`/`pick_folder`（rfd 模态对话框要在主线程）、`pgs_image`/`pgs_close`/`pgs_current`（纯内存）、`autostart`（注册表毫秒级）、`transcode_target`（纯计算）。
+
+**audio / subtitle 是两个独立 Job 槽**：`JobSlots { audio, subtitle }`。**不要合并回单槽** —— 实测 5 分钟片转音轨途中点内嵌字幕，共用槽会把音轨任务静默杀掉、mka 永远不落盘。取消分两种：换片/关窗用 `transcode_cancel_all`（两个都杀），单杀音轨用 `transcode_audio_cancel`。kill 一律在锁外做（等子进程退出要几百毫秒，拿锁会把另一个槽的命令一起卡住）。
+
+**任务代际号只增不减**：`JOB_GEN: AtomicU64` + `fetch_add(1)`。**不要改回"槽里 gen+1、槽为空则从 1 开始"** —— 取消会把槽清空，下一个任务又从 1 编号，而上一单的 worker 正是靠 `take_if_gen(|j| j.gen == gen)` 认领自己那单；号一重合，旧 worker 就会摘走新任务、拿上一单的产物清单去改名。
+
+**被取消/让位必须发 `transcode://cancelled`**：这条路径以前是静默清理，前端等不到 `done`，字幕的"加载中"状态会永远挂着。payload `{ kind, video, index }`（音轨的 index 序列化成 null）。
+
+**前端按 kind 双记账位**：`audioJob { video, ordinal }` / `subJob { video, index, item }`，progress / done / error 一律按 `p.kind` 分流，只比对该组自己的 video。**不要退回单组 `transcodeVideo` 当全局闸门** —— 音轨 done 会把它清空，随后到达的字幕 done 就被当成过期事件丢掉（内嵌字幕永远不挂载）。pill 用 `syncPill()`，两组都空才隐藏。
+
+**`transcode://cancelled` 只做提示，不清记账位**：片内换轨时旧任务的 cancelled 先到、新任务 done 后到，在事件里清账会让新 done 认领不上。状态清理归发起方（换片 / 点 pill 的 `transcode_cancel_all` 回调），不依赖事件。
 
 **floating 面板互斥**：音轨、字幕、弹幕密度、弹幕屏蔽四个面板都用 `.block-panel`，固定在同一个 `right:16px; bottom:64px`。新加这类面板必须接进 `closeOtherPanels()`。
 

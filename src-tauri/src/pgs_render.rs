@@ -12,6 +12,7 @@
 
 use serde::Serialize;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
 use libpgs::pgs::payload::ods_rle_data;
@@ -46,6 +47,41 @@ pub struct PgsDoc {
 }
 
 pub type PgsState = Mutex<Option<PgsDoc>>;
+
+// ---- 请求代际 ----
+
+/// PGS 请求代际号，只增不减。前端连点两条 PGS 轨时，先发出的那次 build 可能更慢：
+/// 如果它一完成就无条件写 state，会把后发者已经写好的文档盖回去，`pgs_image` 随后
+/// 按事件序号取到的是另一条轨的图（或图数对不上而静默无图）。前端的 `pgsToken`
+/// 只挡 promise 回调，挡不住 Rust 侧状态被旧文档覆盖，所以这里必须自己认号。
+static PGS_GEN: AtomicU64 = AtomicU64::new(0);
+
+fn next_pgs_gen() -> u64 {
+    PGS_GEN.fetch_add(1, Ordering::SeqCst) + 1
+}
+
+// ---- 资源上限 ----
+
+/// 画布边长硬顶。蓝光最大 1920×1080，UHD 蓝光 3840×2160，8192 留足余量。
+/// 尺寸是文件里的外部数据，不设限时损坏/恶意文件声明 65535×65535 会让
+/// `Canvas::new` 申请约 17 GB（65535²×4），分配失败直接 abort 整个播放器。
+const PGS_MAX_DIM: u32 = 8192;
+
+/// 单轨事件数上限。每条事件都常驻一张 PNG，条数失控同样会吃光内存。
+const PGS_MAX_EVENTS: usize = 200_000;
+
+fn check_canvas_size(w: u32, h: u32) -> Result<(), String> {
+    if w == 0 || h == 0 || w > PGS_MAX_DIM || h > PGS_MAX_DIM {
+        return Err(format!("PGS 画布尺寸异常（{w}×{h}），拒绝加载"));
+    }
+    Ok(())
+}
+
+/// ODS 对象尺寸也是文件声明的，`decode_rle` 会按 w*h 预分配像素缓冲，超限同样是
+/// 一次 abort。0 表示空对象，解码器自己会返回空切片，照旧放行。
+fn object_size_reasonable(w: u16, h: u16) -> bool {
+    w <= PGS_MAX_DIM as u16 && h <= PGS_MAX_DIM as u16
+}
 
 // ---- 位图合成 ----
 
@@ -205,6 +241,9 @@ fn build(video: &str, track: u32) -> Result<PgsDoc, String> {
             let group = &groups[&id];
             let Some(first) = group[0].parse_ods() else { continue };
             let (Some(w), Some(h)) = (first.width, first.height) else { continue };
+            if !object_size_reasonable(w, h) {
+                return Err(format!("PGS 对象尺寸异常（{w}×{h}），拒绝加载"));
+            }
             let mut rle: Vec<u8> = Vec::new();
             for seg in group {
                 if let Some(ods) = seg.parse_ods() {
@@ -220,6 +259,8 @@ fn build(video: &str, track: u32) -> Result<PgsDoc, String> {
         }
 
         let Some(pcs) = ds.segments.iter().find_map(|s| s.parse_pcs()) else { continue };
+        // 先校验再分配：画布是照文件声明申请的，别让坏文件把进程撑爆
+        check_canvas_size(pcs.video_width as u32, pcs.video_height as u32)?;
         canvas_w = pcs.video_width as u32;
         canvas_h = pcs.video_height as u32;
 
@@ -265,6 +306,9 @@ fn build(video: &str, track: u32) -> Result<PgsDoc, String> {
                 last.end = ds.pts_ms; // 上一帧结束在这里
             }
         }
+        if events.len() >= PGS_MAX_EVENTS {
+            return Err(format!("PGS 事件数超过上限（{PGS_MAX_EVENTS}），拒绝继续合成"));
+        }
         events.push(PgsEvent { start: ds.pts_ms, end: ds.pts_ms + 2000.0, x: bx, y: by, w: bw, h: bh });
         images.push(png);
         current = Some(sig);
@@ -288,12 +332,23 @@ fn build(video: &str, track: u32) -> Result<PgsDoc, String> {
 /// 打开某条 PGS 字幕轨：后台抽取并合成，返回事件索引（图像按需再取）。
 #[tauri::command]
 pub async fn pgs_open(app: AppHandle, video_path: String, track: u32) -> Result<PgsIndex, String> {
+    // 号在 build 之前就取好：之后只要再来一次 open 或 close，号就比这个大了
+    let my_gen = next_pgs_gen();
     let app2 = app.clone();
     let doc = tauri::async_runtime::spawn_blocking(move || build(&video_path, track))
         .await
         .map_err(|e| format!("PGS 任务失败: {e}"))??;
     let index = doc.index.clone();
-    *app2.state::<PgsState>().lock().unwrap() = Some(doc);
+    // 比对和写入必须在同一把锁里：否则「比对通过 → 另一个 open 取号 → 本单写入」
+    // 这个交错照样会把新文档盖掉
+    {
+        let state = app2.state::<PgsState>();
+        let mut guard = state.lock().unwrap();
+        if PGS_GEN.load(Ordering::SeqCst) != my_gen {
+            return Err("PGS 解析已被更新的请求取代".into());
+        }
+        *guard = Some(doc);
+    }
     Ok(index)
 }
 
@@ -309,7 +364,14 @@ pub fn pgs_image(state: State<'_, PgsState>, index: usize) -> Result<String, Str
 /// 释放当前 PGS 文档（切片/关闭字幕时调用，30 MB 内存不常驻）
 #[tauri::command]
 pub fn pgs_close(state: State<'_, PgsState>) {
-    *state.lock().unwrap() = None;
+    // 先推高代际号，让还在 build 的 open 完成后自己作废；再比对一次是为了防止
+    // 「close 取号之后又来了一次新 open」时把新 open 刚写好的文档关掉
+    let my_gen = next_pgs_gen();
+    let mut guard = state.lock().unwrap();
+    if PGS_GEN.load(Ordering::SeqCst) != my_gen {
+        return;
+    }
+    *guard = None;
 }
 
 /// 当前加载的是哪条轨（换片判断用）
@@ -333,4 +395,46 @@ fn base64_encode(input: &[u8]) -> String {
         out.push(if chunk.len() > 2 { TABLE[n as usize & 63] as char } else { '=' });
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn canvas_size_accepts_real_and_boundary_sizes() {
+        for (w, h) in [(1u32, 1u32), (1920, 1080), (3840, 2160), (8192, 8192)] {
+            assert!(check_canvas_size(w, h).is_ok(), "{w}×{h} 应被接受");
+        }
+    }
+
+    #[test]
+    fn canvas_size_rejects_zero_and_absurd_sizes() {
+        for (w, h) in [
+            (0u32, 0u32),
+            (0, 1080),
+            (1920, 0),
+            (65535, 65535),
+            (8193, 100),
+            (100, 8193),
+        ] {
+            assert!(check_canvas_size(w, h).is_err(), "{w}×{h} 应被拒绝");
+        }
+    }
+
+    #[test]
+    fn object_size_guard_allows_empty_but_rejects_oversized() {
+        assert!(object_size_reasonable(0, 0));
+        assert!(object_size_reasonable(1920, 1080));
+        assert!(object_size_reasonable(8192, 8192));
+        assert!(!object_size_reasonable(8193, 100));
+        assert!(!object_size_reasonable(65535, 65535));
+    }
+
+    #[test]
+    fn pgs_generation_only_increases() {
+        let a = next_pgs_gen();
+        let b = next_pgs_gen();
+        assert!(b > a, "代际号必须单调递增：{a} -> {b}");
+    }
 }
