@@ -70,6 +70,14 @@ const PGS_MAX_DIM: u32 = 8192;
 /// 单轨事件数上限。每条事件都常驻一张 PNG，条数失控同样会吃光内存。
 const PGS_MAX_EVENTS: usize = 200_000;
 
+/// 位图总量上限。只限条数是不够的 —— 200000 条 × 30 KB 也能到 6 GB。
+/// 真片实测约 884 条、30 MB，128 MB 对正常片源绰绰有余。
+const PGS_MAX_IMAGE_BYTES: usize = 128 * 1024 * 1024;
+
+/// 单个 epoch 内解码后的对象总量上限。对象尺寸已限 8192²（单对象 64 MB），
+/// 但 id 空间有 65536 个，坏文件能堆出天文数字；真片几百 KB 到几 MB。
+const PGS_MAX_OBJECT_BYTES: usize = 128 * 1024 * 1024;
+
 fn check_canvas_size(w: u32, h: u32) -> Result<(), String> {
     if w == 0 || h == 0 || w > PGS_MAX_DIM || h > PGS_MAX_DIM {
         return Err(format!("PGS 画布尺寸异常（{w}×{h}），拒绝加载"));
@@ -211,12 +219,16 @@ fn build(video: &str, track: u32) -> Result<PgsDoc, String> {
     let mut images: Vec<Vec<u8>> = Vec::new();
     let (mut canvas_w, mut canvas_h) = (0u32, 0u32);
     let mut current: Option<Vec<(u16, u8, u16, u16)>> = None;
+    // 累计已吃下的内存，超预算就整轨放弃（见上面两个常量）
+    let mut object_bytes: usize = 0;
+    let mut image_bytes: usize = 0;
 
     for ds in &sets {
         if ds.composition_state == CompositionState::EpochStart {
             objects.clear();
             objects_ver.clear();
             palette.clear();
+            object_bytes = 0; // 新 epoch 重新开始计数，旧对象已释放
         }
         for seg in &ds.segments {
             if let Some(pds) = seg.parse_pds() {
@@ -253,6 +265,13 @@ fn build(video: &str, track: u32) -> Result<PgsDoc, String> {
                 }
             }
             if let Some(pixels) = decode_rle(&rle, w, h) {
+                object_bytes = object_bytes.saturating_add(pixels.len());
+                if object_bytes > PGS_MAX_OBJECT_BYTES {
+                    return Err(format!(
+                        "PGS 对象总量超过 {} MB 上限，拒绝加载",
+                        PGS_MAX_OBJECT_BYTES / (1024 * 1024)
+                    ));
+                }
                 objects_ver.insert(id, first.version);
                 objects.insert(id, (w as usize, h as usize, pixels));
             }
@@ -308,6 +327,13 @@ fn build(video: &str, track: u32) -> Result<PgsDoc, String> {
         }
         if events.len() >= PGS_MAX_EVENTS {
             return Err(format!("PGS 事件数超过上限（{PGS_MAX_EVENTS}），拒绝继续合成"));
+        }
+        image_bytes = image_bytes.saturating_add(png.len());
+        if image_bytes > PGS_MAX_IMAGE_BYTES {
+            return Err(format!(
+                "PGS 位图总量超过 {} MB 上限，拒绝继续合成",
+                PGS_MAX_IMAGE_BYTES / (1024 * 1024)
+            ));
         }
         events.push(PgsEvent { start: ds.pts_ms, end: ds.pts_ms + 2000.0, x: bx, y: by, w: bw, h: bh });
         images.push(png);

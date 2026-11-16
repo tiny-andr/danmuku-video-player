@@ -1260,7 +1260,12 @@
     }
 
     async function loadPlaylist(dir, open) {
+      // 连点「打开文件夹」/先后拖两个目录时两次 scan_folder 会并行跑；
+      // 后返回的旧目录结果会把新目录的列表盖掉（面板标题、选中集、后续自动下一集全跟着错），
+      // 所以只让最后一次发起的扫描落地，被取代的那次把结果交给调用方但不动状态。
+      var mySeq = ++playlistSeq;
       var scan = await invoke('scan_folder', { dir: dir });
+      if (mySeq !== playlistSeq) return null; // 已有更新的扫描，本次整份作废
       playlist = scan.episodes;
       playlistDir = normPath(dir);
       $('plTitle').textContent = '📂 ' + scan.label;
@@ -1290,6 +1295,12 @@
     var audioJob = { video: '', ordinal: -1 };          // 音轨转码（ordinal 1-based）
     var subJob = { video: '', index: -1, item: null };  // 内嵌字幕抽取（index 只作记录/诊断用）
     var currentVideoPath = '';  // 当前播放的源视频（归一化路径）
+    // 下面三个代际是同一类东西：异步请求回来时，用户可能已经改主意了。
+    // 用代际而不是「比一下 currentVideoPath」：后者挡不住「fs_stat 还没回来、
+    // currentVideoPath 还没更新」那段窗口，先发起的旧请求会把最后一次点击翻盘。
+    var videoLoadSeq = 0;       // 换片代际：每次 desktopLoadVideo 自增
+    var dropSeq = 0;            // 拖放代际：一次拖放里有多个 await，后一次拖放让前一次作废
+    var playlistSeq = 0;        // 播放列表代际：并发扫描时只让最后一次写状态
     var externalOrdinal = -1;   // 当前挂载的外挂音轨序号；-1 = 无
     var probeTracks = null;     // 最近一次探测的音轨列表（仅 audio）
     var probeDurationUs = null;
@@ -1458,13 +1469,18 @@
           audioJob.ordinal = ordinal;
           updatePill('audio', -1, 0);
           invoke('transcode_audio_start', { videoPath: path, audioIndex: audioIdx, durationUs: durationUs || null }).then(function () {
-            if (audioJob.video === normPath(path)) {
+            // 同一条启动请求也可能晚回：只有这次启动的（片, 轨道）还占着记账位才算数，
+            // 否则会给已经换掉的轨道弹一条「正在转换」。
+            if (audioJob.video === normPath(path) && audioJob.ordinal === ordinal) {
               var why2 = reason === 'pin'
                 ? '（' + label + '）是默认音轨，但本内核会跳过它'
                 : '（' + label + '）本内核无法解码';
               toast('音轨' + ordinal + why2 + '，正在后台转换为 AAC 外挂音轨', 6000);
             }
           }).catch(function (e) {
+            // 换片 / 片内换轨之后，这次启动失败才回来：记账位已经属于别的任务，
+            // 在这里 clearAudioJob() 会把新任务的记账清掉，还会弹一条旧片的错误。
+            if (audioJob.video !== normPath(path) || audioJob.ordinal !== ordinal) return;
             clearAudioJob();
             toast('音轨转换未能启动：' + e, 8000);
           });
@@ -2089,9 +2105,16 @@
     });
 
     async function desktopLoadVideo(path, manualDanPath, epIndex) {
+      // 每次换片铸一个代际：这个函数里有 fs_stat / 目录扫描 / 读弹幕三个 await，
+      // 用户在这期间随时可能又点了别的片。回来时先确认自己还是最后一次请求，
+      // 否则旧请求会翻盘 —— 典型是 A 的 fs_stat 比 B 晚返回，A 把 currentVideoPath
+      // 改回自己并重新加载（最后一次点击作废）。
+      // 返回值是本次代际；被取代或失败时返回 0，调用方（拖放）据此判断能不能续挂字幕。
+      var seq = ++videoLoadSeq;
       var name = pathName(path);
       var st = await invoke('fs_stat', { path: path });
-      if (st.kind !== 'file') { toast('文件不存在：' + name); return; }
+      if (seq !== videoLoadSeq) return 0; // 之后又发起了换片，本次什么都不做
+      if (st.kind !== 'file') { toast('文件不存在：' + name); return 0; }
       currentVideoPath = normPath(path);
       probeTracks = null;
       probeDurationUs = null;
@@ -2119,6 +2142,9 @@
       var dir = pathDir(path);
       if (epIndex == null) {
         if (!playlist.length || playlistDir !== normPath(dir)) await loadPlaylist(dir, false);
+        // 扫描目录可能要几秒（网络盘）；期间换片的话整段定位都作废，
+        // 否则旧片会把自己的集数写进新片的列表选中态。
+        if (seq !== videoLoadSeq) return 0;
         epIndex = -1;
         for (var i = 0; i < playlist.length; i++) if (normPath(playlist[i].path) === normPath(path)) { epIndex = i; break; }
       }
@@ -2128,13 +2154,24 @@
       // 读盘期间用户可能已经换了片：结果回来时先确认当前片还是本部，不等就整段作废。
       // 否则 A 片的弹幕晚到会滚到 B 片上（B 自己刚挂好的弹幕被覆盖，或者 B 被误清空）。
       if (manualDanPath) {
-        var manualText = await invoke('read_text', { path: manualDanPath });
-        if (normPath(currentVideoPath) !== normPath(path)) return; // 已换片，丢弃
+        // read_text 有 64 MB 上限，超大/损坏的弹幕会让它 reject。不接住的话
+        // 整个 await 链变成 unhandled rejection，界面一点提示都没有。
+        var manualText = null;
+        try {
+          manualText = await invoke('read_text', { path: manualDanPath });
+        } catch (e) {
+          clearDanmaku(); // 别把上一部片的弹幕留在画面上
+          toast('弹幕读取失败：' + e, 7000);
+          return seq; // 视频已经就绪，弹幕失败不该影响播放
+        }
+        if (seq !== videoLoadSeq) return 0; // 已换片，丢弃
+        if (normPath(currentVideoPath) !== normPath(path)) return 0; // 已换片，丢弃
         desktopLoadDanmaku(pathName(manualDanPath), manualText);
       } else {
         var pairPath = / \(AAC\)\.mkv$/i.test(name) ? path.replace(/ \(AAC\)\.mkv$/i, '.mkv') : path;
         var pair = await invoke('pair_danmaku', { videoPath: pairPath });
-        if (normPath(currentVideoPath) !== normPath(path)) return; // 已换片，丢弃；下面的 toast / clearDanmaku 也不能执行
+        if (seq !== videoLoadSeq) return 0; // 已换片，丢弃
+        if (normPath(currentVideoPath) !== normPath(path)) return 0; // 已换片，丢弃；下面的 toast / clearDanmaku 也不能执行
         if (pair) {
           desktopLoadDanmaku(pair.name, pair.text);
           toast('已自动加载同名弹幕：' + pair.name);
@@ -2143,6 +2180,7 @@
           toast('「' + baseName(name) + '」同目录没有同名弹幕（.xml / .json）', 4200);
         }
       }
+      return seq;
     }
     window.__BplayerDesktop = {
       loadVideo: desktopLoadVideo,
@@ -2170,7 +2208,10 @@
     });
     $('btnOpenFolder').addEventListener('click', async function () {
       var d = await invoke('pick_folder');
-      if (d) { await loadPlaylist(d, true); toast('已加载播放列表 · ' + playlist.length + ' 集'); }
+      if (d) {
+        var scan = await loadPlaylist(d, true);
+        if (scan) toast('已加载播放列表 · ' + playlist.length + ' 集'); // 被更新的扫描取代时 scan 为 null
+      }
     });
     $('btnPlaylist').addEventListener('click', function () { $('playlist').classList.toggle('open'); });
 
@@ -2294,9 +2335,16 @@
       if (p.type === 'leave' || p.type === 'drop') document.body.classList.remove('dragover');
       if (p.type !== 'drop' || !p.paths || !p.paths.length) return;
       var paths = p.paths;
+      // 一次拖放里有 fs_stat / 载片 / 读弹幕多个 await，拖放又是各自独立的回调：
+      // 后一次拖放让前一次整个作废，否则先拖的文件夹会晚到把后拖的视频盖掉。
+      // 同时记下拖放时的换片代际：载片进行中换了片，这次拖放的附带内容（字幕/弹幕）也不属于新片。
+      var drop = ++dropSeq;
+      var dropVideoSeq = videoLoadSeq;
       var st = await invoke('fs_stat', { path: paths[0] });
+      if (drop !== dropSeq || dropVideoSeq !== videoLoadSeq) return; // 已有更新的操作，本次作废
       if (st.kind === 'dir') {
         var scan = await loadPlaylist(paths[0], true);
+        if (!scan || drop !== dropSeq || dropVideoSeq !== videoLoadSeq) return;
         toast('已加载播放列表「' + scan.label + '」· ' + playlist.length + ' 集');
         return;
       }
@@ -2309,7 +2357,11 @@
       }
       if (video) {
         // 视频 + 字幕一起拖进来：先起视频，字幕等菜单建好后补上去
-        await desktopLoadVideo(video, dan);
+        var own = await desktopLoadVideo(video, dan);
+        // 载片可能要几秒（网络盘 / 扫目录 / 配对弹幕）。这期间用户可能已经换片
+        // （播放列表点击、自动下一集、又拖了别的视频），此时这条字幕已经不属于当前片：
+        // 登记会污染新片的字幕菜单，挂载会把旧片的字幕显示在新片上。
+        if (!own || own !== videoLoadSeq) return;
         if (sub) {
           var vs = addDroppedSubtitle(sub);
           if (vs) mountSubtitle(vs, false);
@@ -2322,8 +2374,13 @@
         if (s2) mountSubtitle(s2, false);
         return;
       }
-      if (dan) desktopLoadDanmaku(pathName(dan), await invoke('read_text', { path: dan }));
-      else toast('未识别的文件：请拖入视频、弹幕（xml / json）或字幕（srt / ass / vtt）');
+      if (dan) {
+        // 读弹幕文件也要等；期间换片或又拖了别的弹幕，这份文本就不能再挂上去
+        // （否则旧片弹幕会覆盖新片刚挂好的那份）。
+        var text = await invoke('read_text', { path: dan });
+        if (drop !== dropSeq || dropVideoSeq !== videoLoadSeq) return;
+        desktopLoadDanmaku(pathName(dan), text);
+      } else toast('未识别的文件：请拖入视频、弹幕（xml / json）或字幕（srt / ass / vtt）');
     });
 
     // 转码进度/完成/失败事件（Rust 侧 ffmpeg 工作线程发出）。
