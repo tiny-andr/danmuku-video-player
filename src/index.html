@@ -945,6 +945,15 @@
 
   function baseName(n) { return String(n).replace(/\.[^.]+$/, ''); }
 
+  // 提示里的文件名动辄几十个字符（Transformers.Revenge.of.the.Fallen.2009.Bluray…srt），
+  // 整条塞进 toast 会把提示撑成两行、还得来回找重点。截到能分辨为止就行。
+  // 纯"当前片/当前目录"上下文里已经知道的信息，干脆不写名字（见各调用点）。
+  function clipName(n, max) {
+    var t = String(n || '');
+    var lim = max || 24;
+    return t.length > lim ? t.slice(0, lim - 1) + '…' : t;
+  }
+
   function clearDanmaku() {
     danmakuLoadToken++;
     danmakuList = [];
@@ -1815,7 +1824,7 @@
         mountedSubId = s.id;
         art.subtitle.style({ display: 'block' });
         refreshSubtitleMenu();
-        if (!silent) toast('已挂载字幕：' + s.name);
+        if (!silent) toast('已挂载字幕：' + clipName(s.name));
       }).catch(function (e) {
         // 换片导致的失败不是用户的错，别在新片上弹一条莫名其妙的报错
         if (normPath(currentVideoPath) !== wantPath) { dropStaleSubBlob(url); return; }
@@ -1840,7 +1849,7 @@
         mountedSubId = s.id;
         art.subtitle.style({ display: 'block' });
         refreshSubtitleMenu();
-        if (!silent) toast('已挂载字幕：' + s.name);
+        if (!silent) toast('已挂载字幕：' + clipName(s.name));
       }).catch(function (e) {
         if (normPath(currentVideoPath) !== wantPath) {
           try { URL.revokeObjectURL(url); } catch (e2) { }
@@ -2002,7 +2011,7 @@
       // 位图解析不是后台转码任务，只借字幕胶囊给个「还在解析」的反馈；
       // 字幕抽取正在跑时不能抢那颗胶囊，否则进度文字会被这行覆盖掉
       if (!subJob.video) updatePill('subtitle', -1, 0);
-      toast('正在解析位图字幕（' + s.name + '）…', 4000);
+      toast('正在解析位图字幕（' + clipName(s.name) + '）…', 4000);
       invoke('pgs_open', { videoPath: path, track: s.track }).then(function (idx) {
         if (token !== pgsToken) return;
         syncPill(); // 位图解析不是后台转码任务，别把同时在跑的音轨进度胶囊一起收掉
@@ -2019,7 +2028,7 @@
         pgsEl.style.display = '';
         pgsPump();
         refreshSubtitleMenu();
-        if (!silent) toast('位图字幕已就绪：' + s.name + '（' + idx.events.length + ' 条）', 4000);
+        if (!silent) toast('位图字幕已就绪：' + clipName(s.name) + '（' + idx.events.length + ' 条）', 4000);
       }).catch(function (e) {
         if (token !== pgsToken) return;
         syncPill();
@@ -2114,7 +2123,7 @@
       var name = pathName(path);
       var st = await invoke('fs_stat', { path: path });
       if (seq !== videoLoadSeq) return 0; // 之后又发起了换片，本次什么都不做
-      if (st.kind !== 'file') { toast('文件不存在：' + name); return 0; }
+      if (st.kind !== 'file') { toast('文件不存在：' + clipName(name, 40)); return 0; }
       currentVideoPath = normPath(path);
       probeTracks = null;
       probeDurationUs = null;
@@ -2174,10 +2183,12 @@
         if (normPath(currentVideoPath) !== normPath(path)) return 0; // 已换片，丢弃；下面的 toast / clearDanmaku 也不能执行
         if (pair) {
           desktopLoadDanmaku(pair.name, pair.text);
-          toast('已自动加载同名弹幕：' + pair.name);
+          // 同名配对永远只有这一个结果（xml 优先于 json），文件名没有辨识价值
+          toast('已自动加载同名弹幕');
         } else {
           clearDanmaku();
-          toast('「' + baseName(name) + '」同目录没有同名弹幕（.xml / .json）', 4200);
+          // 不写片名：用户刚打开的就是这部片，名字又长，写出来只会把提示撑成两行
+          toast('当前目录下找不到同名弹幕文件（xml / json）', 4200);
         }
       }
       return seq;
@@ -2321,7 +2332,7 @@
     // 播完自动下一集
     window.__BplayerNext = function () {
       if (currentEpIndex >= 0 && currentEpIndex + 1 < playlist.length) {
-        toast('自动播放下一集：' + playlist[currentEpIndex + 1].name);
+        toast('自动播放下一集：' + clipName(playlist[currentEpIndex + 1].name));
         desktopLoadVideo(playlist[currentEpIndex + 1].path, null, currentEpIndex + 1);
       }
     };
@@ -2400,7 +2411,7 @@
       var vid = p.video ? normPath(p.video) : '';
       if (!vid || vid !== job.video) {
         // 迟到的完成通知（属于上一部片、换片时没来得及杀掉的）：只提示，别动当前记账
-        toast('「' + baseName(pathName(p.video || '')) + '」后台处理完成');
+        toast('后台处理完成');
         return;
       }
       if (isSub) {
