@@ -1,6 +1,6 @@
 [package]
 name = "danmuku-video-player"
-version = "1.2.6"
+version = "1.2.7"
 description = "Danmuku Video Player 本地视频 + 弹幕播放器（桌面版）"
 edition = "2021"
 
