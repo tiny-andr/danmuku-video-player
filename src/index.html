@@ -1551,12 +1551,15 @@
       if (s.kind === 'ext') {
         // 外挂字幕全部先转成干净的 SRT 文本再挂：
         // Artplayer 内置的 assToVtt 生成的 VTT 不合法（WEBVTT 后无换行、序号和时间轴挤在一行），
-        // 结果是「菜单显示已挂载、画面一个字都没有」；而它又用 textContent 渲染，
-        // <font> / <i> 这些标签会原样显示在画面上。交给 ffmpeg 统一转换 + 后端剥标签，
+        // 结果是「菜单显示已挂载、画面一个字都没有」；它又是 innerHTML + escape 渲染，
+        // <font> / <i> 这些标签会被转义成原文显示。交给后端统一转换 + 剥标签，
         // 编码 / GBK / 样式标签一并处理掉。
+        var extWant = normPath(currentVideoPath); // 发起时捕获，回调里不能再读当前值
         invoke('subtitle_to_srt_text', { path: s.path }).then(function (srt) {
+          if (normPath(currentVideoPath) !== extWant) return; // 已经换片，丢弃
           mountSubtitleText(srt, { id: s.id, name: s.name }, silent);
         }).catch(function (e) {
+          if (normPath(currentVideoPath) !== extWant) return;
           toast('字幕加载失败：' + e, 6000);
         });
         return;
@@ -1573,21 +1576,23 @@
       if (!batch.some(function (b) { return b.index === s.ordinal - 1; })) {
         batch.push({ index: s.ordinal - 1, track: s.track, ass: s.codecLabel === 'ASS' });
       }
+      var embedWant = normPath(currentVideoPath); // 发起时捕获，回调里读当前值等于没校验
       invoke('extract_subtitle_text', { videoPath: currentVideoPath, subs: batch, durationUs: probeDurationUs || null }).then(function (got) {
-        var want = normPath(currentVideoPath);
+        if (normPath(currentVideoPath) !== embedWant) return; // 已经换片，整个结果作废
         var hit = (got || []).filter(function (x) { return x.index === s.ordinal - 1; })[0];
         if (hit) {
           pendingSub = null;
           hidePill();
           transcodeVideo = '';
           transcodeOrdinal = -1;
-          if (normPath(currentVideoPath) === want) mountSubtitleText(hit.text, s, silent);
+          mountSubtitleText(hit.text, s, silent);
         } else {
           // 稀疏抽不出来：ffmpeg 管道后台跑，完成事件里带回文本。
           // pendingSub / transcodeVideo 要留着，done 事件靠它们认领。
           toast('正在后台抽取内嵌字幕，完成后自动挂载', 7000);
         }
       }).catch(function (e) {
+        if (normPath(currentVideoPath) !== embedWant) return;
         hidePill();
         transcodeVideo = '';
         pendingSub = null;

@@ -299,18 +299,33 @@ struct SubEntry {
 
 /// 去掉字幕文本里的 HTML 风格标签（`<font face=...>`、`<i>`、`</font>` 等）。
 ///
-/// 播放器把 cue 文本用 textContent 写进 DOM，不解析标签，所以这些会原样显示在画面上。
-/// SRT 文本里 `<` 极罕见，时间轴用的 `-->` 不含 `<`，整段扫一遍是安全的。
+/// 播放器把 cue 文本经 escape 后写进 innerHTML，标签会原样显示在画面上。
+///
+/// 只能剥"看起来确实是标签"的片段：`<` 必须在**同一行内**找到 `>`，且内容以 `/` 或
+/// ASCII 字母开头、内部不含 `<`。否则就把 `<` 原样输出。
+/// 早先的写法是跨行保持一个 `inside` 状态，结果字幕正文里出现 `<3`、`a < b`、`<--`
+/// 这类字符时，会一直吞到下一个 `>`（通常是下一行时间轴的 `-->`），把后半条字幕的
+/// 序号和时间轴一起吃掉，产出一份结构已坏的 SRT。
 pub fn strip_markup(srt: &str) -> String {
     let mut out = String::with_capacity(srt.len());
-    let mut inside = false;
-    for ch in srt.chars() {
-        match ch {
-            '<' => inside = true,
-            '>' if inside => inside = false,
-            _ if !inside => out.push(ch),
-            _ => {}
+    for line in srt.split_inclusive('\n') {
+        let mut rest = line;
+        loop {
+            let Some(lt) = rest.find('<') else { break };
+            let Some(gt_rel) = rest[lt..].find('>') else { break };
+            let inner = &rest[lt + 1..lt + gt_rel];
+            let looks_like_tag = !inner.contains('<')
+                && (inner.starts_with('/')
+                    || inner.chars().next().is_some_and(|c| c.is_ascii_alphabetic()));
+            out.push_str(&rest[..lt]);
+            if looks_like_tag {
+                rest = &rest[lt + gt_rel + 1..];
+            } else {
+                out.push('<');
+                rest = &rest[lt + 1..];
+            }
         }
+        out.push_str(rest);
     }
     out
 }
@@ -450,6 +465,29 @@ mod tests {
     /// 真机调试入口：
     ///   $env:SPARSE_TEST_SRC="<mkv>"; $env:SPARSE_TEST_TRACK="3"; $env:SPARSE_TEST_ASS="1"
     ///   cargo test --release sparse_probe -- --nocapture
+    /// strip_markup 不能因为一个不成对的 < 而吞掉后面的内容。
+    /// 字幕正文里 <3、 < b、<-- 都很常见。
+    #[test]
+    fn strip_markup_survives_unpaired_lt() {
+        let srt = "1\n00:00:01,000 --> 00:00:02,000\n<3\n\n2\n00:00:03,000 --> 00:00:04,000\nhello\n";
+        let out = strip_markup(srt);
+        assert!(
+            out.contains("hello"),
+            "不成对的 '<' 把后续字幕全吞了：{out:?}"
+        );
+        assert!(out.contains("<3"), "普通文本里的 '<3' 不应被当标签删掉：{out:?}");
+    }
+
+    /// 真正的样式标签仍然要被剥掉。
+    #[test]
+    fn strip_markup_removes_real_tags() {
+        let srt = "1\n00:00:01,000 --> 00:00:02,000\n<font face=\"Arial\"><i>hi</i></font>\n";
+        let out = strip_markup(srt);
+        assert!(out.contains("hi"));
+        assert!(!out.contains("<font"), "标签没剥干净：{out:?}");
+        assert!(!out.contains("<i>"), "标签没剥干净：{out:?}");
+    }
+
     #[test]
     fn sparse_probe() {
         let Ok(src) = std::env::var("SPARSE_TEST_SRC") else { return };
