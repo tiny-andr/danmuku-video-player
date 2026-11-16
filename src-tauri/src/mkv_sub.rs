@@ -254,7 +254,7 @@ fn parse_block(buf: &[u8], start: usize, _track_hint: u32) -> Option<(u32, i64, 
     Some((track as u32, rel_ts, duration, buf[p..de].to_vec()))
 }
 
-fn fmt_ts(ms: i64) -> String {
+pub(crate) fn fmt_ts(ms: i64) -> String {
     let ms = ms.max(0);
     let (h, rest) = (ms / 3_600_000, ms % 3_600_000);
     let (m, rest) = (rest / 60_000, rest % 60_000);
@@ -277,8 +277,14 @@ fn ass_line_to_text(line: &str) -> String {
             return String::new();
         }
     }
-    let mut text = it.next().unwrap_or("").to_string();
-    // 去掉 {\...} 覆盖标签（{\i1} / {\pos(..)} 之类）
+    ass_clean_text(it.next().unwrap_or(""))
+}
+
+/// ASS 的「文本字段」→ 可直接显示的纯文本：去掉 `{\...}` 覆盖标签，
+/// 处理 `\N`（硬换行）/ `\n`（软换行）/ `\h`（不换行空格）三个转义。
+/// 内嵌块（`ass_line_to_text`）与外挂 .ass 文件（`subtitle_text`）共用。
+pub(crate) fn ass_clean_text(text: &str) -> String {
+    let mut text = text.to_string();
     loop {
         let Some(a) = text.find('{') else { break };
         let Some(b) = text[a..].find('}') else { break };

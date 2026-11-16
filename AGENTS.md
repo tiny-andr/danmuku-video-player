@@ -7,7 +7,7 @@
 Tauri 2 桌面播放器：打开本机视频，自动配同目录的弹幕 XML 与字幕一起播。
 
 - 前端**没有构建步骤**：`src/index.html` 是唯一入口，CSS 与 JS 全部内联，`src/vendor/` 下的 Artplayer 与两个插件是本地化副本，不走 CDN。
-- 后端是 Rust，7 个模块，多数命令是"调外部 ffmpeg / 读二进制 / 开系统对话框"的薄封装。
+- 后端是 Rust，8 个模块，多数命令是"调外部 ffmpeg / 读二进制 / 开系统对话框"的薄封装。
 
 ## 2. 代码地图
 
@@ -20,6 +20,7 @@ Tauri 2 桌面播放器：打开本机视频，自动配同目录的弹幕 XML �
 | `src-tauri/src/mkv_probe.rs` | 解析 MKV 轨道表。产出 `number`（Matroska TrackNumber，**不是** 0 基索引） |
 | `src-tauri/src/mkv_sub.rs` | 用 Cues 索引稀疏抽取文本字幕（核心性能点） |
 | `src-tauri/src/pgs_render.rs` | libpgs 解码 PGS 位图 → base64 PNG |
+| `src-tauri/src/subtitle_text.rs` | 外挂字幕（srt/vtt/ass/ssa）纯 Rust → SRT，**不依赖 ffmpeg** |
 | `src-tauri/src/transcode.rs` | 音轨转码、字幕抽取兜底、后台任务状态机、Job Object |
 | `src-tauri/src/autostart.rs` | 注册表 `Run` 项自启动 |
 
@@ -42,6 +43,11 @@ Start-Process 'src-tauri\target\release\danmuku-video-player.exe'
 
 注意：`document.getElementById('someRange').value` 在面板**没打开过**时读到的是 HTML 初始值，不是运行时配置。验证默认值必须先把面板打开。
 
+```powershell
+cargo test --lib                     # Rust 单测（外挂字幕解析、选轨清理、字幕标签剥离）
+npm run test:audio                   # 前端选轨决策单测（从 index.html 抠真函数跑，不依赖程序）
+```
+
 `cargo test --release sparse_probe -- --nocapture` 是 `mkv_sub` 的真机单测入口，靠环境变量喂片源：
 
 ```powershell
@@ -55,6 +61,12 @@ $env:SPARSE_TEST_SRC='<mkv>'; $env:SPARSE_TEST_TRACK='9'; $env:SPARSE_TEST_ASS='
 **WebAudio 隔离**：`art.video.crossOrigin = 'anonymous'` 必须在**第一次设 `src` 之前**。页面源是 `tauri.localhost`，素材源是 `asset.localhost`，跨源被污染的媒体抓出来是纯静音，而且一个元素只能抓一次。
 
 **音频规则（用户明确要求过两次）**：不管能不能转，**只能读默认音轨**；默认轨解不了就静音。Chromium 的真实行为是"挑第一条能解的"，不是播默认轨——所以 `classifyAudio()` 算出的 `pin`（`firstPlayable !== audioIndex`）为真时必须强制隔离并静音原轨，否则会放出一条没人要的评论轨。
+
+**`pin` 优先于"编码都能解"**：双 AAC 文件（默认标在第二条）没有任何死编码轨，但内核照样会播错。所以 `handleAudioCodecs()` 的提前返回必须写在 `pin` 之后，音轨菜单入口用 `needsAudioEntry()`（`dead > 0 || pin`）而不是"有没有死编码轨"。改动这块逻辑跑 `npm run test:audio` 回归。
+
+**外挂字幕不依赖 ffmpeg**：`subtitle_text.rs` 自己解析 srt/vtt/ass/ssa（编码探测走 `MultiByteToWideChar` 的 936 代码页）。**安装包不带 ffmpeg** —— `target/release` 里没有 `ffmpeg.exe`，`tauri.conf.json` 也没配 `resources`/`externalBin`，只有开发机 PATH 恰好有才work。任何"外挂字幕走 ffmpeg"的写法等于干净安装的机器上一个外挂字幕都挂不上。ffmpeg 只留给 `subtitle_text` 认不出来的格式兜底。
+
+**删文件前先精确匹配**：`clean_sidecar_tmp()` 只认 `` {stem} (音轨N).tmp.mka `` / `` {stem} (字幕N).tmp.srt ``（`is_our_sidecar_tmp`）。**不要退回「基名前缀 + 含 `.tmp.`」**——实测那样会把用户目录里 `反派 (上).tmp.txt`、`某片 (备注).tmp.mka` 这类普通文件一起删掉，不可逆。
 
 **字幕只进内存**：内嵌文本字幕抽出来直接交给前端做 blob URL，**不写 `(字幕N).srt`**。只有音轨转码会落盘 `(音轨N).mka`。别再往媒体目录里写派生文件。
 

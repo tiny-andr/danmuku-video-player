@@ -6,6 +6,7 @@
   "scripts": {
     "dev": "tauri dev",
     "build": "tauri build",
+    "test:audio": "node tests/audio-plan.mjs",
     "tauri": "tauri"
   },
   "devDependencies": {

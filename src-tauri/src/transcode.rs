@@ -481,15 +481,31 @@ pub struct SubTrack {
     pub ass: bool,
 }
 
-/// 把外挂字幕（ASS/SSA 等）转成 SRT 文本，结果只回给前端，不落盘。
-/// Artplayer 的字幕只认 vtt/srt，外挂 .ass 直接挂上去会「显示已挂载但什么都不出现」，
-/// 交给 ffmpeg 转一次最稳：编码、特效行、样式标记它都处理得掉。
+/// 把外挂字幕（SRT/VTT/ASS/SSA）转成 SRT 文本，结果只回给前端，不落盘。
+///
+/// 主路径是 `subtitle_text::to_srt`（纯 Rust，不碰外部程序）：srt/vtt/ass/ssa
+/// 都是纯文本，转换只是重排时间轴 + 剥样式，不需要解码器。这一点很关键 ——
+/// 安装包并没有把 ffmpeg 打进去，只有开发机 PATH 里恰好有才work，走 ffmpeg
+/// 就等于"干净安装的机器上一个外挂字幕都挂不上"。
+/// ffmpeg 只留给这套解析认不出来的格式兜底。
+///
+/// 为什么要转而不是直接挂：Artplayer 内置的 assToVtt 生成的 VTT 不合法
+/// （WEBVTT 后无换行、序号和时间轴挤在一行），结果是「菜单显示已挂载、画面一个字
+/// 都没有」；它又是 innerHTML + escape 渲染，`<font>` / `<i>` 会被显示成原文。
 #[tauri::command]
 pub fn subtitle_to_srt_text(path: String) -> Result<String, String> {
     let src = PathBuf::from(&path);
     if !src.is_file() {
         return Err("字幕文件不存在".into());
     }
+    match crate::subtitle_text::to_srt(&src) {
+        Ok(srt) => Ok(srt),
+        Err(pure_err) => subtitle_to_srt_with_ffmpeg(&src).map_err(|ff_err| format!("{pure_err}（ffmpeg 兜底：{ff_err}）")),
+    }
+}
+
+/// ffmpeg 兜底：处理 `subtitle_text::to_srt` 认不出来的格式。
+fn subtitle_to_srt_with_ffmpeg(src: &Path) -> Result<String, String> {
     let ffmpeg = find_ffmpeg()?;
     let mut cmd = hidden_command(&ffmpeg);
     cmd.args([
@@ -498,24 +514,20 @@ pub fn subtitle_to_srt_text(path: String) -> Result<String, String> {
         "-loglevel",
         "error",
         "-i",
-        &path,
+        src.to_string_lossy().as_ref(),
         "-f",
         "srt",
         "pipe:1",
     ]);
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
-    let out = cmd
-        .output()
-        .map_err(|e| format!("启动 ffmpeg 失败: {e}"))?;
+    let out = cmd.output().map_err(|e| format!("启动 ffmpeg 失败: {e}"))?;
     if !out.status.success() {
         let msg = String::from_utf8_lossy(&out.stderr);
-        return Err(format!("字幕转换失败：{}", last_err_line(&msg)));
+        return Err(last_err_line(&msg));
     }
-    // ffmpeg 转 ASS 时会生成 <font face=...> 这类样式标签，播放器不解析标签、
-    // 会原样显示在画面上，所以这里统一剥掉，只留纯文本。
     let srt = crate::mkv_sub::strip_markup(&String::from_utf8_lossy(&out.stdout));
     if srt.trim().is_empty() {
-        return Err("这条字幕没有可显示的内容".into());
+        return Err("没有可显示的内容".into());
     }
     Ok(srt)
 }
@@ -650,8 +662,35 @@ pub fn transcode_audio_cancel(state: tauri::State<'_, JobState>) -> bool {
     false
 }
 
+/// 判断某个文件名是不是本应用留下的半成品：`{stem} (音轨N).tmp.mka` /
+/// `{stem} (字幕N).tmp.srt`（N 是十进制音轨/字幕序号，1 基）。
+///
+/// 早先的判据是「以 `{stem} (` 开头且含 `.tmp.`」，于是用户目录里名字碰巧套娃的
+/// **普通文件**会被一起删掉（`反派 (上).tmp.txt`、`某片 (1).tmp.mkv` 实测都被删）。
+/// 这是不可逆的删数据，所以按产物命名规则逐字符精确匹配：宁可漏删一个半成品，
+/// 也绝不误删用户文件。
+pub fn is_our_sidecar_tmp(stem: &str, name: &str) -> bool {
+    let Some(rest) = name.strip_prefix(stem) else { return false };
+    let Some(rest) = rest.strip_prefix(" (") else { return false };
+    let (expect, rest) = if let Some(r) = rest.strip_prefix("音轨") {
+        ("mka", r)
+    } else if let Some(r) = rest.strip_prefix("字幕") {
+        ("srt", r)
+    } else {
+        return false;
+    };
+    let digits = rest.chars().take_while(|c| c.is_ascii_digit()).count();
+    if digits == 0 {
+        return false;
+    }
+    match rest[digits..].strip_prefix(").tmp.") {
+        Some(ext) => ext == expect,
+        None => false,
+    }
+}
+
 /// 清掉同一部片遗留的半成品：上一次被强杀/崩溃时工作线程来不及删的
-/// `基名 (音轨N).tmp.mka` / `基名 (字幕N).tmp.srt`。只删基名和 `.tmp.` 都匹配的本应用产物。
+/// `基名 (音轨N).tmp.mka` / `基名 (字幕N).tmp.srt`。
 #[tauri::command]
 pub fn clean_sidecar_tmp(video_path: String) -> u32 {
     let vp = Path::new(&video_path);
@@ -660,12 +699,11 @@ pub fn clean_sidecar_tmp(video_path: String) -> u32 {
     if stem.is_empty() {
         return 0;
     }
-    let prefix = format!("{stem} (");
     let mut n = 0;
     if let Ok(rd) = fs::read_dir(dir) {
         for e in rd.flatten() {
             let name = e.file_name().to_string_lossy().into_owned();
-            if !name.starts_with(&prefix) || !name.contains(".tmp.") {
+            if !is_our_sidecar_tmp(&stem, &name) {
                 continue;
             }
             let p = e.path();
@@ -736,5 +774,62 @@ mod tests {
         assert!(is_cache_name("深空失忆 (2009) (AAC).tmp.mkv"));
         assert!(!is_cache_name("深空失忆 (2009).mkv"));
         assert!(!is_cache_name(" AAC.mkv"));
+    }
+
+    /// 回归：`clean_sidecar_tmp` 只能删本应用自己命名的半成品。
+    /// 之前的判据（基名前缀 + 含 ".tmp."）会连用户文件一起删。
+    #[test]
+    fn sidecar_tmp_pattern_is_exact() {
+        let stem = "反派 (上)";
+        for ok in [
+            "反派 (上) (音轨1).tmp.mka",
+            "反派 (上) (音轨12).tmp.mka",
+            "反派 (上) (字幕2).tmp.srt",
+        ] {
+            assert!(is_our_sidecar_tmp(stem, ok), "应识别为本应用半成品：{ok}");
+        }
+        for bad in [
+            "反派 (上).tmp.txt",              // 用户的普通文件
+            "反派 (上) 笔记.tmp.txt",
+            "反派 (上) (备注).tmp.mka",       // 括号里不是序号
+            "反派 (上) (音轨).tmp.mka",       // 缺序号
+            "反派 (上) (音轨1).tmp.mkv",      // 扩展名不对
+            "反派 (上) (音轨1).mka",          // 正式产物，不能删
+            "反派 (上) (AAC).tmp.mkv",        // 整片缓存半成品，另有归属
+            "反派 (下) (音轨1).tmp.mka",      // 别的片
+        ] {
+            assert!(!is_our_sidecar_tmp(stem, bad), "误判为用户可删文件：{bad}");
+        }
+    }
+
+    /// 端到端：真建目录真删文件，确认用户的同名普通文件原地不动。
+    #[test]
+    fn clean_sidecar_tmp_keeps_user_files() {
+        let dir = std::env::temp_dir().join(format!("bplayer-clean-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let video = dir.join("反派 (上).mkv");
+        let ours = [
+            "反派 (上) (音轨1).tmp.mka",
+            "反派 (上) (字幕2).tmp.srt",
+        ];
+        let users = [
+            "反派 (上).tmp.txt",
+            "反派 (上) (备注).tmp.mka",
+            "反派 (上) (音轨1).mka",
+        ];
+        fs::write(&video, b"x").unwrap();
+        for n in ours.iter().chain(users.iter()) {
+            fs::write(dir.join(n), b"x").unwrap();
+        }
+        let n = clean_sidecar_tmp(video.to_string_lossy().into_owned());
+        assert_eq!(n, ours.len() as u32, "删除数量不对：{n}");
+        for name in ours {
+            assert!(!dir.join(name).exists(), "半成品没删掉：{name}");
+        }
+        for name in users {
+            assert!(dir.join(name).exists(), "用户文件被误删：{name}");
+        }
+        let _ = fs::remove_dir_all(&dir);
     }
 }

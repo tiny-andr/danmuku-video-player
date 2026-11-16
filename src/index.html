@@ -1205,8 +1205,38 @@
       for (var i = 0; i < audios.length; i++) {
         if (!isDeadCodec(audios[i].codec)) { firstPlayable = i; break; }
       }
-      res.pin = firstPlayable !== res.audioIndex;
+      // 一条音轨都没有时「内核会选错轨」无从谈起，别给出 pin=true
+      res.pin = audios.length > 0 && firstPlayable !== res.audioIndex;
       return res;
+    }
+
+    // 决策层：要不要接管音频管线。把「算」和「做」分开，这段逻辑才能被离线单测
+    // 覆盖（`npm run test:audio` 会直接抠本文件里的源码来跑）。
+    //
+    // native=true：内核自己就会选中默认轨，什么都不用做。
+    // native=false：必须隔离原轨 + 外挂 mka，否则会播出用户没要的轨。
+    function audioPlan(tracks) {
+      var c = classifyAudio(tracks);
+      var audios = (tracks || []).filter(function (t) { return t.kind === 'audio'; });
+      var def = audios[c.audioIndex];
+      var pin = c.count > 0 && c.pin;
+      return {
+        count: c.count,
+        pin: pin,
+        index: c.audioIndex,
+        defDead: c.defDead,
+        // 默认轨的编码名。pin 但没有死编码轨时（双 AAC）deadNames 是空的，用默认轨自己的编码兜底。
+        label: c.deadNames.join(' / ') || (def ? codecName(String(def.codec || '').toUpperCase()) : ''),
+        shake: c.shakyNames,
+        native: !pin
+      };
+    }
+
+    // 音轨菜单入口的显示条件。不能只看「有没有死编码轨」：双 AAC 文件没有死编码轨，
+    // 但内核会播错轨 —— 这种文件更需要入口，否则用户连当前挂的是哪条轨都看不到。
+    function needsAudioEntry(tracks) {
+      var c = classifyAudio(tracks);
+      return c.count > 0 && (c.dead > 0 || c.pin);
     }
 
     // 音轨链路诊断：结果累积在 window.__bplayerDiag，出问题时可从 DevTools 直接读
@@ -1230,7 +1260,10 @@
         try { buildSubtitleMenu(path, probe.tracks, token); } catch (e) { diag('sub-err', { err: String(e) }); }
         var c = classifyAudio(probe.tracks);
         diag('classify', c);
-        if (!c.count || (!c.dead && !c.shakyNames.length)) { diag('audio-ok-native'); return; }
+        var plan = audioPlan(probe.tracks);
+        diag('plan', plan);
+        if (!plan.count) return;
+        if (plan.native && !plan.shake.length) { diag('audio-ok-native'); return; }
         var fullCache = fullAacPath(path);
         invoke('fs_stat', { path: fullCache }).then(function (st) {
           diag('fullcache', { kind: st.kind });
@@ -1239,21 +1272,21 @@
             switchToAudioCache(path, fullCache, st.size, true); // 整片缓存命中：静默换源
             return;
           }
-          // c.pin=false：内核「第一条能解的轨道」恰好就是默认轨，交给内核即可
-          if (!c.pin) {
+          // 内核「第一条能解的轨道」恰好就是默认轨：交给内核即可
+          if (plan.native) {
             diag('audio-native-default');
-            if (c.shakyNames.length) {
-              toast('音轨编码（' + c.shakyNames.join(' / ') + '）解码不可靠（随 WebView2 版本而定），可能无声', 8000);
+            if (plan.shake.length) {
+              toast('音轨编码（' + plan.shake.join(' / ') + '）解码不可靠（随 WebView2 版本而定），可能无声', 8000);
             }
             return;
           }
           // 内核会选中非默认轨（默认轨解不了，或它前面还有别的可解轨）。
           // 绝不让它替用户换轨：先隔离视频音频，宁可静音也不能放出错的轨。
-          diag('audio-pin-required', { idx: c.audioIndex, defDead: c.defDead });
+          diag('audio-pin-required', { idx: plan.index, defDead: plan.defDead });
           isolateVideoAudio();
-          diag('ensure', { idx: c.audioIndex });
+          diag('ensure', { idx: plan.index });
           // manual=false：自动路径。已有 mka 缓存照样直接用，只有需要新转时才看设置开关。
-          try { ensureAudioTrack(path, probeDurationUs, c.audioIndex, c.deadNames.join(' / '), false); }
+          try { ensureAudioTrack(path, probeDurationUs, plan.index, plan.label, false, plan.defDead ? 'dead' : 'pin'); }
           catch (e) { diag('ensure-err', { err: String(e) }); }
         }).catch(function (e) { diag('fullcache-err', { err: String(e) }); });
       }).catch(function (e) { diag('probe-err', { err: String(e) }); });
@@ -1261,7 +1294,9 @@
 
     // 确保某条音轨的外挂 mka 存在：命中缓存直接挂载（不受设置开关影响），
     // 未命中才转码；manual=false 且「自动转换」关闭时不启动转码，只静音并提示。
-    function ensureAudioTrack(path, durationUs, audioIdx, label, manual) {
+    // reason：'dead' = 默认轨内核解不了；'pin' = 默认轨能解但内核会跳过去播别的轨。
+    // 两者都归到「转默认轨」，只是给用户的解释不一样。
+    function ensureAudioTrack(path, durationUs, audioIdx, label, manual, reason) {
       // 一旦决定走外挂音轨就先隔离视频音频：Chromium 自己会挑它解得了的那条轨
       // （潘神实测：它跳过两条 DTS，直接播了第 3 条 AC-3），不隔离就会放出错的轨。
       isolateVideoAudio();
@@ -1274,7 +1309,10 @@
           if (normPath(currentVideoPath) !== normPath(path)) return;
           if (st.kind === 'file') { engageExternalAudio(path, mkaPath, ordinal, true); return; }
           if (!manual && !appSettings.autoAudio) {
-            toast('音轨' + ordinal + '（' + label + '）内核无法解码，且没有现成的外挂音轨，已静音。'
+            var why = reason === 'pin'
+              ? '（' + label + '）是默认音轨，但本内核会跳过它去播别的轨'
+              : '（' + label + '）内核无法解码';
+            toast('音轨' + ordinal + why + '，且没有现成的外挂音轨，已静音。'
               + '需要声音请到「音轨」菜单点这条轨道开始转换；也可以在设置中开启自动音轨处理', 9000);
             return;
           }
@@ -1284,7 +1322,10 @@
           updatePill(-1, 0);
           invoke('transcode_audio_start', { videoPath: path, audioIndex: audioIdx, durationUs: durationUs || null }).then(function () {
             if (transcodeVideo === normPath(path)) {
-              toast('音轨' + ordinal + '（' + label + '）本内核无法解码，正在后台转换为 AAC 外挂音轨', 6000);
+              var why2 = reason === 'pin'
+                ? '（' + label + '）是默认音轨，但本内核会跳过它'
+                : '（' + label + '）本内核无法解码';
+              toast('音轨' + ordinal + why2 + '，正在后台转换为 AAC 外挂音轨', 6000);
             }
           }).catch(function (e) {
             hidePill();
@@ -1393,17 +1434,11 @@
       if (!silent) toast('已切换到 AAC 整片缓存版（播放进度保留）');
     }
 
-    // ---- 音轨菜单（存在死编码音轨就出现；单轨文件也要入口：没得选，但能看到挂载状态/重试） ----
-    function hasDeadAudio() {
-      return (probeTracks || []).some(function (t) {
-        var c = String(t.codec || '').toUpperCase();
-        return c.indexOf('A_DTS') === 0 || c === 'A_TRUEHD' || c === 'A_AC4' || c === 'A_DRA';
-      });
-    }
+    // ---- 音轨菜单（有死编码轨、或内核会选错轨时出现；能看到挂载状态/手动重试） ----
     function refreshAudioMenu() {
       var btn = $('btnAudioEntry');
       var panel = $('audioPanel');
-      if (fullCacheActive || !hasDeadAudio() || !probeTracks || !probeTracks.length) {
+      if (fullCacheActive || !needsAudioEntry(probeTracks)) {
         btn.hidden = true;
         panel.hidden = true;
         return;
@@ -1429,7 +1464,7 @@
     }
 
     function switchAudioTrack(i) {
-      if (fullCacheActive || !hasDeadAudio() || !probeTracks || !probeTracks[i] || !currentVideoPath) return;
+      if (fullCacheActive || !needsAudioEntry(probeTracks) || !probeTracks[i] || !currentVideoPath) return;
       $('audioPanel').hidden = true;
       // 已选中但底层 audio 其实没有 src（换片时被清空）时不能直接 return，
       // 否则用户点这条音轨也救不回来，只能听着静音。
