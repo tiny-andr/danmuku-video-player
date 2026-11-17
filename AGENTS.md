@@ -13,7 +13,7 @@ Tauri 2 桌面播放器：打开本机视频，自动配同目录的弹幕 XML �
 
 | 文件 | 职责 |
 |---|---|
-| `src/index.html` (~2100 行) | 整个前端。播放器装配、弹幕、字幕菜单、音轨菜单、设置页、拖放、进度胶囊 |
+| `src/index.html` (~3500 行) | 整个前端。播放器装配、弹幕、字幕菜单 + 字幕样式/位置/延时、音轨菜单、画面适配、停止播放、断点续播、设置页、拖放、进度胶囊 |
 | `src/vendor/artplayer.js` | 播放器内核，本地副本，**不要改** |
 | `src/vendor/artplayer-plugin-danmuku.js` | 弹幕插件，本地副本，只在必要时打补丁（`.orig.js` 保留原版） |
 | `src-tauri/src/lib.rs` | 命令注册、选文件/选文件夹、目录扫描、`reveal_path`、`sidecar_cache_files` |
@@ -45,9 +45,15 @@ Start-Process 'src-tauri\target\release\danmuku-video-player.exe'
 注意：`document.getElementById('someRange').value` 在面板**没打开过**时读到的是 HTML 初始值，不是运行时配置。验证默认值必须先把面板打开。
 
 ```powershell
-cargo test --lib                     # Rust 单测（外挂字幕解析、选轨清理、字幕标签剥离）
+cargo test --lib                     # Rust 单测 58 条，含合成的 MKV / SUP 端到端
 npm run test:audio                   # 前端选轨决策单测（从 index.html 抠真函数跑，不依赖程序）
 ```
+
+`cargo test --lib` 里有两条**不需要任何片源**的端到端测试，改 `mkv_sub` / `pgs_render` 时必须靠它们兜底（以前这两条链路只能在真机上用环境变量喂片才跑得到）：
+- `mkv_sub::tests::synthetic_mkv_sparse_extract_srt_and_ass`：在内存里拼一个真 EBML 字节流（EBML 头 + Segment{Info(TimestampScale) + SeekHead + Cues + Cluster}）写到临时文件，真跑 `sparse_extract_srt()` 全链路，逐字节比对 SRT 与 ASS 输出，并验「不存在的轨必须 Err」。同文件还有 `synthetic_mkv_without_relative_position_is_fail_closed` 钉 fail-closed。
+- `pgs_render::tests::synthetic_sup_decodes_to_png_event`：用 `libpgs::DisplaySetBuilder` 造一条最小 PGS 轨写成 `.sup`，真跑 `build()` 的「抽取 → RLE 解码 → 画布合成 → 裁边 → PNG 编码」，断言 PNG 魔数、宽高、`color_type`、像素 RGBA 值和 base64 无 `data:` 前缀。
+
+前端那批「从 `index.html` 抠真函数跑」的脚本在 `H:\tmp\bplayer-audit\`（**不入库**，属临时资产，系统清理可能删掉）：`syntax-check.mjs`、`sub-ownership-test.mjs`、`jl-ownership-test.mjs`、`race-ownership-test.mjs`、`toast-stack-test.mjs`、`contract-check.mjs`、`a2..a10-*.mjs`、`b1..b4-*.mjs`。改前端后至少跑 `syntax-check.mjs` 加与改动区域相关的那几个。
 
 `cargo test --release sparse_probe -- --nocapture` 是 `mkv_sub` 的真机单测入口，靠环境变量喂片源：
 
@@ -97,6 +103,14 @@ $env:SPARSE_TEST_SRC='<mkv>'; $env:SPARSE_TEST_TRACK='9'; $env:SPARSE_TEST_ASS='
 **`transcode://cancelled` 只做提示，不清记账位**：片内换轨时旧任务的 cancelled 先到、新任务 done 后到，在事件里清账会让新 done 认领不上。状态清理归发起方（换片 / 点 pill 的 `transcode_cancel_all` 回调），不依赖事件。
 
 **floating 面板互斥**：音轨、字幕、弹幕密度、弹幕屏蔽四个面板都用 `.block-panel`，固定在同一个 `right:16px; bottom:64px`。新加这类面板必须接进 `closeOtherPanels()`。
+
+**画面定位一律按「实际可见画面」**：字幕层和 PGS 位图层的坐标必须用 `videoPictureBox(hostW, hostH, videoWidth, videoHeight, appSettings.fit)` 反算，**不能用容器尺寸**。默认 `fit = 'contain'`，有黑边时容器比真画面大一圈，按容器算会让两者整体偏出去（4:3 片在 16:9 窗口里偏约 190px，肉眼只看到"字幕怎么不在画面里"）。`object-fit` 变化**不触发 `ResizeObserver`**（元素尺寸没变），所以 `applyFitMode()` 广播 `bplayer:fit` 事件，位图层和字幕层都必须监听它重排。
+
+**`.art-subtitle` 的 `bottom` 带 `!important`，且自定义属性必须 `setProperty`**：vendor 里 `.art-subtitle{bottom:var(--art-subtitle-bottom)!important}` —— inline `style.bottom` 盖不住，只能改 CSS 变量。而 Artplayer 的 `art.subtitle.style()` / `setStyles` 内部是 `el.style[key] = value`，对 `--art-subtitle-bottom` 这类自定义属性**静默失效**（实测赋值后 `getComputedStyle` 不变），必须 `el.style.setProperty(...)`（见 `setSubtitleVar()`）。字号同理走 `--art-subtitle-font-size`。另外控制栏显示时 Artplayer 会自己把字幕再抬 `--art-control-height`（46px），这是"别让控制栏压住字幕"的既有行为，不要压掉。
+
+**字幕延时在 SRT 文本层做，不在 cue 对象上**：`mountSubtitleText` 把原文留档到 `subSourceText`，延时用 `shiftSrtTimes(text, deltaMs)` 整体位移时间戳后重建 blob 再 `switch()`。重建时**不要传 `name`**（Artplayer 会因此弹一条「切换字幕：xxx」notice）。原文必须留档，否则每拖一次延时就在已位移的文本上再位移一次，越拖越偏。
+
+**三类存档语义别混**：`bplayer_settings`（齿轮页开关，改动即存）、`bplayer_subtitle_style`（字幕样式，**只有点「保存」才写**，预览即时生效但不落盘、不跨片）、`bplayer_resume`（播放位置，自动 5 秒节流存、`ended` 删、30 天过期）。新增任何一个存档都要带 `ver` 字段并对字段做白名单回落。配套的 `subtitleManual` / `danmakuManual` 令牌：**只有非空的手动选择才置位** —— 取消对话框、空结果、关闭字幕、清空弹幕都不置位，否则自动匹配会永久失效。
 
 **设置项改默认值**：`localStorage` 里已经存过的旧值会盖住新默认。凡是改默认值，必须同时升 `SETTINGS_VER` / `CONFIG_VER` / `DENSITY_VER` 并让旧存档（无版本号）回落到新默认，否则老用户看不到变化。
 

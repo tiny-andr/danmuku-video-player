@@ -328,6 +328,65 @@
   .track-item.current .t-meta { color: var(--accent); }
   .track-item.disabled { opacity: .45; cursor: default; }
   .track-item.disabled:hover { border-color: var(--line); }
+  /* ---- 字幕样式区（挂在字幕浮窗底部，复用既有外壳与控件观感，不另造一套表单） ---- */
+  .sub-style {
+    display: flex; flex-direction: column; gap: 8px;
+    border-top: 1px solid var(--line); padding-top: 10px;
+  }
+  .sub-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  .sub-label { flex: 0 0 auto; width: 30px; font-size: 12px; color: var(--muted); }
+  .sub-row select {
+    flex: 1 1 auto; min-width: 0;
+    background: #232733; color: var(--text); border: 1px solid var(--line);
+    border-radius: 8px; padding: 4px 8px; font-size: 12px; font-family: inherit; cursor: pointer;
+  }
+  .sub-row select:focus { outline: none; border-color: var(--accent); }
+  .sub-colors { display: flex; gap: 6px; }
+  .sub-color {
+    display: inline-flex; align-items: center; gap: 5px;
+    background: #232733; color: var(--muted); border: 1px solid var(--line);
+    border-radius: 8px; padding: 3px 9px; font-size: 12px; font-family: inherit; cursor: pointer;
+    transition: border-color .15s, color .15s;
+  }
+  .sub-color i { width: 10px; height: 10px; border-radius: 50%; border: 1px solid rgba(0, 0, 0, .6); }
+  .sub-color:hover { border-color: var(--accent); }
+  .sub-color[data-on="1"] { border-color: var(--accent); color: var(--text); }
+  .sub-delay-val { font-size: 12px; color: var(--text); font-variant-numeric: tabular-nums; }
+  .sub-actions { display: flex; gap: 8px; }
+  .sub-btn {
+    flex: 1 1 auto;
+    background: #232733; color: var(--text); border: 1px solid var(--line);
+    border-radius: 8px; padding: 6px 10px; font-size: 12px; font-family: inherit; cursor: pointer;
+    transition: border-color .15s, color .15s;
+  }
+  .sub-btn:hover { border-color: var(--accent); color: var(--accent); }
+  .sub-btn.primary { border-color: var(--accent); color: var(--accent); }
+  /* ---- 断点续播选择条（B3） ----
+   * 它是 stage 内部的一条浮条，不是贴边浮窗：续播提示和"当前画面"强相关，
+   * 放在画面底部中间才一眼看见；也不进 closeOtherPanels()（那套管的是右侧贴边面板）。
+   * bottom 抬到 76px：字幕默认在画面底边内缩 12px + 一行字高，浮条压在它上面，
+   * 10 秒的提示不会盖住正在播的字幕。 */
+  .resume-bar {
+    position: absolute; left: 50%; bottom: 76px; transform: translateX(-50%);
+    display: flex; align-items: center; gap: 10px;
+    max-width: calc(100% - 32px);
+    background: rgba(20, 22, 28, .97); backdrop-filter: blur(10px);
+    border: 1px solid var(--line); border-radius: 12px; padding: 9px 12px;
+    box-shadow: 0 18px 50px -20px rgba(0, 0, 0, .8);
+    z-index: 40; font-size: 13px; color: var(--text);
+    animation: pill-in .22s ease both;
+  }
+  .resume-bar[hidden] { display: none; }
+  .resume-text { color: var(--muted); white-space: nowrap; }
+  .resume-text b { color: var(--text); font-variant-numeric: tabular-nums; }
+  .resume-btn {
+    background: #232733; color: var(--text); border: 1px solid var(--line);
+    border-radius: 8px; padding: 5px 12px; font-size: 12px; font-family: inherit; cursor: pointer;
+    white-space: nowrap;
+    transition: border-color .15s, color .15s;
+  }
+  .resume-btn:hover { border-color: var(--accent); color: var(--accent); }
+  .resume-btn.primary { border-color: var(--accent); color: var(--accent); }
   /* ---- 页面滚动条 ---- */
   ::-webkit-scrollbar { width: 10px; height: 10px; }
   ::-webkit-scrollbar-track { background: var(--bg); }
@@ -361,6 +420,13 @@
         弹幕支持 B 站 XML（.xml）与 mybili 导出 JSON（.json）<br />
         拖入字幕文件自动挂载（.srt / .ass / .ssa / .vtt）
       </div>
+    </div>
+    <!-- 断点续播选择条（B3）：元数据就绪且这部片有记录时出现，10 秒无操作自动消失。
+         文案不提文件名 —— 用户刚打开的就是这部片，写了只会把浮条撑长。 -->
+    <div class="resume-bar" id="resumeBar" hidden>
+      <span class="resume-text">上次看到 <b id="resumeTime">--:--</b></span>
+      <button type="button" class="resume-btn primary" id="resumeContinue">继续播放</button>
+      <button type="button" class="resume-btn" id="resumeRestart">从头开始</button>
     </div>
   </div>
 
@@ -420,6 +486,45 @@
       <button type="button" id="subtitleClose" title="关闭">✕</button>
     </div>
     <div id="subtitleList"></div>
+    <div class="sub-style">
+      <div class="sub-row">
+        <span class="sub-label">字号</span>
+        <select id="subSize">
+          <option value="16">16 px</option>
+          <option value="18" selected>18 px（默认）</option>
+          <option value="22">22 px</option>
+          <option value="26">26 px</option>
+          <option value="32">32 px</option>
+        </select>
+      </div>
+      <div class="sub-row">
+        <span class="sub-label">颜色</span>
+        <div class="sub-colors" id="subColors">
+          <button type="button" class="sub-color" data-color="#ffffff"><i style="background:#ffffff"></i>白</button>
+          <button type="button" class="sub-color" data-color="#ffff00"><i style="background:#ffff00"></i>黄</button>
+          <button type="button" class="sub-color" data-color="#00ffff"><i style="background:#00ffff"></i>青</button>
+        </div>
+      </div>
+      <div class="sub-row">
+        <span class="sub-label">描边</span>
+        <label class="switch"><input type="checkbox" id="subOutline" /><span>开启</span></label>
+      </div>
+      <div class="sub-row">
+        <span class="sub-label">位置</span>
+        <label class="switch"><input type="radio" name="subPos" id="subPosInside" value="inside" checked /><span>画面内底部</span></label>
+        <label class="switch"><input type="radio" name="subPos" id="subPosBelow" value="below" /><span>画面下方</span></label>
+      </div>
+      <div class="sub-row">
+        <span class="sub-label">延时</span>
+        <span class="sub-delay-val" id="subDelayValue">0.0s</span>
+      </div>
+      <input type="range" id="subDelay" min="-10" max="10" step="0.1" value="0" />
+      <div class="sub-actions">
+        <button type="button" class="sub-btn primary" id="subSave">保存</button>
+        <button type="button" class="sub-btn" id="subReset">重置为默认</button>
+      </div>
+      <div class="block-foot">改字号/颜色/描边/位置立即预览当前片 · 点「保存」才会记住，以后打开的片沿用 · 延时只对当前片的文本字幕有效（负数=字幕更早），换片归零</div>
+    </div>
     <div class="block-foot">外挂字幕扫描同目录同名/变体文件 · 内嵌文本字幕需后台抽取为 SRT · PGS 位图字幕由本地解码后直接叠加显示</div>
   </div>
 
@@ -498,8 +603,25 @@
 
   /* ---- 应用设置（齿轮页）：音轨自动转换默认开，字幕默认关 ---- */
   var SETTINGS_KEY = 'bplayer_settings';
-  var SETTINGS_VER = 2; // 1.2.6 起音轨自动转换改为默认开启；旧存档没有版本号，一律按新默认走一次
-  var appSettings = { autoAudio: true, autoSubtitle: false };
+  // 3：画面适配模式（fit）进存档。必须升版本号 —— 旧存档没有 fit 字段，
+  // 不升的话 localStorage 里的旧值会盖住新默认，老用户永远拿不到新的默认。
+  var SETTINGS_VER = 3;
+  var appSettings = { autoAudio: true, autoSubtitle: false, fit: 'contain' };
+
+  // 画面适配三档。contain 是唯一不变形的模式，所以是默认值：
+  // 以前 `.art-video` 没有任何 object-fit 规则，浏览器初始值就是 fill ——
+  // 16:9 的片子在 1280×860 的窗口里被纵向拉长约 19%，4:3 的片子横向拉宽 33%，
+  // 用户看到的是"人脸被拉宽"，只是没人意识到那是 bug 而不是片源问题。
+  var FIT_MODES = [
+    { value: 'contain', label: '适应', hint: '完整适应 · 保持比例（可能有黑边）' },
+    { value: 'cover', label: '裁剪', hint: '裁剪填满 · 保持比例（画面边角会被切掉）' },
+    { value: 'fill', label: '拉伸', hint: '拉伸填满 · 不保持比例（会变形）' },
+  ];
+  function isFitMode(v) { return v === 'contain' || v === 'cover' || v === 'fill'; }
+  function fitLabel(v) {
+    for (var i = 0; i < FIT_MODES.length; i++) if (FIT_MODES[i].value === v) return FIT_MODES[i].label;
+    return '适应';
+  }
 
   function loadAppSettings() {
     try {
@@ -507,6 +629,7 @@
       if (c.ver !== SETTINGS_VER) return; // 旧版存档：沿用新的默认值
       appSettings.autoAudio = !!c.autoAudio;
       appSettings.autoSubtitle = !!c.autoSubtitle;
+      if (isFitMode(c.fit)) appSettings.fit = c.fit; // 白名单：存档被改坏就回默认
     } catch (e) { /* 配置损坏按默认值 */ }
   }
 
@@ -515,6 +638,7 @@
       localStorage.setItem(SETTINGS_KEY, JSON.stringify({
         autoAudio: appSettings.autoAudio,
         autoSubtitle: appSettings.autoSubtitle,
+        fit: appSettings.fit,
         ver: SETTINGS_VER,
       }));
     } catch (e) { /* 忽略持久化失败 */ }
@@ -673,6 +797,125 @@
     return (n / 1024).toFixed(0) + ' KB';
   }
 
+  /* ------------------------------------------------------------------ *
+   * 断点续播（B3）：存档规则和安卓版 android-resume-store.js 是同一份。
+   *   localStorage（bplayer_resume，ver:1）+ { version, items: [{path,position,duration,updatedAt}] }
+   *   上限 100 条、30 天过期、同路径只留最新、按 updatedAt 降序、片尾附近不记。
+   * 纯函数全部显式注入 store / now：隐私模式下 localStorage 会抛，测试也要能喂内存桩和固定时间。
+   * 桌面版以前完全没有记忆播放位置（"resume" 只在 WebAudio 的 ctx.resume() 里出现过）。
+   * ------------------------------------------------------------------ */
+  var RESUME_KEY = 'bplayer_resume';
+  var RESUME_VER = 1;
+  var RESUME_MAX = 100;
+  // 30 天：再久以前的进度用户自己都忘了，留着只是白占 localStorage
+  var RESUME_MAX_AGE = 30 * 24 * 60 * 60 * 1000;
+
+  function resumeFinite(v) { return typeof v === 'number' && isFinite(v); }
+
+  // 路径归一化：口径和 normPath 一致（统一斜杠），再多一步折叠重复分隔符。
+  // 同一条历史路径可能被不同入口写成 C:\a\b、C:/a/b、C:/a//b，不折叠就会变成
+  // 三条互不相认的记录（安卓版 //sdcard 是同一个坑）。
+  function resumeNormalize(path) {
+    if (typeof path !== 'string' || !path) return '';
+    return path.replace(/\\/g, '/').replace(/\/{2,}/g, '/');
+  }
+
+  // 值得续播：至少看了 5 秒，且离片尾还有一段。
+  // 片尾阈值 max(3, min(15, duration*3%))：短片用 3 秒下限（不然 10 秒的片子处处是片尾），
+  // 长片封顶 15 秒（3% 会变成一两分钟，那等于整片都不记）。
+  function resumeResumable(position, duration) {
+    if (!resumeFinite(position) || !resumeFinite(duration)) return false;
+    if (duration <= 0 || position < 5) return false;
+    return duration - position > Math.max(3, Math.min(15, duration * 0.03));
+  }
+
+  function resumePersist(store, items) {
+    try {
+      store.setItem(RESUME_KEY, JSON.stringify({ version: RESUME_VER, items: items }));
+    } catch (e) { /* 隐私模式 / 配额满：只影响续播，不该打断播放 */ }
+  }
+
+  // 读全部有效记录。坏档 / 缺版本一律当空；过期、非法、重复在这里就地裁掉并回写，
+  // 否则每次 read-modify-write 都要把垃圾重新搬一遍，存档只会越攒越多。
+  function resumeLoad(store, now) {
+    var ts = resumeFinite(now) && now >= 0 ? now : Date.now();
+    var data;
+    try { data = JSON.parse(store.getItem(RESUME_KEY)); } catch (e) { return []; }
+    if (!data || data.version !== RESUME_VER || !Array.isArray(data.items)) return [];
+    var items = [];
+    data.items.forEach(function (item) {
+      if (!item || typeof item !== 'object') return;
+      var path = resumeNormalize(item.path);
+      if (!path || !resumeResumable(item.position, item.duration)) return;
+      if (!resumeFinite(item.updatedAt) || item.updatedAt < 0) return;
+      // 未来时间戳（改过系统时间 / 从别的机器同步过来的存档）直接丢弃，
+      // 否则它会永远排在第一位、占着"最新一条"的位置。
+      if (item.updatedAt > ts || ts - item.updatedAt >= RESUME_MAX_AGE) return;
+      items.push({ path: path, position: item.position, duration: item.duration, updatedAt: item.updatedAt });
+    });
+    items.sort(function (a, b) { return b.updatedAt - a.updatedAt; });
+    var seen = {};
+    items = items.filter(function (item) {
+      if (seen[item.path]) return false;
+      seen[item.path] = 1;
+      return true;
+    }).slice(0, RESUME_MAX);
+    // 裁剪过就回写（长度或内容变了都算），下次读就不用再扫一遍垃圾
+    if (JSON.stringify(items) !== JSON.stringify(data.items)) resumePersist(store, items);
+    return items;
+  }
+
+  // 打开一部片时取它自己的记录。currentDuration 传了就要校验时长：
+  // 差超过 max(3, 记录时长*5%) 说明同名文件已经换了（不同压制版本 / 换集），
+  // 记录作废且**不提示** —— 用户此刻还没做任何操作，弹条"进度已失效"只会莫名其妙。
+  function resumeGet(store, now, path, currentDuration) {
+    var p = resumeNormalize(path);
+    if (!p) return null;
+    var items = resumeLoad(store, now);
+    var hit = null;
+    for (var i = 0; i < items.length; i++) if (items[i].path === p) { hit = items[i]; break; }
+    if (!hit) return null;
+    if (currentDuration !== undefined) {
+      if (!resumeFinite(currentDuration) || currentDuration <= 0) return null;
+      if (Math.abs(currentDuration - hit.duration) > Math.max(3, hit.duration * 0.05)) {
+        resumePersist(store, items.filter(function (it) { return it.path !== p; }));
+        return null;
+      }
+    }
+    return { path: hit.path, position: hit.position, duration: hit.duration, updatedAt: hit.updatedAt };
+  }
+
+  // 存位置。位置/时长非法（还没 loadedmetadata、直播 Infinity、NaN）时一个字段都不写；
+  // 不值得续播时只删旧记录 —— 用户直接把进度拖到片尾，下次打开不该再问"继续播放"。
+  function resumeSave(store, now, path, position, duration) {
+    var p = resumeNormalize(path);
+    if (!p || !resumeFinite(position) || !resumeFinite(duration) || duration <= 0) return;
+    var ts = resumeFinite(now) && now >= 0 ? now : Date.now();
+    var items = resumeLoad(store, ts).filter(function (it) { return it.path !== p; });
+    if (resumeResumable(position, duration)) {
+      items.unshift({ path: p, position: position, duration: duration, updatedAt: ts });
+    }
+    resumePersist(store, items.slice(0, RESUME_MAX));
+  }
+
+  function resumeRemove(store, path) {
+    var p = resumeNormalize(path);
+    if (!p) return;
+    var items = resumeLoad(store, Date.now());
+    resumePersist(store, items.filter(function (it) { return it.path !== p; }));
+  }
+
+  // 工厂：把 store 绑定进去，now 仍可按需注入（测试用），用法 resume.get(path, duration)
+  function resumeStore(store) {
+    return {
+      load: function (now) { return resumeLoad(store, now); },
+      get: function (path, currentDuration, now) { return resumeGet(store, now, path, currentDuration); },
+      save: function (path, position, duration, now) { return resumeSave(store, now, path, position, duration); },
+      remove: function (path) { return resumeRemove(store, path); }
+    };
+  }
+  var resume = resumeStore(localStorage);
+
   /* 信息栏：时长 / 分辨率 / 进度 跟随 video 元素实时更新 */
   function updateVideoInfo() {
     var v = document.querySelector('#player video');
@@ -724,7 +967,17 @@
     return { text: text, time: time, mode: mode, color: color, border: false, style: {} };
   }
 
+  // UTF-8 BOM（\uFEFF）在两种弹幕格式里都会让首字符非法：JSON.parse 直接抛（chip 卡在
+  // 「解析中…」），XML 的 DOMParser 也会把它当内容。剥在**两个解析入口**而不是
+  // applyDanmakuText：文本→条目 的每一步都自洽，以后新增调用方绕过 applyDanmakuText
+  // 也照样受益，同时纯函数本身可被离线单测直接喂 BOM 文本。
+  function stripUtf8Bom(s) {
+    s = String(s == null ? '' : s);
+    return s.charAt(0) === '\uFEFF' ? s.slice(1) : s;
+  }
+
   function parseBiliXml(xmlText) {
+    xmlText = stripUtf8Bom(xmlText);
     var out = [];
     var doc = null;
     try {
@@ -763,7 +1016,7 @@
   }
 
   function parseJsonDanmaku(text) {
-    var data = JSON.parse(text);
+    var data = JSON.parse(stripUtf8Bom(text));
     if (!Array.isArray(data)) throw new Error('JSON 弹幕应为数组（mybili 导出格式）');
     var out = [];
     for (var i = 0; i < data.length; i++) {
@@ -867,7 +1120,23 @@
     // 外挂音轨：audio-track 插件，独立 Audio 元素跟随视频时钟（工厂函数直接接线，不走插件管理器）
     audioTrack = artplayerPluginAudioTrack({ url: '' })(art);
 
+    // 画面适配：先把存档里的模式应用到 video 上（静默，开片不该弹一条 toast），
+    // 再挂控制栏入口。applyFitMode 只设 inline object-fit，换片不会重建 video 元素，所以一次就够。
+    applyFitMode(true);
     mountDensityControl();   // 弹幕密度入口挂在控制栏右列（齿轮左边）
+    mountFitControl();       // 画面适配入口，挂在密度按钮左边
+    mountStopControl();      // 停止播放，挂在左列最前面（播放按钮左边）
+
+    // 字幕样式/位置：开播就套上存档那套，并在这些时机重排。
+    // loadedmetadata 才知道真实画面尺寸；object-fit 变化不改变元素尺寸（ResizeObserver
+    // 收不到），所以要接 applyFitMode 广播的 bplayer:fit；每屏字幕行数不同，位置2 靠
+    // 实际高度判断黑边放不放得下，所以 cue 更新后也排一次。
+    applySubtitleStyle();
+    window.addEventListener('resize', layoutSubtitle);
+    document.addEventListener('bplayer:fit', layoutSubtitle);
+    art.on('video:loadedmetadata', layoutSubtitle);
+    art.on('resize', layoutSubtitle);
+    art.on('subtitleAfterUpdate', layoutSubtitle);
 
     art.on('artplayerPluginDanmuku:config', function (opt) { saveConfig(opt); });
     art.on('artplayerPluginDanmuku:loaded', function (q) { debugQueue = q; });
@@ -896,6 +1165,10 @@
   function setVideoFromUrl(url, name, size) {
     if (currentVideoName !== name) danmakuLoadToken++; // 作废仍在解析的旧弹幕任务
     currentVideoName = name;
+    // 停止播放时会把整个播放器藏起来（回到空态占位页）；再次开片要复原。
+    // 用 display 而不是靠 z-index 盖：Artplayer 的 .art-bottom 是 z-index:60，
+    // placeholder 只有 5，硬抬层级会跟播放列表(60)/面板(70)/设置(100) 抢。
+    $('player').style.display = '';
     if (!art) {
       createPlayer(url);
     } else {
@@ -904,6 +1177,9 @@
     placeholder.classList.add('hide');
     chipVideo.innerHTML = '🎬 <b>' + escapeHtml(name) + '</b>';
     document.title = name + ' · Danmuku Video Player';
+    // 换片：未保存的样式预览不跨片（只有点过「保存」的那套才对以后打开的片生效）。
+    // 延时的归零在 desktopLoadVideo 里做 —— 那里才是"用户换了片"的唯一入口。
+    resetSubtitleStylePreview();
     // 信息栏：立即显示文件大小，时长/分辨率等元数据就绪后补齐
     $('infobar').hidden = false;
     $('infoSize').textContent = size ? fmtBytes(size) : '—';
@@ -1191,6 +1467,345 @@
   /* 控制栏入口：直接往 Artplayer 右侧控制列插一个原生 .art-control 按钮，
    * 尺寸、透明度、显隐动画全部沿用 Artplayer 自带样式，跟齿轮/画中画并排。
    * 用 DOM 插入而不是 controls.add()：不吃 API 的参数校验，版本升级也不会静默失效。 */
+  // ---- 画面适配：适应 / 裁剪 / 拉伸 ----
+  // 可视画面框：占满容器的 .art-video 里真正有像素的那块矩形（坐标相对播放器容器）。
+  // 位图字幕和文本字幕都必须按它定位 —— 有黑边还按容器算，字幕/位图会整块偏出去。
+  // 抽成纯函数是为了能离线单测：几何算错的表现是"字幕偏了 190px"，
+  // 而 DOM 断言看不出"偏了"，只能靠数值验证。
+  function videoPictureBox(hostW, hostH, videoW, videoH, fit) {
+    var cw = Number(hostW) || 0;
+    var ch = Number(hostH) || 0;
+    if (!cw || !ch) return null;
+    var vw = Number(videoW) || 0;
+    var vh = Number(videoH) || 0;
+    // 还没拿到真实尺寸（loadedmetadata 之前）或者拉伸模式：内容框就是容器本身
+    if (!vw || !vh || fit === 'fill') return { x: 0, y: 0, w: cw, h: ch };
+    var scale = fit === 'cover' ? Math.max(cw / vw, ch / vh) : Math.min(cw / vw, ch / vh);
+    var dw = vw * scale;
+    var dh = vh * scale;
+    return { x: (cw - dw) / 2, y: (ch - dh) / 2, w: dw, h: dh };
+  }
+
+  // ---- 字幕样式 / 位置 / 延时：纯函数部分（不碰 DOM，可离线单测） ----
+
+  // 延时在 SRT 文本层位移时间戳。桌面端把字幕包成 blob 交给 Artplayer，
+  // 它内部要 fetch(blob)→srtToVtt 之后才生成 cue，前端拿不到 cue 对象，
+  // 所以只能改文本：只动 `HH:MM:SS,mmm --> HH:MM:SS,mmm` 这一行的两个时间，
+  // 序号/正文/空行逐字保留（正文里偶尔出现的箭头不会被误改）。
+  // 负偏移把时间夹到 0 —— VTT 解析器不接受负时间戳，一条负时间会把整条 cue 丢掉。
+  function shiftSrtTimes(text, deltaMs) {
+    var src = text == null ? '' : String(text);
+    var d = Math.round(Number(deltaMs) || 0);
+    if (!d) return src; // 没开延时：原样返回，避免无意义地重建整份文本
+    var pad = function (n, w) {
+      var s = String(Math.floor(n));
+      while (s.length < w) s = '0' + s;
+      return s;
+    };
+    var parse = function (t) {
+      var p = t.split(/[:.,]/); // hh:mm:ss,mmm -> [hh, mm, ss, mmm]
+      return ((Number(p[0]) * 60 + Number(p[1])) * 60 + Number(p[2])) * 1000 + Number(p[3]);
+    };
+    var fmt = function (ms) {
+      var t = Math.max(0, Math.round(ms));
+      var mmm = t % 1000;
+      var total = (t - mmm) / 1000;
+      var ss = total % 60;
+      var mm = Math.floor(total / 60) % 60;
+      var hh = Math.floor(total / 3600);
+      return pad(hh, 2) + ':' + pad(mm, 2) + ':' + pad(ss, 2) + ',' + pad(mmm, 3);
+    };
+    return src.replace(/(\d{1,2}:\d{2}:\d{2},\d{3})(\s*-->\s*)(\d{1,2}:\d{2}:\d{2},\d{3})/g,
+      function (all, a, sep, b) {
+        return fmt(parse(a) + d) + sep + fmt(parse(b) + d);
+      });
+  }
+
+  // 字幕排布的纯函数。几何算错的表现是"字幕偏了上百像素"，只有数值断言能验证，
+  // 所以坐标系统一写清楚：原点在**播放器容器**左上角（.art-subtitle 是 absolute，
+  // 包含块就是 .art-video-player），bottom 是 CSS bottom（元素底边距容器底边的距离）。
+  // box 传 videoPictureBox() 的结果（真正有像素的画面框），不能用容器尺寸 ——
+  // 上下有黑边时按容器算，字幕会整体坐到黑边上。
+  function subtitleLayout(hostW, hostH, box, position, textH) {
+    var INSET = 12; // 位置1：字幕底边离画面底边的内缩量
+    var GAP = 8;    // 位置2：文字块顶边离画面底边的距离
+    var W = Number(hostW) || 0;
+    var H = Number(hostH) || 0;
+    if (!W || !H || !box) return null; // 容器还没尺寸（隐藏/未布局）：这轮不排，等下一次事件
+    var bx = Number(box.x) || 0;
+    var by = Number(box.y) || 0;
+    var bw = Number(box.w) || 0;
+    var bh = Number(box.h) || 0;
+    // 只取画面框落在容器里的可见部分：cover 模式下画面框比容器大（上下或左右出血）
+    var left = Math.max(0, Math.min(bx, W));
+    var right = Math.min(W, Math.max(bx + bw, left));
+    var top = Math.max(0, Math.min(by, H));
+    var bottomEdge = Math.min(H, Math.max(by + bh, top));
+    var th = Math.max(12, Math.round(Number(textH) || 0)); // 量不到高度（还没显示）时给一行保底
+    // 位置2「画面下方」：文字块顶边从画面底边下 GAP 起；黑边放得下这一屏
+    // 字幕（文字块整体底边仍在容器内）才落下去，否则回退位置1，绝不把字幕顶出画面。
+    var below = position === 'below' && (H - bottomEdge - GAP) >= th;
+    var bottom = below ? (H - (bottomEdge + GAP + th)) : (H - bottomEdge + INSET);
+    if (bottom < 0) bottom = 0;
+    return {
+      left: left,
+      width: Math.max(0, right - left),
+      bottom: bottom,
+      // 位置1 的字幕不该长到盖住画面顶部：可用高度就是画面高减上下各一圈内缩。
+      // 位置2 用黑边高度做上限（不能用 th —— 那会用上一屏量到的高度把下一屏自己夹住，
+      // 两行字幕的 offsetHeight 被前一次的 maxHeight 压成一行的值，判断就一直是错的）。
+      maxHeight: below ? Math.max(0, H - bottomEdge - GAP) : Math.max(0, bottomEdge - top - INSET * 2),
+      position: below ? 'below' : 'inside',
+    };
+  }
+
+  function fitHint(v) {
+    for (var i = 0; i < FIT_MODES.length; i++) if (FIT_MODES[i].value === v) return FIT_MODES[i].hint;
+    return '';
+  }
+
+  function applyFitMode(silent) {
+    var v = art && art.video;
+    if (!v) return;
+    if (!isFitMode(appSettings.fit)) appSettings.fit = 'contain';
+    v.style.objectFit = appSettings.fit;
+    // object-fit 变化不改变元素尺寸，ResizeObserver 收不到通知，必须显式广播：
+    // 位图字幕的覆盖层和文本字幕层的定位都要按新的可视画面框重算。
+    try {
+      document.dispatchEvent(new CustomEvent('bplayer:fit', { detail: { fit: appSettings.fit } }));
+    } catch (e) { /* 老内核不支持 CustomEvent 构造函数时忽略，定位会在下次 resize 时纠正 */ }
+    if (!silent) toast('画面：' + fitLabel(appSettings.fit) + ' — ' + fitHint(appSettings.fit));
+  }
+
+  function cycleFitMode() {
+    var idx = 0;
+    for (var i = 0; i < FIT_MODES.length; i++) if (FIT_MODES[i].value === appSettings.fit) idx = i;
+    appSettings.fit = FIT_MODES[(idx + 1) % FIT_MODES.length].value;
+    saveAppSettings();
+    applyFitMode(false);
+    updateFitControl();
+  }
+
+  var FIT_ICON = '<svg class="art-icon" viewBox="0 0 24 24" aria-hidden="true">' +
+    '<path d="M3 8V4h4M21 8V4h-4M3 16v4h4M21 16v4h-4" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round"/>' +
+    '<rect x="8" y="8" width="8" height="8" rx="1" stroke="currentColor" stroke-width="1.6" fill="none" opacity=".65"/></svg>';
+
+  function updateFitControl() {
+    var btn = $('ctlFit');
+    if (!btn) return;
+    var title = '画面适配：' + fitLabel(appSettings.fit) + '（点击切换）';
+    btn.title = title;
+    btn.setAttribute('aria-label', title);
+  }
+
+  function mountFitControl() {
+    if ($('ctlFit')) return;
+    var box = (art && art.template && art.template.$controlsRight) ||
+              document.querySelector('#player .art-controls-right');
+    if (!box) return;
+    var btn = document.createElement('div');
+    btn.className = 'art-control art-control-fit';
+    btn.id = 'ctlFit';
+    btn.setAttribute('role', 'button');
+    btn.innerHTML = FIT_ICON;
+    btn.addEventListener('click', function (e) {
+      e.stopPropagation();   // 别让点击穿到播放器触发暂停
+      cycleFitMode();
+    });
+    // 挂在弹幕密度左边：两个都是"画面/弹幕观感"类开关，挨着比混进齿轮菜单里好找
+    var density = $('ctlDensity');
+    if (density && density.parentElement === box) box.insertBefore(btn, density);
+    else box.insertBefore(btn, box.firstChild);
+    updateFitControl();
+  }
+
+  // ---- 停止播放（关闭当前视频，回到空态）----
+  // 实现在 initDesktop 里：要碰字幕/音轨/PGS/续播那一堆块内状态，顶层的函数声明
+  // 看不到它们（index.html 是 IIFE + 二级块）。这里只留一个转发变量。
+  var stopPlaybackRef = null;
+
+  // 实心方块 = 停止。播放器里这是"停止并卸载媒体"，不是"暂停回开头"。
+  var STOP_ICON = '<svg class="art-icon" viewBox="0 0 24 24" aria-hidden="true">' +
+    '<rect x="6.5" y="6.5" width="11" height="11" rx="1.5" fill="currentColor"/></svg>';
+
+  function mountStopControl() {
+    if ($('ctlStop')) return;
+    var box = (art && art.template && art.template.$controlsLeft) ||
+              document.querySelector('#player .art-controls-left');
+    if (!box) return;
+    var btn = document.createElement('div');
+    btn.className = 'art-control art-control-stop';
+    btn.id = 'ctlStop';
+    btn.title = '停止播放（关闭当前视频）';
+    btn.setAttribute('role', 'button');
+    btn.setAttribute('aria-label', '停止播放');
+    btn.innerHTML = STOP_ICON;
+    btn.addEventListener('click', function (e) {
+      e.stopPropagation();   // 别让点击穿到播放器触发暂停
+      if (stopPlaybackRef) stopPlaybackRef();
+    });
+    // 左列最前面（播放按钮左边）：停止在播放之前，和 VLC/PotPlayer 的顺序一致；
+    // 右列已经被弹幕密度、画面适配占满，再塞会挤掉全屏那些图标。
+    box.insertBefore(btn, box.firstChild);
+  }
+
+  /* ---- 字幕样式（字号 / 颜色 / 描边 / 位置）与延时 ----
+   * 规格由安卓版定死，桌面版这里是实现：字号 16/18/22/26/32（默认 18）、
+   * 颜色 白/黄/青（默认白）、描边默认关、位置两选（默认画面内底部）、
+   * 延时 ±10.0s（负数=字幕更早，换片归零）。
+   * 改任一项立即预览当前片；只有点「保存」才写 localStorage 并让以后打开的片沿用
+   * （老用户没保存过就一直是默认值，不会因为一次误拖就永久改了样式）。
+   * 延时永不落盘：它和这一部片的时间轴对齐关系强相关，换片必须归零。
+   */
+  var SUB_STYLE_KEY = 'bplayer_subtitle_style';
+  var SUB_STYLE_VER = 1; // 以后改默认值要升这个版本，旧存档（无 ver）回落新默认
+  var SUB_SIZE_STEPS = [16, 18, 22, 26, 32];
+  var SUB_COLORS = ['#ffffff', '#ffff00', '#00ffff'];
+  var SUB_DELAY_LIMIT = 10000; // ±10.0s
+  // 描边开启时的 8 方向阴影（Artplayer 默认就是拿这招冒充描边）。关闭时写 text-shadow:none
+  // 把它整套盖掉 —— 只把 --art-subtitle-border 设成透明是不够的，玩家容器还继承了
+  // --art-text-shadow-color 那层阴影。
+  var SUB_OUTLINE_SHADOW = '0 0 2px rgba(0,0,0,.92),1px 0 1px #000,0 1px 1px #000,-1px 0 1px #000,' +
+    '0 -1px 1px #000,1px 1px 1px #000,-1px -1px 1px #000,1px -1px 1px #000,-1px 1px 1px #000';
+  var subStyle = { size: 18, color: '#ffffff', outline: false, position: 'inside' };
+  var subDelayMs = 0;       // 当前片的字幕延时（毫秒，负=更早）；永不持久化
+  var subSourceText = '';   // 当前文本字幕的原始 SRT 文本（改延时要在它上面重做位移）
+  var subSourceItem = null; // 原文对应的菜单条目（重建时还要靠它认领归属 / 菜单高亮）
+
+  function defaultSubStyle() { return { size: 18, color: '#ffffff', outline: false, position: 'inside' }; }
+  function isSubSize(v) {
+    for (var i = 0; i < SUB_SIZE_STEPS.length; i++) if (SUB_SIZE_STEPS[i] === v) return true;
+    return false;
+  }
+  function isSubColor(v) {
+    for (var i = 0; i < SUB_COLORS.length; i++) if (SUB_COLORS[i] === v) return true;
+    return false;
+  }
+  function isSubPosition(v) { return v === 'inside' || v === 'below'; }
+
+  // 存档读坏 / 版本不符一律回落默认（和 appSettings 同一套路：白名单 + ver）
+  function loadSubStyle() {
+    var out = defaultSubStyle();
+    try {
+      var c = JSON.parse(localStorage.getItem(SUB_STYLE_KEY)) || {};
+      if (c.ver !== SUB_STYLE_VER) return out; // 旧档没有版本号：按新默认走一次
+      if (isSubSize(c.size)) out.size = c.size;
+      if (isSubColor(c.color)) out.color = c.color;
+      if (isSubPosition(c.position)) out.position = c.position;
+      out.outline = c.outline === true;
+    } catch (e) { /* 存档损坏按默认值 */ }
+    return out;
+  }
+  function saveSubStyle() {
+    try {
+      localStorage.setItem(SUB_STYLE_KEY, JSON.stringify({
+        size: subStyle.size,
+        color: subStyle.color,
+        outline: subStyle.outline,
+        position: subStyle.position,
+        ver: SUB_STYLE_VER,
+      }));
+    } catch (e) { /* 忽略持久化失败 */ }
+  }
+
+  function subtitleEl() {
+    if (!art) return null;
+    return (art.template && art.template.$subtitle) || document.querySelector('#player .art-subtitle');
+  }
+  // 自定义属性只能走 setProperty：Artplayer 的 subtitle.style() 内部是 setStyles → setStyle，
+  // 而 setStyle 就是 `el.style[key] = value`（直接赋值）。实测对 '--art-subtitle-bottom'
+  // 这类自定义属性无效（赋值后 getComputedStyle 不变），必须显式写 CSS 变量。
+  function setSubtitleVar(name, value) {
+    var el = subtitleEl();
+    if (!el || !el.style || !el.style.setProperty) return;
+    try { el.style.setProperty(name, value); } catch (e) { }
+  }
+
+  // 字号 / 颜色 / 描边：字号走 CSS 变量（.art-subtitle 的 font-size 读的就是它），
+  // 颜色和阴影走 inline（这两条没有 !important，普通 inline 就够）
+  function applySubtitleStyle() {
+    if (!art || !art.subtitle) return;
+    setSubtitleVar('--art-subtitle-font-size', subStyle.size + 'px');
+    art.subtitle.style({
+      color: subStyle.color,
+      // 描边默认关：Artplayer 的 .art-subtitle 自带 8 方向 text-shadow 冒充描边，必须显式盖掉
+      textShadow: subStyle.outline ? SUB_OUTLINE_SHADOW : 'none',
+      textAlign: 'center',
+    });
+    layoutSubtitle();
+  }
+
+  // 位置：竖向只能靠 CSS 变量。vendor 里 .art-video-player.art-lock .art-subtitle 的
+  // bottom 带 !important（inline 盖不住），而 .art-control-show 又在这个变量上叠加控制栏
+  // 高度 —— 那是 Artplayer 自带的"字幕别被控制栏压住"行为，保留（暂停时控制栏常显，
+  // 不叠加的话字幕会被进度条压住）。横向 left/width 没有 !important，走 inline。
+  function layoutSubtitle() {
+    if (!art) return;
+    var host = (art.template && (art.template.$player || art.template.$container)) || $('player');
+    var v = art.video;
+    var el = subtitleEl();
+    if (!host || !v || !el) return;
+    var hostW = host.clientWidth;
+    var hostH = host.clientHeight;
+    // 必须按「实际可见画面」算：有黑边时容器比画面大一圈，按容器算字幕会坐到黑边上
+    var box = videoPictureBox(hostW, hostH, v.videoWidth, v.videoHeight, appSettings.fit);
+    if (!box) return;
+    // 位置2 放不放得下要看这一屏字幕实际多高（一行/两行差很多）；还没渲染出高度时按字号估
+    var textH = el.offsetHeight || Math.round(subStyle.size * 1.6);
+    var lay = subtitleLayout(hostW, hostH, box, subStyle.position, textH);
+    if (!lay) return;
+    setSubtitleVar('--art-subtitle-bottom', lay.bottom + 'px');
+    art.subtitle.style({ left: lay.left + 'px', width: lay.width + 'px', maxHeight: lay.maxHeight + 'px' });
+  }
+
+  // 延时文案：+1.2s / -0.5s / 0.0s
+  function subDelayText(ms) {
+    var v = (Number(ms) || 0) / 1000;
+    return (v > 0 ? '+' : '') + v.toFixed(1) + 's';
+  }
+  // 只更新数值和文案（滑块 input 阶段用），不动字幕轨 —— 拖动时重建几十遍字幕太重
+  function setSubDelay(ms) {
+    var v = Math.round(Number(ms) || 0);
+    if (v > SUB_DELAY_LIMIT) v = SUB_DELAY_LIMIT;
+    if (v < -SUB_DELAY_LIMIT) v = -SUB_DELAY_LIMIT;
+    subDelayMs = Math.round(v / 100) * 100; // 0.1s 步进，和滑块对齐
+    updateSubDelayLabel();
+    return subDelayMs;
+  }
+  function updateSubDelayLabel() {
+    var val = $('subDelayValue');
+    if (val) val.textContent = subDelayText(subDelayMs);
+    var range = $('subDelay');
+    if (range) range.value = String(subDelayMs / 1000);
+  }
+
+  // 面板控件是 DOM 状态：打开面板 / 换片 / 重置之后必须从运行时状态刷一遍，
+  // 否则滑块和单选显示的是上一次的值（没打开过时读到的只是 HTML 初值）。
+  function refreshSubStyleControls() {
+    var sel = $('subSize');
+    if (sel) sel.value = String(subStyle.size);
+    var outline = $('subOutline');
+    if (outline) outline.checked = subStyle.outline === true;
+    var inside = $('subPosInside');
+    if (inside) inside.checked = subStyle.position === 'inside';
+    var below = $('subPosBelow');
+    if (below) below.checked = subStyle.position === 'below';
+    var colors = document.querySelectorAll('#subColors .sub-color');
+    for (var i = 0; i < colors.length; i++) {
+      colors[i].setAttribute('data-on', colors[i].getAttribute('data-color') === subStyle.color ? '1' : '0');
+    }
+    updateSubDelayLabel();
+  }
+
+  // 换片：未保存的样式预览不跨片（只有点过「保存」的那套才对以后打开的片生效）
+  function resetSubtitleStylePreview() {
+    subStyle = loadSubStyle();
+    applySubtitleStyle();
+    refreshSubStyleControls();
+  }
+
+  subStyle = loadSubStyle(); // 启动时先把存档里的样式读进来（art 还没建，apply 是安全空操作）
+
   var DENSITY_ICON = '<svg class="art-icon" viewBox="0 0 24 24" aria-hidden="true">' +
     '<path d="M4 7h16M4 12.5h11M4 18h6" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round"/></svg>';
 
@@ -1289,7 +1904,19 @@
       var t0 = performance.now();
       setTimeout(function () {
         if (token !== danmakuLoadToken) return;
-        applyDanmakuText(name, text, t0);
+        try {
+          applyDanmakuText(name, text, t0);
+        } catch (e) {
+          // 解析是纯函数，抛错（最典型：JSON 带 UTF-8 BOM、结构不对）以前会冒到
+          // window.onerror，chip 永远停在「解析中…」，用户等一个永远不会来的结果。
+          // 这里落到失败态 + 提示；applyDanmakuText 在替换 danmakuList 之前就抛，
+          // 所以画面上原有弹幕不受影响。token 一并作废，别让这次失败留在记账里。
+          chipDanmaku.textContent = '💬 弹幕解析失败';
+          $('infoCount').textContent = '—';
+          $('infoParse').textContent = '—';
+          toast('弹幕解析失败：' + clipName(String(e), 40), 7000);
+          danmakuLoadToken++;
+        }
       }, 30);
     }
 
@@ -1313,10 +1940,21 @@
     var externalOrdinal = -1;   // 当前挂载的外挂音轨序号；-1 = 无
     var probeTracks = null;     // 最近一次探测的音轨列表（仅 audio）
     var probeDurationUs = null;
+    var probeFailed = false;    // 最近一次 probe_mkv_tracks 失败：入口仍要可见，便于重试
     var fullCacheActive = false; // 已换到自包含 (AAC).mkv 播放
     var subItems = [];          // 字幕菜单条目（外挂文件 + 内嵌轨 + PGS 位图轨）
     var mountedSubId = '';      // 当前挂载的字幕条目 id；'' = 关闭
     var droppedSubs = [];       // 拖进窗口的字幕文件（不在视频同目录也能用；换片清空）
+    /* B4：手动选择令牌（按当前视频归属，desktopLoadVideo 换片时复位）。
+     * 自动挂字幕 / 自动配对弹幕都是"猜"，用户一旦自己选过，晚到的自动结果就不能再顶掉
+     * 他的选择 —— 桌面版以前没这两个开关，手动选的轨会被几秒后回来的自动结果覆盖。
+     * 关闭字幕 / 清空弹幕不置 manual：关掉不等于"我想要手动"，以后自动匹配仍应生效。 */
+    var subtitleManual = false;
+    var danmakuManual = false;
+    // 用户当前字幕选择的代际：每次"改选 / 关闭"自增（与末尾 transcode JOB_GEN 同一套路，
+    // 只增不减 —— 归零会让更早发出的请求重新"命中"）。所有异步回来的字幕回包
+    // （外挂转 SRT、内嵌抽取、PGS 索引）落地前都要比一下这个号，落后了就丢弃。
+    var subPickSeq = 0;
 
     function codecName(c) {
       if (c.indexOf('A_DTS') === 0) return 'DTS（含 DTS-HD）';
@@ -1408,11 +2046,13 @@
     function handleAudioCodecs(path, name) {
       if (!/\.(mkv|mka|webm)$/i.test(name)) return;
       var token = ++probeToken;
+      probeFailed = false;
       invoke('probe_mkv_tracks', { path: path }).then(function (probe) {
         diag('probe', { token: token, now: probeToken, tracks: (probe.tracks || []).length });
         if (token !== probeToken) { diag('probe-stale'); return; }
         probeTracks = (probe.tracks || []).filter(function (t) { return t.kind === 'audio'; });
         probeDurationUs = probe.duration_us || null;
+        probeFailed = false;
         try { refreshAudioMenu(); } catch (e) { diag('menu-err', { err: String(e) }); }
         try { buildSubtitleMenu(path, probe.tracks, token); } catch (e) { diag('sub-err', { err: String(e) }); }
         var c = classifyAudio(probe.tracks);
@@ -1446,7 +2086,19 @@
           try { ensureAudioTrack(path, probeDurationUs, plan.index, plan.label, false, plan.defDead ? 'dead' : 'pin'); }
           catch (e) { diag('ensure-err', { err: String(e) }); }
         }).catch(function (e) { diag('fullcache-err', { err: String(e) }); });
-      }).catch(function (e) { diag('probe-err', { err: String(e) }); });
+      }).catch(function (e) {
+        diag('probe-err', { err: String(e) });
+        // 探测失败（文件损坏 / 命令超时 / 不是真的 MKV）以前只写 diag：字幕菜单和外挂字幕
+        // 扫描都挂在成功分支里，用户于是既没有字幕菜单、也没有音轨入口，无声且无从自救。
+        // 外挂扫描（scan_subtitles）不依赖 probe 结果，这里传 null 轨表照样能建出
+        // 「只有外挂字幕」的菜单。旧的失败属于旧片就别动新片的状态。
+        if (token !== probeToken) return;
+        probeFailed = true;
+        try { buildSubtitleMenu(path, null, token); } catch (e2) { diag('sub-err', { err: String(e2) }); }
+        try { refreshAudioMenu(); } catch (e3) { diag('menu-err', { err: String(e3) }); }
+        // 不贴文件名：用户刚打开的就是这部片，写出来只会把提示撑成两行
+        toast('音轨信息读取失败，可在「音轨」菜单里重试；字幕仍可手动选择', 8000);
+      });
     }
 
     // 确保某条音轨的外挂 mka 存在：命中缓存直接挂载（不受设置开关影响），
@@ -1598,15 +2250,33 @@
     function refreshAudioMenu() {
       var btn = $('btnAudioEntry');
       var panel = $('audioPanel');
-      if (fullCacheActive || !needsAudioEntry(probeTracks)) {
+      // probeFailed 时 probeTracks 是空的，needsAudioEntry 必然 false —— 但入口不能跟着消失：
+      // 音轨信息读失败正是用户最需要「重试」入口的时候。判据里单独放一个 probeFailed。
+      if (fullCacheActive || (!needsAudioEntry(probeTracks) && !probeFailed)) {
         btn.hidden = true;
         panel.hidden = true;
         return;
       }
       btn.hidden = false;
-      $('audioTrackCount').textContent = probeTracks.length + ' 条';
       var list = $('audioTrackList');
       list.innerHTML = '';
+      if (probeFailed) {
+        // 不假装有轨道：只给一行可点的「重试」，探测失败多半是共享盘断连/命令超时
+        $('audioTrackCount').textContent = '读取失败';
+        var retry = document.createElement('div');
+        retry.className = 'track-item';
+        var rn = document.createElement('span');
+        rn.className = 't-name';
+        rn.textContent = '音轨信息读取失败，点这里重试';
+        retry.appendChild(rn);
+        retry.addEventListener('click', function () {
+          $('audioPanel').hidden = true;
+          handleAudioCodecs(currentVideoPath, pathName(currentVideoPath));
+        });
+        list.appendChild(retry);
+        return;
+      }
+      $('audioTrackCount').textContent = probeTracks.length + ' 条';
       probeTracks.forEach(function (t, i) {
         var ordinal = i + 1;
         var item = document.createElement('div');
@@ -1743,14 +2413,27 @@
         else if (s.type) bits.push(s.type.toUpperCase());
         meta.textContent = bits.join(' · ');
         item.appendChild(meta);
-        item.addEventListener('click', function () { mountSubtitle(s, false); });
+        // 用户在菜单里点选 = 手动选择（位图轨也算）：从此自动挂载不许再覆盖这条
+        item.addEventListener('click', function () { markSubtitleManual(); mountSubtitle(s, false); });
         list.appendChild(item);
       });
     }
 
+    // 用户亲手选了一条字幕（菜单点选 / 拖入文件）：置令牌并推进选择代际。
+    // 令牌挡的是"以后别再自动挂"，代际挡的是"之前发起的异步结果别再回来"。
+    function markSubtitleManual() {
+      subtitleManual = true;
+      subPickSeq++;
+    }
+    // 用户当前的选择变了（改选 / 关闭）但没表达"我要手动"：只推进代际，不置令牌
+    function bumpSubPick() { subPickSeq++; }
+
     function mountSubtitle(s, silent) {
       if (s.disabled || !currentVideoPath) return;
       $('subtitlePanel').hidden = true;
+      // 发起时的选择代际：外挂转 SRT / 内嵌抽取都是异步的，回来时若用户已经改选或关闭，
+      // 这份结果就不再属于"用户当前选择"，必须丢弃（与下面的 path 归属校验并存）。
+      var wantPick = subPickSeq;
       if (s.kind === 'bitmap') { mountPgsSubtitle(s, silent); return; }
       unmountPgs(); // 从位图字幕切到文本字幕：收起图像层
       if (s.kind === 'ext') {
@@ -1762,9 +2445,11 @@
         var extWant = normPath(currentVideoPath); // 发起时捕获，回调里不能再读当前值
         invoke('subtitle_to_srt_text', { path: s.path }).then(function (srt) {
           if (normPath(currentVideoPath) !== extWant) return; // 已经换片，丢弃
+          if (wantPick !== subPickSeq) return; // 用户已改选/关闭，这份结果作废
           mountSubtitleText(srt, { id: s.id, name: s.name }, silent);
         }).catch(function (e) {
           if (normPath(currentVideoPath) !== extWant) return;
+          if (wantPick !== subPickSeq) return;
           toast('字幕加载失败：' + e, 6000);
         });
         return;
@@ -1773,6 +2458,9 @@
       subJob.video = currentVideoPath;
       subJob.index = s.ordinal - 1;
       subJob.item = s;
+      // 这次抽取属于哪个"用户选择代际"：ffmpeg 后台跑完（done 事件）时用户可能已经改选，
+      // done 回调靠这个号判断结果还算不算数。
+      subJob.pick = wantPick;
       updatePill('subtitle', -1, 0);
       // 只请求用户点的这一条。后端对稀疏抽不出的轨只把 pending[0] 交给 ffmpeg
       // （ffmpeg 写 pipe:1，一次只能跑一条），批量请求时点「英文」拿回的可能
@@ -1782,6 +2470,7 @@
       var embedWant = normPath(currentVideoPath); // 发起时捕获，回调里读当前值等于没校验
       invoke('extract_subtitle_text', { videoPath: currentVideoPath, subs: batch, durationUs: probeDurationUs || null }).then(function (got) {
         if (normPath(currentVideoPath) !== embedWant) return; // 已经换片，整个结果作废
+        if (wantPick !== subPickSeq) return; // 用户已改选/关闭，这份抽取结果不属于当前选择
         var hit = (got || []).filter(function (x) { return x.index === s.ordinal - 1; })[0];
         if (hit) {
           clearSubJob(); // 稀疏直接抽出来了，没有后台任务要等
@@ -1793,41 +2482,74 @@
         }
       }).catch(function (e) {
         if (normPath(currentVideoPath) !== embedWant) return;
+        if (wantPick !== subPickSeq) return;
         clearSubJob();
         toast('字幕抽取未能启动：' + e, 8000);
       });
     }
 
-    // 内存里的字幕文本直接交给播放器，用完释放上一个 blob
+    // 当前生效的字幕 blob（'' = 没有）。换字幕是**原子**的：新 blob 建好先交给 switch()，
+    // 载入成功并确认归属后才 revoke 旧的；失败只释放新的，屏幕上那条字幕不受影响。
+    // 旧写法是「先 revoke 旧的再 switch」：新字幕一旦加载失败，旧 blob 已经废了，
+    // 画面上一片空白，lastSubBlobUrl 还留着一个已释放的 url。
     var lastSubBlobUrl = '';
+    // 正在 switch、还没被认领的那条。和 lastSubBlobUrl 分开记账：换字幕期间用户又点了一次，
+    // 只能作废「正在尝试的」这条，绝不能碰屏幕上正在播的那条。
+    var switchingSubBlobUrl = '';
     // 归属已经变了：这条 blob 再也挂不到任何人身上，立刻释放，别留到下次换片才回收
     function dropStaleSubBlob(url) {
       try { URL.revokeObjectURL(url); } catch (e) { }
       if (lastSubBlobUrl === url) lastSubBlobUrl = '';
+      if (switchingSubBlobUrl === url) switchingSubBlobUrl = '';
     }
-    function mountSubtitleText(text, s, silent) {
+    // opts.keepSource：改延时重建同一条轨时用。原文已经在 subSourceText 里，
+    //   不能拿「已经位移过的入参」再把原文覆盖掉，否则每拖一次延时就叠加一次位移。
+    // opts.noName：重建时不把 name 传给 Artplayer。带 name 它会弹一条
+    //   「切换字幕：xxx」的 notice —— 用户只是改了延时，并没有换字幕。
+    function mountSubtitleText(text, s, silent, opts) {
       if (!art) return;
+      var o = opts || {};
+      if (!o.keepSource) {
+        subSourceText = text == null ? '' : String(text);
+        subSourceItem = s || null;
+      }
       // 发起时记下归属：建 blob 和 switch 都是异步的（外挂字幕转换要几百毫秒），
       // 中途换片回调照样会跑，不校验就会把上一部的字幕记成当前这部已挂载。
       var wantPath = normPath(currentVideoPath);
-      if (lastSubBlobUrl) { try { URL.revokeObjectURL(lastSubBlobUrl); } catch (e) { } lastSubBlobUrl = ''; }
       var url;
       try {
-        url = URL.createObjectURL(new Blob([text], { type: 'text/plain;charset=utf-8' }));
-        lastSubBlobUrl = url;
+        // 延时在文本层位移后再交出去：Artplayer 只认 blob（内部 fetch→srtToVtt），
+        // 前端拿不到 cue 对象，只能在文本时间轴上做。
+        url = URL.createObjectURL(new Blob([shiftSrtTimes(subSourceText, subDelayMs)], { type: 'text/plain;charset=utf-8' }));
       } catch (e) {
         toast('字幕加载失败：' + e, 6000);
         return;
       }
-      art.subtitle.switch(url, { name: s.name, type: 'srt', encoding: 'utf-8' }).then(function () {
+      // 上一次还卡在 switch 里的尝试作废（只作废「正在尝试的」那条，不碰屏幕上正在播的）
+      if (switchingSubBlobUrl && switchingSubBlobUrl !== url) {
+        try { URL.revokeObjectURL(switchingSubBlobUrl); } catch (e) { }
+        switchingSubBlobUrl = '';
+      }
+      switchingSubBlobUrl = url;
+      var switchOpt = { type: 'srt', encoding: 'utf-8' };
+      if (!o.noName && s && s.name) switchOpt.name = s.name;
+      art.subtitle.switch(url, switchOpt).then(function () {
         if (normPath(currentVideoPath) !== wantPath) { dropStaleSubBlob(url); return; }
+        // 交换点：到这里新轨已经载入成功，旧的才退役。顺序反了就会出现「失败的换字幕
+        // 把当前字幕一起清掉」——手机版也是先建新轨、校验有内容，最后才交换。
+        if (switchingSubBlobUrl === url) switchingSubBlobUrl = '';
+        var prev = lastSubBlobUrl;
+        lastSubBlobUrl = url;
         mountedSubId = s.id;
         art.subtitle.style({ display: 'block' });
         refreshSubtitleMenu();
+        if (prev && prev !== url) { try { URL.revokeObjectURL(prev); } catch (e) { } }
         if (!silent) toast('已挂载字幕：' + clipName(s.name));
       }).catch(function (e) {
+        // 失败只清理这次的新轨：旧字幕还在播，lastSubBlobUrl 保持旧值
+        dropStaleSubBlob(url);
         // 换片导致的失败不是用户的错，别在新片上弹一条莫名其妙的报错
-        if (normPath(currentVideoPath) !== wantPath) { dropStaleSubBlob(url); return; }
+        if (normPath(currentVideoPath) !== wantPath) return;
         toast('字幕加载失败：' + e, 6000);
       });
     }
@@ -1862,6 +2584,8 @@
     // 拖入的字幕文件：登记进菜单（同一路径只登记一次），返回菜单条目供立即挂载
     function addDroppedSubtitle(p) {
       if (!p) return null;
+      // 用户亲手把字幕拖进来 = 手动选择：从此自动挂载不许再覆盖它
+      markSubtitleManual();
       var np = normPath(p);
       var dup = droppedSubs.some(function (f) { return normPath(f) === np; });
       if (!dup) droppedSubs.push(p);
@@ -1914,16 +2638,23 @@
       return pgsEl;
     }
 
-    // 视频显示区域。Artplayer 的 .art-video 是 object-fit:fill（不是 contain），
-    // 画面被拉伸填满整个容器，所以内容框就是容器本身，PGS 画布按同样比例拉伸即可。
+    // 位图字幕要贴的位置：容器的**可视画面框**，不是容器本身。以前这里假定
+    // `.art-video` 是 object-fit:fill、画面铺满容器，于是把容器当内容框 —— 那只在
+    // 「拉伸」模式下成立。默认改成「适应」之后，有黑边时真正有像素的画面比容器小一圈，
+    // 继续按容器算会让位图整体偏出去（宽出黑边、上下也偏）。
     function videoContentBox() {
       var v = art && art.video;
       var host = pgsEl && pgsEl.parentElement;
       if (!v || !host) return null;
-      var cw = host.clientWidth || 0;
-      var ch = host.clientHeight || 0;
-      if (!cw || !ch) return null;
-      return { x: 0, y: 0, w: cw, h: ch };
+      return videoPictureBox(host.clientWidth, host.clientHeight, v.videoWidth, v.videoHeight, appSettings.fit);
+    }
+
+    // 适配模式或窗口尺寸变了要重排当前这张位图。object-fit 变化不改变元素尺寸，
+    // ResizeObserver 收不到，所以由 applyFitMode 广播 bplayer:fit 事件来通知。
+    function refreshPgsLayout() {
+      if (!pgsIndexData || pgsActiveIdx < 0) return;
+      var ev = pgsIndexData.events[pgsActiveIdx];
+      if (ev) layoutPgsImg(ev);
     }
 
     function layoutPgsImg(ev) {
@@ -1991,10 +2722,28 @@
       v.addEventListener('seeking', pgsPump);
       v.addEventListener('loadedmetadata', pgsPump);
       v.addEventListener('play', pgsPump);
+      // 元数据到达后才第一次知道真实画面尺寸，这时必须重排一次
+      v.addEventListener('loadedmetadata', refreshPgsLayout);
+      // 适配模式切换时要重排：object-fit 变了但元素尺寸没变，ResizeObserver 收不到。
+      // 暂停状态下也没有 timeupdate 来"顺手"触发，所以两路都接。
+      document.addEventListener('bplayer:fit', refreshPgsLayout);
+      // 窗口缩放/进出全屏：容器尺寸变了，可视画面框跟着变
+      if (window.ResizeObserver && !v.__pgsResizeBound) {
+        var host = pgsHost();
+        if (host) {
+          v.__pgsResizeBound = true;
+          v.__pgsResize = new ResizeObserver(function () { refreshPgsLayout(); });
+          v.__pgsResize.observe(host);
+        }
+      }
     }
 
     function mountPgsSubtitle(s, silent) {
       if (!currentVideoPath || !art) return;
+      // 位图字幕挂在图像层上，文本层的延时/重建依据一律作废：PGS 的时间轴不走 SRT 文本，
+      // 留着旧的 subSourceText 会让"拖一下延时"把已经收起的文本字幕又 switch 回来。
+      subSourceText = '';
+      subSourceItem = null;
       if (pgsIndexData && pgsTrackNo === s.track && pgsOwnerPath === currentVideoPath) {
         mountedSubId = s.id;
         if (art.subtitle) art.subtitle.style({ display: 'none' });
@@ -2007,14 +2756,17 @@
       }
       unmountPgs();
       var token = ++pgsToken;
+      // 位图索引也是异步回包：用户可能已经改选/关闭，这份索引不再属于当前选择
+      var wantPick = subPickSeq;
       var path = currentVideoPath;
       // 位图解析不是后台转码任务，只借字幕胶囊给个「还在解析」的反馈；
       // 字幕抽取正在跑时不能抢那颗胶囊，否则进度文字会被这行覆盖掉
       if (!subJob.video) updatePill('subtitle', -1, 0);
       toast('正在解析位图字幕（' + clipName(s.name) + '）…', 4000);
       invoke('pgs_open', { videoPath: path, track: s.track }).then(function (idx) {
-        if (token !== pgsToken) return;
         syncPill(); // 位图解析不是后台转码任务，别把同时在跑的音轨进度胶囊一起收掉
+        if (token !== pgsToken) return;
+        if (wantPick !== subPickSeq) return; // 用户已改选/关闭，索引作废
         if (!idx || !idx.events || !idx.events.length) { toast('这条字幕轨里没有可显示的位图', 6000); return; }
         pgsIndexData = idx;
         pgsTrackNo = s.track;
@@ -2052,12 +2804,29 @@
       mountedSubId = '';
       $('subtitlePanel').hidden = true;
       unmountPgs();
+      // 关闭也是"用户当前选择变了"：推进选择代际，让在途的抽取/位图回包作废，
+      // 否则后台刚抽完的字幕会在用户关掉之后自己又挂回来。
+      // 但**不置 manual** —— 关掉不等于"我要手动"，以后自动匹配还该生效。
+      bumpSubPick();
+      // 关闭字幕：原文和延时的重建依据一起作废，否则拖一下延时会把刚关掉的字幕重新挂回来
+      subSourceText = '';
+      subSourceItem = null;
+      // 关闭字幕：当前这条和正在 switch 的那条都不再有任何轨会引用，立刻回收。
+      // 否则要等下一次成功挂载才释放（每次关字幕都漏一个 blob）。
+      if (switchingSubBlobUrl) { try { URL.revokeObjectURL(switchingSubBlobUrl); } catch (e) { } switchingSubBlobUrl = ''; }
+      if (lastSubBlobUrl) { try { URL.revokeObjectURL(lastSubBlobUrl); } catch (e) { } lastSubBlobUrl = ''; }
       if (art) art.subtitle.style({ display: 'none' });
       refreshSubtitleMenu();
     }
 
-    // 自动挂载：同名/变体外挂 > 默认内嵌文本轨 > 第一条内嵌文本轨 > 第一条外挂
+    // 自动挂载优先级：同名/变体外挂 > 默认内嵌文本轨 > 第一条内嵌文本轨 > 第一条外挂 > 位图。
+    // 位图（PGS）排最后：解析要解位图（几秒、几十 MB 内存），而且不可搜索、样式不可控，
+    // 只要还有任何文本字幕就先用文本；位图只在「全 PGS、一个文本轨都没有」时兜底
+    // （《潘神》这种片，以前自动字幕等于没开）。位图解码是重操作，只在开了自动字幕时碰。
     function autoMountSubtitle() {
+      // B4：用户已经亲手选过字幕（菜单点选 / 拖入文件，含 PGS 位图轨），
+      // 自动挂载只管"没选过"的情况，不能再覆盖他的选择。
+      if (subtitleManual) return;
       var vb = baseName(currentVideoName).toLowerCase();
       var exact = subItems.filter(function (s) {
         if (s.kind !== 'ext') return false;
@@ -2067,12 +2836,127 @@
       var embDefault = subItems.filter(function (s) { return s.kind === 'embedded' && s.default; });
       var embFirst = subItems.filter(function (s) { return s.kind === 'embedded'; });
       var extFirst = subItems.filter(function (s) { return s.kind === 'ext'; });
+      // disabled 的是 VobSub 等 libpgs 吃不下的图形字幕，不能作为兜底候选
+      var bitmap = subItems.filter(function (s) { return s.kind === 'bitmap' && !s.disabled; });
       var cand = exact[0];
       // 内嵌文本轨要抽 SRT（读整遍文件），只在你开启了自动转换时才自动挂
       if (!cand && appSettings.autoSubtitle) cand = embDefault[0] || embFirst[0];
       if (!cand) cand = extFirst[0];
+      // 位图放 extFirst 之后：外挂文本可搜索、样式可控、解析几乎零成本，比位图好；
+      // 只有完全没有文本候选时才值得为位图付解码开销（手机版顺序也是 ext → embedded → bitmap）
+      if (!cand && appSettings.autoSubtitle) cand = bitmap[0];
       if (cand) mountSubtitle(cand, !!exact[0]);
     }
+
+    /* ---- B3 断点续播的 UI 与时机 ----
+     * 存档规则全在外层 resumeStore 纯函数里，这里只管"什么时候问、什么时候记"。
+     * 选择条放在 stage 内部底部，不是贴边浮窗，所以不进 closeOtherPanels()。 */
+    var resumeBarItem = null;   // 选择条当前对应的记录（点继续播放用它，不重新读存档）
+    var resumeBarAt = 0;        // 选择条出现时画面在哪个位置（用户自己 seek 超过 5 秒就撤条）
+    var resumeBarTimer = null;
+    var resumeHintedPath = '';  // 本次会话已经提示过的片：同一部只问一次（播完 ended 后可再问）
+    var resumeReady = false;    // 当前源的元数据已就绪：没就绪时 duration/currentTime 都是旧片的
+    var resumeSavedAt = 0;      // timeupdate 的 5 秒节流时间戳
+    var resumeHoldUntil = 0;    // 这段窗口内不保存：「从头开始」的 seek 到 0 不能按"不值得续播"删记录
+
+    function hideResumeBar() {
+      clearTimeout(resumeBarTimer);
+      resumeBarTimer = null;
+      resumeBarItem = null;
+      var bar = $('resumeBar');
+      if (bar) bar.hidden = true;
+    }
+
+    function showResumeBar(item) {
+      if (!item) return;
+      resumeBarItem = item;
+      resumeBarAt = art && art.video ? (art.video.currentTime || 0) : 0;
+      $('resumeTime').textContent = fmtDuration(item.position);
+      $('resumeBar').hidden = false;
+      // 10 秒无操作 = 用户懒得选，按「从头开始」继续。注意播放本身从打开起就在跑，
+      // 这里只收浮条、绝不 pause —— 为了问一句就把画面钉住，比丢进度更让人火大。
+      clearTimeout(resumeBarTimer);
+      resumeBarTimer = setTimeout(function () { hideResumeBar(); }, 10000);
+    }
+
+    // 记位置：路径一律走 normPath 归一化后的 currentVideoPath（resume 内部还会再折叠一次分隔符）
+    function saveResumePosition() {
+      if (!currentVideoPath || !art || !art.video) return;
+      if (!resumeReady) return; // 换源瞬间 duration/currentTime 还是上一部的，不能记到新路径上
+      // 选择条还开着时画面正从 0 往前跑，这个 0~10 秒的位置**不是用户的选择**：
+      // 照常保存会把旧记录覆盖掉（位置太靠前还会直接删掉），用户还没点就先没了。
+      // 安卓版同样在 savePosition 里用 pendingResume 把这段时间隔开。
+      if (resumeBarItem) return;
+      if (Date.now() < resumeHoldUntil) return; // 「从头开始」刚 seek 到 0 的那一下也不记
+      var v = art.video;
+      // 非法值（还没元数据 / 直播 Infinity）由 resumeSave 自己过滤
+      resume.save(currentVideoPath, v.currentTime, v.duration, Date.now());
+    }
+
+    // 元数据就绪后问一次：有记录才出现选择条。时长对不上（同名文件换了版本）时
+    // resumeGet 已经悄悄删掉记录并返回 null，这里不弹任何提示。
+    function offerResume() {
+      var v = art && art.video;
+      if (!v || !currentVideoPath) return;
+      if (resumeHintedPath === currentVideoPath) return;
+      var item = resume.get(currentVideoPath, v.duration, Date.now());
+      if (!item) return;
+      resumeHintedPath = currentVideoPath;
+      showResumeBar(item);
+    }
+
+    var resumeEventsBound = false;
+    function bindResumeEvents() {
+      var v = art && art.video;
+      if (!v || resumeEventsBound) return;
+      resumeEventsBound = true;
+      v.addEventListener('loadedmetadata', function () {
+        resumeReady = true;
+        offerResume();
+      });
+      v.addEventListener('timeupdate', function () {
+        // 5 秒节流：timeupdate 一秒能来四次，每条都写 localStorage 是白费磁盘和主线程
+        if (Date.now() - resumeSavedAt < 5000) return;
+        resumeSavedAt = Date.now();
+        saveResumePosition();
+      });
+      v.addEventListener('pause', saveResumePosition);
+      v.addEventListener('seeked', function () {
+        saveResumePosition();
+        // 用户自己拖到离浮条出现位置 5 秒以外：他已经自己决定了从哪看，浮条立刻撤
+        if (resumeBarItem && Math.abs((v.currentTime || 0) - resumeBarAt) > 5) hideResumeBar();
+      });
+      v.addEventListener('ended', function () {
+        // 播完就不存在"续播"：删记录，并允许下次重开这部片再问一遍
+        resume.remove(currentVideoPath);
+        resumeHintedPath = '';
+        hideResumeBar();
+      });
+    }
+
+    $('resumeContinue').addEventListener('click', function () {
+      var item = resumeBarItem;
+      hideResumeBar();
+      if (!item || !art) return;
+      var to = item.position;
+      var d = Number(art.video && art.video.duration);
+      // 记录位置贴着片尾时留 1 秒余量，免得 seek 到 duration 直接触发 ended
+      if (resumeFinite(d) && d > 0 && to > d - 1) to = Math.max(0, d - 1);
+      try { art.currentTime = to; } catch (e) { }
+      try { Promise.resolve(art.play()).catch(function () { }); } catch (e) { }
+    });
+    $('resumeRestart').addEventListener('click', function () {
+      // 不删记录：用户可能只是暂时重看一遍，之后保存的位置会自然覆盖它。
+      // 但 seek 到 0 会立刻触发 seeked 保存，而"位置 0"按规则又会删掉旧记录 ——
+      // 所以这两个动作之间的窗口先按住不存（2 秒足够覆盖这次 seek，之后照常记新位置）。
+      resumeHoldUntil = Date.now() + 2000;
+      hideResumeBar();
+      try {
+        if (!art) return;
+        art.currentTime = 0;
+        Promise.resolve(art.play()).catch(function () { });
+      } catch (e) { }
+    });
 
     // 音轨和字幕各占一颗胶囊，标签由 kind 决定，不再有「当前任务类型」这种全局态
     var PILL_KIND_TEXT = { audio: '音轨', subtitle: '字幕' };
@@ -2101,7 +2985,7 @@
     }
     // 清记账位后统一走 syncPill：只清自己那组、只收自己那颗胶囊
     function clearAudioJob() { audioJob.video = ''; audioJob.ordinal = -1; syncPill(); }
-    function clearSubJob() { subJob.video = ''; subJob.index = -1; subJob.item = null; syncPill(); }
+    function clearSubJob() { subJob.video = ''; subJob.index = -1; subJob.item = null; subJob.pick = -1; syncPill(); }
     // 点哪颗胶囊都取消全部：音轨和字幕是两个独立任务槽，只取消 audio 会让字幕继续在后台跑完。
     pillStackEl.addEventListener('click', function () {
       // 命令改成返回 Result 之后必须接 catch，否则 reject 会变成 unhandled rejection。
@@ -2112,6 +2996,83 @@
         if (n) toast('已取消后台处理');
       }).catch(function () { });
     });
+
+    // ---- 停止播放：关掉当前视频，回到空态 ----
+    // 语义是「卸载媒体」，不是「暂停回开头」——后者用进度条就能做。而「退出当前片」
+    // 以前完全没有入口：placeholder 一旦 hide 就再也不恢复，播过一片就回不到空态。
+    function stopPlayback() {
+      if (!currentVideoPath || !art) { toast('当前没有在播的视频'); return; }
+      var v = art.video;
+      // 1) 先把位置存下来。停止是用户主动离开这部片，不是看完（看完走 ended 删记录）。
+      //    这里直接调 resume.save，绕开 saveResumePosition 的节流与「续播条开着就别存」守卫。
+      try {
+        if (v && isFinite(v.currentTime) && isFinite(v.duration) && v.duration > 0) {
+          resume.save(normPath(currentVideoPath), v.currentTime, v.duration);
+        }
+      } catch (e) { }
+      // 2) 作废所有在途请求：fs_stat / 探测 / 字幕抽取 / 弹幕配对 / PGS 回来的结果全丢弃，
+      //    否则停止之后它们还会往空态界面上写东西（弹幕条数、字幕菜单、胶囊进度）。
+      videoLoadSeq++;
+      probeToken++;
+      pgsToken++;
+      danmakuLoadToken++;
+      subPickSeq++;
+      // 3) 停后台任务 + 收胶囊/续播条
+      try { invoke('transcode_cancel_all').catch(function () { }); } catch (e) { }
+      clearAudioJob();
+      clearSubJob();
+      hideAllPills();
+      hideResumeBar();
+      resumeReady = false;
+      resumeBarItem = null;
+      // 4) 卸播放资源
+      try { art.pause(); } catch (e) { }
+      unmountPgs();
+      unmountSubtitle();
+      releaseVideoAudio();
+      resetExternalAudio();
+      // 5) 清界面
+      clearDanmaku();
+      closeOtherPanels('');
+      $('playlist').classList.remove('open');
+      hideToast();
+      $('infobar').hidden = true;
+      chipVideo.textContent = '未加载视频';
+      document.title = 'Danmuku Video Player · 本地视频 + 弹幕播放器';
+      // 6) 清状态（与 desktopLoadVideo 开片时的重置项一一对应，漏一个就会串到下一部）
+      currentVideoPath = '';
+      currentVideoName = '';
+      probeTracks = null;
+      probeDurationUs = null;
+      probeFailed = false;
+      fullCacheActive = false;
+      subItems = [];
+      mountedSubId = '';
+      droppedSubs = [];
+      subtitleManual = false;
+      danmakuManual = false;
+      subDelayMs = 0;
+      subSourceText = '';
+      subSourceItem = null;
+      refreshSubStyleControls();
+      currentEpIndex = -1;
+      // 播放列表留着（用户可能还想从里面挑别的集），只是不再高亮任何一集
+      renderPlaylist();
+      // 7) 卸掉媒体源：不卸的话 29 GB 的片会一直占着文件句柄，用户想删/移文件会被占用。
+      //    removeAttribute + load() 让内核回到 NETWORK_EMPTY；下次开片由 art.url 重新设源。
+      var media = art.video;
+      if (media) {
+        try { media.removeAttribute('src'); media.load(); } catch (e) { }
+      }
+      // 8) 藏掉播放器、露出占位页。
+      //    不用 z-index 盖：Artplayer 的 .art-bottom 是 z-index:60，placeholder 只有 5，
+      //    硬抬会跟播放列表(60)/面板(70)/设置(100) 抢层级。
+      $('player').style.display = 'none';
+      placeholder.classList.remove('hide');
+      toast('已停止播放');
+    }
+    // 顶层控制栏按钮通过这个引用转发（它看不到 initDesktop 里的块内状态）
+    stopPlaybackRef = stopPlayback;
 
     async function desktopLoadVideo(path, manualDanPath, epIndex) {
       // 每次换片铸一个代际：这个函数里有 fs_stat / 目录扫描 / 读弹幕三个 await，
@@ -2124,13 +3085,24 @@
       var st = await invoke('fs_stat', { path: path });
       if (seq !== videoLoadSeq) return 0; // 之后又发起了换片，本次什么都不做
       if (st.kind !== 'file') { toast('文件不存在：' + clipName(name, 40)); return 0; }
+      var prevVideoPath = currentVideoPath; // 用来区分「真换片」和「同一文件重开」
       currentVideoPath = normPath(path);
       probeTracks = null;
       probeDurationUs = null;
+      probeFailed = false; // 新片重新探测；旧片的失败态不能留到新片上
       fullCacheActive = false;
       subItems = [];
       mountedSubId = '';
       droppedSubs = []; // 拖入的字幕只对当前这部片有效
+      // B4：手动选择令牌按当前视频归属 —— 上一部的手动选择绝不能把新片的自动匹配也关掉
+      subtitleManual = false;
+      danmakuManual = false;
+      // 延时只对当前这部片有效：换片归零，并把上一部的字幕原文一并作废
+      // （原文不清掉的话，新片还没挂字幕时拖一下延时会把上一部的字幕重新 switch 回来）。
+      subDelayMs = 0;
+      subSourceText = '';
+      subSourceItem = null;
+      refreshSubStyleControls(); // 面板开着时滑块要跟着回 0
       if (art) art.subtitle.style({ display: 'none' }); // 上一部的字幕先藏起来，扫描到新的会自动挂载
       // 换片即中断上一部的后台处理（转码/抽字幕）：不让它在后台偷偷跑完占磁盘和 CPU。
       // 音轨和字幕抽取是两个独立的任务槽，必须一起取消；而且不能靠记账位判断有没有活干
@@ -2144,7 +3116,16 @@
       // 上一次被强杀/崩溃会留下 *.tmp.* 半成品，打开这部片时顺手清掉
       try { invoke('clean_sidecar_tmp', { videoPath: path }).catch(function () { }); } catch (e) { }
       unmountPgs(); // 上一部的位图字幕数据（Rust 侧约 30 MB）随换片释放
+      // 换片立刻撤掉上一部的弹幕：pair_danmaku 要读盘（网络盘/大目录可达数秒），
+      // 那几秒里画面已经是新片、弹幕还在飘上一部的（手机版拿到文件第一件事就是 clearDanmaku）。
+      // 同一文件重开不清：保留「重开同一片时弹幕不闪一下」的既有行为。
+      if (prevVideoPath && prevVideoPath !== normPath(path)) clearDanmaku();
       setVideoFromUrl(mediaUrl(path), name, st.size);
+      // 换片/换集：上一部的续播选择条立刻收起，并把"元数据已就绪"复位 ——
+      // 换源那一瞬 duration/currentTime 还是旧片的，不复位会把旧进度记到新路径上。
+      hideResumeBar();
+      resumeReady = false;
+      bindResumeEvents(); // 首次载片时 art 才建出来，监听在这里补挂（内部只挂一次）
       handleAudioCodecs(path, name);
       // 外挂字幕扫描对全部视频类型生效（内嵌轨只有 MKV 能探测，由 handleAudioCodecs 补齐）
       if (!/\.(mkv|mka|webm)$/i.test(name)) buildSubtitleMenu(path, null, ++probeToken);
@@ -2175,12 +3156,18 @@
         }
         if (seq !== videoLoadSeq) return 0; // 已换片，丢弃
         if (normPath(currentVideoPath) !== normPath(path)) return 0; // 已换片，丢弃
+        // 用户拖视频时一并指定的弹幕 = 手动选择：以后自动配对不许再顶掉它。
+        // 只有真的读到文本才置位 —— 读取失败/取消不算"选过"。
+        danmakuManual = true;
         desktopLoadDanmaku(pathName(manualDanPath), manualText);
       } else {
         var pairPath = / \(AAC\)\.mkv$/i.test(name) ? path.replace(/ \(AAC\)\.mkv$/i, '.mkv') : path;
         var pair = await invoke('pair_danmaku', { videoPath: pairPath });
         if (seq !== videoLoadSeq) return 0; // 已换片，丢弃
         if (normPath(currentVideoPath) !== normPath(path)) return 0; // 已换片，丢弃；下面的 toast / clearDanmaku 也不能执行
+        // B4：pair_danmaku 要读盘（网络盘可达数秒），这期间用户可能已经手动拖入弹幕。
+        // 晚到的自动结果直接丢弃：不清空他挂的内容、不弹「已自动加载同名弹幕」。
+        if (danmakuManual) return seq;
         if (pair) {
           desktopLoadDanmaku(pair.name, pair.text);
           // 同名配对永远只有这一个结果（xml 优先于 json），文件名没有辨识价值
@@ -2214,14 +3201,23 @@
     };
 
     $('btnOpenVideo').addEventListener('click', async function () {
-      var p = await invoke('pick_video');
-      if (p) desktopLoadVideo(p, null);
+      // 对话框/载片任何一个 await 失败都要有反馈：以前 reject 会变成未捕获的 promise，
+      // 用户点完什么都没发生。提示里不带长路径，错误文本截到 40 字符。
+      var p = null;
+      try { p = await invoke('pick_video'); } catch (e) { toast('打开视频失败：' + clipName(String(e), 40), 7000); return; }
+      if (!p) return;
+      try { await desktopLoadVideo(p, null); } catch (e) { toast('打开视频失败：' + clipName(String(e), 40), 7000); }
     });
     $('btnOpenFolder').addEventListener('click', async function () {
-      var d = await invoke('pick_folder');
-      if (d) {
+      var d = null;
+      try { d = await invoke('pick_folder'); } catch (e) { toast('选择文件夹失败：' + clipName(String(e), 40), 7000); return; }
+      if (!d) return;
+      try {
         var scan = await loadPlaylist(d, true);
         if (scan) toast('已加载播放列表 · ' + playlist.length + ' 集'); // 被更新的扫描取代时 scan 为 null
+      } catch (e) {
+        // scan_folder 失败（权限不足 / 网络盘断连 / 路径过长）以前会静默变成 unhandled rejection
+        toast('读取文件夹失败：' + clipName(String(e), 40), 8000);
       }
     });
     $('btnPlaylist').addEventListener('click', function () { $('playlist').classList.toggle('open'); });
@@ -2326,8 +3322,69 @@
       var opening = panel.hidden;
       closeOtherPanels(opening ? 'subtitlePanel' : '');
       panel.hidden = !opening;
+      // 样式区控件是 DOM 状态：打开面板时从运行时状态刷一遍（换片/重置后可能已经变了）
+      if (opening) refreshSubStyleControls();
     });
     $('subtitleClose').addEventListener('click', function () { $('subtitlePanel').hidden = true; });
+
+    // ---- 字幕样式 / 延时面板 ----
+    // 改延时：拖滑块（input）只更新数值和文案；松手（change）才真正重建字幕轨。
+    // 一次拖动会连发几十个 input，每个都 switch 一遍等于把整份 SRT 重新 fetch + 解析几十遍。
+    function commitSubDelay() {
+      // 没有在播的文本字幕时只更新数值：没有轨可重建（PGS 位图字幕的时间轴不走 SRT 文本）
+      if (!art || !subSourceText || !subSourceItem) return;
+      mountSubtitleText(subSourceText, subSourceItem, true, { keepSource: true, noName: true });
+    }
+
+    function bindSubtitleStylePanel() {
+      $('subSize').addEventListener('change', function () {
+        var v = Number(this.value);
+        subStyle.size = isSubSize(v) ? v : 18;
+        applySubtitleStyle(); // 即时预览
+      });
+      var colorBtns = document.querySelectorAll('#subColors .sub-color');
+      for (var i = 0; i < colorBtns.length; i++) {
+        colorBtns[i].addEventListener('click', function () {
+          var c = this.getAttribute('data-color');
+          subStyle.color = isSubColor(c) ? c : '#ffffff';
+          applySubtitleStyle();
+          refreshSubStyleControls();
+        });
+      }
+      $('subOutline').addEventListener('change', function () {
+        subStyle.outline = this.checked === true;
+        applySubtitleStyle();
+      });
+      $('subPosInside').addEventListener('change', function () {
+        if (!this.checked) return;
+        subStyle.position = 'inside';
+        applySubtitleStyle();
+      });
+      $('subPosBelow').addEventListener('change', function () {
+        if (!this.checked) return;
+        subStyle.position = 'below';
+        applySubtitleStyle();
+      });
+      $('subDelay').addEventListener('input', function () {
+        // 只更新数值和文案，不重建字幕轨（重建统一在 change 里做）
+        setSubDelay(Math.round(Number(this.value) * 1000));
+      });
+      $('subDelay').addEventListener('change', function () { commitSubDelay(); });
+      $('subSave').addEventListener('click', function () {
+        // 规格：只有点「保存」才写 localStorage。保存后以后打开的片都沿用这套样式。
+        saveSubStyle();
+        toast('字幕样式已保存');
+      });
+      $('subReset').addEventListener('click', function () {
+        subStyle = defaultSubStyle();
+        applySubtitleStyle();
+        refreshSubStyleControls();
+        // 不落盘：按规格只有点「保存」才算数
+        toast('已恢复默认样式，点「保存」后记住', 5000);
+      });
+      refreshSubStyleControls();
+    }
+    bindSubtitleStylePanel();
 
     // 播完自动下一集
     window.__BplayerNext = function () {
@@ -2390,6 +3447,8 @@
         // （否则旧片弹幕会覆盖新片刚挂好的那份）。
         var text = await invoke('read_text', { path: dan });
         if (drop !== dropSeq || dropVideoSeq !== videoLoadSeq) return;
+        // 用户亲手拖进来的弹幕 = 手动选择：残留的自动配对结果以后不许顶掉它
+        danmakuManual = true;
         desktopLoadDanmaku(pathName(dan), text);
       } else toast('未识别的文件：请拖入视频、弹幕（xml / json）或字幕（srt / ass / vtt）');
     });
@@ -2416,7 +3475,12 @@
       }
       if (isSub) {
         var s = subJob.item;
+        var jobPick = subJob.pick; // 发起这次抽取时的用户选择代际
         clearSubJob(); // 只清字幕槽：音轨槽还可能在跑，syncPill 自己判断要不要收胶囊
+        // B4：后台抽取期间用户可能已经改选别的字幕、或把字幕关了。这份文本已经不属于
+        // "用户当前选择"，直接丢弃 —— 否则它会把用户刚选的轨顶掉（这就是手动选择被
+        // 晚到的自动结果覆盖的典型现场）。
+        if (jobPick !== subPickSeq) return;
         if (s && p.text && normPath(currentVideoPath) === vid) {
           // 字幕走内存：ffmpeg 管道抽出的文本随事件带回，直接挂载
           mountSubtitleText(p.text, s, false);
@@ -2484,7 +3548,9 @@
     get block() { return { enabled: blockState.enabled, words: blockWords().length }; },
     get density() { return { limit: densityState.limit, kept: densityFilter(filterDanmaku(danmakuList)).length }; },
     get diag() { return window.__bplayerDiag || []; },
-    get filter() { return filterDanmaku; }
+    get filter() { return filterDanmaku; },
+    // 字幕样式/延时诊断：DevTools 里直接看运行时状态（面板控件的 DOM 值不等于运行时值）
+    get subtitle() { return { style: subStyle, delayMs: subDelayMs, hasSource: !!subSourceText }; }
   };
 })();
 </script>

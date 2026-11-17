@@ -3,6 +3,7 @@
 // - scan_folder：剧集列表（视频 + 同名弹幕标记）
 // - 视频流走 Tauri 官方 asset 协议（http://asset.localhost，原生支持 Range 跳转）
 use serde::Serialize;
+use std::cmp::Ordering;
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -288,6 +289,72 @@ fn folder_label(dir: &Path) -> String {
         .unwrap_or_else(|| dir.to_string_lossy().into_owned())
 }
 
+/// 自然排序里的一段：连续 ASCII 数字，或连续非数字。
+enum NaturalSeg<'a> {
+    Num(&'a str),
+    Text(&'a str),
+}
+
+/// 把（已小写的）文件名切成数字段/非数字段。只在 ASCII 数字边界上切，
+/// 多字节 UTF-8 字符内部不会被切开（数字字节 0x30-0x39 不会出现在续字节里）。
+fn natural_segments(s: &str) -> Vec<NaturalSeg<'_>> {
+    let b = s.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    while i < b.len() {
+        let start = i;
+        let digit = b[i].is_ascii_digit();
+        while i < b.len() && b[i].is_ascii_digit() == digit {
+            i += 1;
+        }
+        out.push(if digit { NaturalSeg::Num(&s[start..i]) } else { NaturalSeg::Text(&s[start..i]) });
+    }
+    out
+}
+
+/// 两段数字按数值比较（不解析成整数，任意长都安全）：先剥前导零，长度长的数大；
+/// 等值时前导零少的排前面（"1.mp4" < "01.mp4" < "001.mp4"），保证排序确定。
+fn cmp_digit_run(a: &str, b: &str) -> Ordering {
+    let sa = a.trim_start_matches('0');
+    let sb = b.trim_start_matches('0');
+    let (va, vb) = (if sa.is_empty() { "0" } else { sa }, if sb.is_empty() { "0" } else { sb });
+    va.len()
+        .cmp(&vb.len())
+        .then_with(|| va.cmp(vb))
+        .then_with(|| a.len().cmp(&b.len()))
+}
+
+/// 自然排序比较（人类排序）：连续数字段按数值比，其余段按小写字符串比。
+///
+/// 为什么需要：`videos.sort_by(|a, b| a.0.to_lowercase().cmp(...))` 是纯字典序，
+/// 「第10集」会排到「第2集」前面，用户打开文件夹看到集数顺序是乱的。手机版用
+/// `Intl.Collator(numeric: true)`；桌面 Rust 侧没有这个（不想为一个比较函数引
+/// unicode 库），所以自己按段拆开比。
+///
+/// 规则（与手机版分段规则对齐）：
+/// - 数字段按数值比较，前导零不参与数值；数值相同再比前导零个数，`1 < 01 < 001`。
+/// - 非数字段按小写字符串比较 —— 大小写不敏感，`a.mp4` 排在 `B.mp4` 前。
+/// - 同一位置"数字段 vs 非数字段"时数字在前（与 ASCII 码位顺序一致）。
+/// - 所有段都相等时按小写全串兜底，`sort_by` 又是稳定排序，结果确定。
+pub(crate) fn natural_cmp(a: &str, b: &str) -> Ordering {
+    let la = a.to_lowercase();
+    let lb = b.to_lowercase();
+    let sa = natural_segments(&la);
+    let sb = natural_segments(&lb);
+    for (x, y) in sa.iter().zip(sb.iter()) {
+        let ord = match (x, y) {
+            (NaturalSeg::Num(p), NaturalSeg::Num(q)) => cmp_digit_run(p, q),
+            (NaturalSeg::Text(p), NaturalSeg::Text(q)) => p.cmp(q),
+            (NaturalSeg::Num(_), NaturalSeg::Text(_)) => Ordering::Less,
+            (NaturalSeg::Text(_), NaturalSeg::Num(_)) => Ordering::Greater,
+        };
+        if ord != Ordering::Equal {
+            return ord;
+        }
+    }
+    sa.len().cmp(&sb.len()).then_with(|| la.cmp(&lb))
+}
+
 fn scan_folder_impl(dir: &str) -> FolderScan {
     let dp = Path::new(dir);
     let mut videos: Vec<(String, PathBuf, u64)> = Vec::new();
@@ -317,7 +384,8 @@ fn scan_folder_impl(dir: &str) -> FolderScan {
             }
         }
     }
-    videos.sort_by(|a, b| a.0.to_lowercase().cmp(&b.0.to_lowercase()));
+    // 自然排序：数字段按数值比，否则「第10集」会排在「第2集」前面。
+    videos.sort_by(|a, b| natural_cmp(&a.0, &b.0));
     let episodes = videos
         .into_iter()
         .map(|(name, p, size)| {
@@ -595,6 +663,95 @@ mod tests {
         assert_eq!(scan.episodes[0].size, 1, "size 来自 entry.metadata()");
         assert_eq!(scan.label, dir.file_name().unwrap().to_string_lossy());
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// 缺陷 A5 回归：播放列表必须按自然排序（人类排序）。
+    /// 修复前 `scan_folder_impl` 是纯小写字典序，于是「第10集」排在「第1集」前面，
+    /// 用户点开文件夹看到的集数顺序是乱的。
+    #[test]
+    fn scan_folder_impl_sorts_episodes_naturally() {
+        let dir = scratch("folder-natural");
+        for n in ["第10集.mp4", "第2集.mp4", "第1集.mp4", "第11集.mp4"] {
+            touch(&dir, n);
+        }
+        fs::write(dir.join("第2集.xml"), b"<i/>").unwrap();
+        let scan = scan_folder_impl(&s(&dir));
+        let names: Vec<&str> = scan.episodes.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["第1集.mp4", "第2集.mp4", "第10集.mp4", "第11集.mp4"],
+            "集数应按数值排序"
+        );
+        // 排序后弹幕配对不能跟着错位
+        assert_eq!(scan.episodes[1].danmaku.as_deref(), Some("第2集.xml"));
+        assert_eq!(scan.episodes[0].danmaku, None);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A5 单测辅助：按 natural_cmp 排序后取回名字。
+    fn natural_sorted(items: &[&str]) -> Vec<String> {
+        let mut v: Vec<String> = items.iter().map(|s| s.to_string()).collect();
+        v.sort_by(|a, b| natural_cmp(a, b));
+        v
+    }
+
+    /// A5 单测：集数按数值排，不能被纯字典序带偏。
+    #[test]
+    fn natural_cmp_orders_episode_numbers() {
+        assert_eq!(
+            natural_sorted(&["第10集.mp4", "第2集.mp4", "第1集.mp4"]),
+            vec!["第1集.mp4", "第2集.mp4", "第10集.mp4"]
+        );
+        // 纯字典序的反例：第10 会压在第1 前面，这里顺带确认期望值不是旧行为
+        let mut lex: Vec<&str> = vec!["第10集.mp4", "第2集.mp4", "第1集.mp4"];
+        lex.sort_by_key(|s| s.to_lowercase());
+        assert_eq!(lex[0], "第10集.mp4", "旧字典序反例变了，说明算例失效");
+    }
+
+    /// A5 单测：大小写不敏感，a 排在 B 前（旧实现 to_lowercase 后正好也这样，
+    /// 但这条防的是将来谁把 non-digit 段改成大小写敏感比较）。
+    #[test]
+    fn natural_cmp_is_case_insensitive() {
+        assert_eq!(natural_sorted(&["B.mp4", "a.mp4"]), vec!["a.mp4", "B.mp4"]);
+        assert_eq!(natural_cmp("A.mp4", "a.MP4"), Ordering::Equal);
+    }
+
+    /// A5 单测：数字段与非数字段交替时，逐段比较。
+    /// 期望：ep2b < ep02a（数值同为 2，前导零少的在前，再比 a/b）< ep10。
+    #[test]
+    fn natural_cmp_handles_mixed_digit_and_text_runs() {
+        assert_eq!(
+            natural_sorted(&["ep02a.mp4", "ep2b.mp4", "ep10.mp4"]),
+            vec!["ep2b.mp4", "ep02a.mp4", "ep10.mp4"]
+        );
+    }
+
+    /// A5 单测：前导零数值相同，排序必须确定、可重复且不 panic。
+    #[test]
+    fn natural_cmp_handles_leading_zeros_deterministically() {
+        let once = natural_sorted(&["01.mp4", "1.mp4", "001.mp4"]);
+        assert_eq!(once, vec!["1.mp4", "01.mp4", "001.mp4"]);
+        // 任意输入顺序都应得到同一结果（等值部分有显式 tie-break）
+        for order in [
+            ["001.mp4", "01.mp4", "1.mp4"],
+            ["01.mp4", "001.mp4", "1.mp4"],
+            ["1.mp4", "001.mp4", "01.mp4"],
+        ] {
+            assert_eq!(natural_sorted(&order), once, "输入顺序 {order:?} 结果不稳定");
+        }
+        // 超长数字段不能靠整数解析（这里 30 位，u64 会溢出）
+        assert_eq!(natural_cmp("a1.mp4", "a0000000000000000000000000001.mp4"), Ordering::Less);
+    }
+
+    /// A5 单测：纯中文无数字文件名仍然稳定有序，不能乱。
+    #[test]
+    fn natural_cmp_keeps_plain_chinese_names_stable() {
+        assert_eq!(
+            natural_sorted(&["附录.mp4", "反派 (下).mp4", "反派 (上).mp4"]),
+            vec!["反派 (上).mp4", "反派 (下).mp4", "附录.mp4"]
+        );
+        // 完全相等 → 稳定排序保持输入顺序（不 panic、不产生随机序）
+        assert_eq!(natural_sorted(&["同名.mp4", "同名.mp4"]), vec!["同名.mp4", "同名.mp4"]);
     }
 
     /// 回归：xml 优先于 json，基名忽略大小写，配不上返回 None（前端据此不显示弹幕）。

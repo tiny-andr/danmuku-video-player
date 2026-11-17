@@ -549,6 +549,193 @@ mod tests {
         p
     }
 
+    // ---- 合成 MKV 样本（不依赖外部素材，CI / 日常开发机都没有真片源） ----
+    //
+    // 下面这套构造器与安卓版同源（平台无关，只用标准库），让 Cues → seek →
+    // BlockGroup 解析这整条链路在没有真片源时也能真跑一遍。
+
+    /// 最少字节的大端编码（元素 ID 用）。
+    fn id_bytes(id: u64) -> Vec<u8> {
+        let be = id.to_be_bytes();
+        let start = be.iter().position(|&b| b != 0).unwrap_or(7);
+        be[start..].to_vec()
+    }
+
+    /// 固定宽度的 EBML 尺寸 vint（含长度标记位）。
+    fn size_vint(width: usize, n: u64) -> Vec<u8> {
+        let mut v = n | (1u64 << (7 * width));
+        let mut out = vec![0u8; width];
+        for i in (0..width).rev() {
+            out[i] = (v & 0xFF) as u8;
+            v >>= 8;
+        }
+        out
+    }
+
+    /// 最短形式的尺寸 vint。
+    fn vint_size(n: u64) -> Vec<u8> {
+        let mut width = 1usize;
+        while n >= (1u64 << (7 * width)) {
+            width += 1;
+        }
+        size_vint(width, n)
+    }
+
+    fn el(id: u64, payload: &[u8]) -> Vec<u8> {
+        let mut out = id_bytes(id);
+        out.extend(vint_size(payload.len() as u64));
+        out.extend_from_slice(payload);
+        out
+    }
+
+    /// 位置类字段固定 8 字节：两遍构建（占位/真实位置）之间元素长度必须一致，
+    /// 否则 SeekHead 里写死的 Cues 偏移会跟着长度变化而错位。
+    fn uint8(value: u64) -> Vec<u8> {
+        value.to_be_bytes().to_vec()
+    }
+
+    /// EBML 的 uint 类元素（CueTrack / ClusterTimestamp / BlockDuration……）是不带长度
+    /// 标记的裸大端整数，跟 vint 完全不同 —— 用 vint 编码会让 read_uint 读出 0x81 这种错值。
+    fn uint_min(value: u64) -> Vec<u8> {
+        let be = value.to_be_bytes();
+        let start = be.iter().position(|&b| b != 0).unwrap_or(7);
+        be[start..].to_vec()
+    }
+
+    const TRACK_SRT: u32 = 1;
+    const TRACK_ASS: u32 = 2;
+
+    /// Block/SimpleBlock 负载：track vint + 相对时间戳(i16) + flags(无 lacing) + 文本
+    fn block_payload(track: u32, rel_ms: i16, text: &[u8]) -> Vec<u8> {
+        let mut p = vint_size(track as u64);
+        p.extend_from_slice(&rel_ms.to_be_bytes());
+        p.push(0);
+        p.extend_from_slice(text);
+        p
+    }
+
+    fn block_group(track: u32, rel_ms: i16, text: &[u8], duration_ms: Option<u64>) -> Vec<u8> {
+        let mut inner = Vec::new();
+        if let Some(d) = duration_ms {
+            inner.extend(el(ID_BLOCK_DURATION, &uint_min(d)));
+        }
+        inner.extend(el(ID_BLOCK, &block_payload(track, rel_ms, text)));
+        el(ID_BLOCK_GROUP, &inner)
+    }
+
+    /// 返回 (Cluster 元素字节, 每个 block 相对 Cluster 数据区的偏移)
+    fn cluster_element(groups: &[(u32, i16, &[u8], Option<u64>)]) -> (Vec<u8>, Vec<u64>) {
+        let mut data = el(ID_CLUSTER_TS, &uint_min(1000));
+        let mut offsets = Vec::new();
+        for (track, rel, text, dur) in groups {
+            offsets.push(data.len() as u64);
+            data.extend(block_group(*track, *rel, text, *dur));
+        }
+        let cluster = el(ID_CLUSTER, &data);
+        // CueRelativePosition 是相对 Cluster **数据区**（元素头之后）的偏移
+        (cluster, offsets)
+    }
+
+    fn cue_point(track: u32, time: u64, cluster_pos: u64, relative: Option<u64>) -> Vec<u8> {
+        let mut ctps = Vec::new();
+        ctps.extend(el(ID_CUE_TRACK, &uint_min(track as u64)));
+        ctps.extend(el(ID_CUE_CLUSTER, &uint8(cluster_pos)));
+        if let Some(r) = relative {
+            ctps.extend(el(ID_CUE_REL, &uint8(r)));
+        }
+        let mut point = el(ID_CUE_TIME, &uint_min(time));
+        point.extend(el(ID_CUE_TRACK_POS, &ctps));
+        el(ID_CUE_POINT, &point)
+    }
+
+    fn seek_head(cues_pos: u64) -> Vec<u8> {
+        let mut seek = el(ID_SEEK_ID, CUE_BYTES);
+        seek.extend(el(ID_SEEK_POS, &uint8(cues_pos)));
+        el(ID_SEEK_HEAD, &el(ID_SEEK, &seek))
+    }
+
+    fn cues_element(cluster_pos: u64, rels: &[u64], with_relative: bool) -> Vec<u8> {
+        let mut body = Vec::new();
+        body.extend(cue_point(TRACK_SRT, 1000, cluster_pos, with_relative.then_some(rels[0])));
+        body.extend(cue_point(TRACK_ASS, 2000, cluster_pos, with_relative.then_some(rels[1])));
+        el(ID_CUES, &body)
+    }
+
+    /// 最小可解析 MKV：EBML 头 + Segment{ Info(TimestampScale=1e6), SeekHead(Cues),
+    /// Cues(两条轨各一个 CuePoint), Cluster(字幕块) }。
+    /// Cluster 放在文件末尾，Cues 的 CueClusterPosition 指向它；
+    /// `with_relative=false` 时故意不写 CueRelativePosition（fail-closed 用例）。
+    fn build_mkv(with_relative: bool) -> Vec<u8> {
+        let info = el(ID_INFO, &el(ID_TIMESTAMP_SCALE, &[0x0F, 0x42, 0x40]));
+        // 同一个 Cluster 里两条轨各一条字幕：SRT 轨带 BlockDuration，ASS 轨不带（走下一条推算）
+        let (cluster, offsets) = cluster_element(&[
+            (TRACK_SRT, 0, b"hello", Some(4000)),
+            (TRACK_ASS, 1000, b"0,0,Default,,0,0,0,,{\\an8}hi, there", None),
+        ]);
+
+        // 两遍构建：Cues 里要写 Cluster 相对位置，SeekHead 里要写 Cues 相对位置。
+        // 位置字段固定 8 字节，所以第二遍的元素长度与第一遍完全相同。
+        // 这条断言钉的就是「位置字段固定 8 字节」这个前提：一旦有人把 uint8 改成
+        // 最短编码，两遍长度会不同，SeekHead 里写死的 Cues 偏移就会错位。
+        let seek_head_len = seek_head(0).len();
+        let cues_pos = info.len() + seek_head_len;
+        let cues_len = cues_element(0, &offsets, with_relative).len();
+        let cluster_pos = (cues_pos + cues_len) as u64;
+        let cues = cues_element(cluster_pos, &offsets, with_relative);
+        let seek = seek_head(cues_pos as u64);
+        assert_eq!(cues.len(), cues_len, "Cues 两遍构建长度必须一致");
+        assert_eq!(seek.len(), seek_head_len, "SeekHead 两遍构建长度必须一致");
+
+        let mut seg_data = Vec::new();
+        seg_data.extend(info);
+        seg_data.extend(seek);
+        seg_data.extend(cues);
+        seg_data.extend(cluster);
+        let mut out = el(0x1A45_DFA3, &[0x42, 0x86, 0x81, 0x01]); // EBML
+        out.extend(el(ID_SEGMENT, &seg_data));
+        out
+    }
+
+    /// 端到端：真解析 Info/SeekHead/Cues → 按 CueClusterPosition + CueRelativePosition
+    /// seek 到 Cluster → 解 BlockGroup → 拼 SRT（SRT 轨 + ASS 轨各一条）。
+    /// 桌面版最核心的性能路径（稀疏抽取）以前只有靠环境变量喂真片源才跑得到，
+    /// CI 和日常 `cargo test` 永远覆盖不到；这条测试把它变成默认回归。
+    #[test]
+    fn synthetic_mkv_sparse_extract_srt_and_ass() {
+        let path = temp_mkv_path("synthetic");
+        std::fs::write(&path, build_mkv(true)).unwrap();
+
+        let srt = sparse_extract_srt(&path, TRACK_SRT, false)
+            .unwrap_or_else(|e| panic!("SRT 轨稀疏抽取失败：{e}"));
+        // 起点 = ClusterTimestamp(1000) + Block 相对时间(0)；
+        // 结束 = BlockDuration(4000) → 5000。这是桌面实现的精确输出。
+        assert_eq!(srt, "1\n00:00:01,000 --> 00:00:05,000\nhello\n\n");
+
+        let ass = sparse_extract_srt(&path, TRACK_ASS, true)
+            .unwrap_or_else(|e| panic!("ASS 轨稀疏抽取失败：{e}"));
+        // 无 BlockDuration → 结束时间按桌面 sparse_extract_srt 里的兜底规则
+        // （没有下一条 cue 时用「起点 + 2000」）→ 4000。
+        // ASS 的 `{\an8}` 覆盖标签已剥掉，正文里的逗号保留。
+        assert_eq!(ass, "1\n00:00:02,000 --> 00:00:04,000\nhi, there\n\n");
+
+        // Cues 里没有的轨必须 Err（不能返回空 SRT 让前端以为成功）
+        let other = sparse_extract_srt(&path, 9, false);
+        assert!(other.is_err(), "不存在的轨不该抽取成功：{other:?}");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// 缺 CueRelativePosition 时整轨 Err，不能退化成顺序扫（退化的代价是整片读取，
+    /// 而且读失败还会产出半份字幕）。
+    #[test]
+    fn synthetic_mkv_without_relative_position_is_fail_closed() {
+        let path = temp_mkv_path("no_rel");
+        std::fs::write(&path, build_mkv(false)).unwrap();
+        let err = sparse_extract_srt(&path, TRACK_SRT, false).expect_err("缺 CueRelativePosition 必须整轨 Err");
+        let _ = std::fs::remove_file(&path);
+        assert!(err.contains("CueRelativePosition"), "错误要指明原因，实际：{err}");
+    }
+
     /// BlockGroup 里的 Block 与 SimpleBlock 的 flags 布局相同，带 lacing 时正文前面是
     /// lace 头。以前只拒绝了 SimpleBlock 的 lacing，BlockGroup 这条会把 lace 头当字幕字节。
     #[test]
