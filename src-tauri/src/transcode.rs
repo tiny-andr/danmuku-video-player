@@ -308,9 +308,21 @@ fn ffmpeg_header() -> Vec<String> {
 /// 慢的代价是用户干等，比重一点 IO 更难受。
 /// -ac 2 是硬要求：TrueHD/DTS-HD 常见 8 声道，原样编成 8ch AAC 时 WebView2（Media
 /// Foundation）解码上限只有 6 声道，7.1 会静音 —— 转了等于没转。立体声足够，192k 已富余。
-fn ffmpeg_audio_args(src: &Path, audio_index: usize, out: &Path, limit_secs: Option<u64>) -> Vec<String> {
+///
+/// `copy=true` 用于「内核本来就解得了、用户只是想换一条听」的轨道（多音轨片子里的
+/// AC-3 / E-AC-3 / PCM）：直接 `-c:a copy` 抽进 mka，不重编码。理由有两条 ——
+/// 一是重编码会把 5.1 压成立体声（上面 -ac 2 那条约束），用户切个语言反而降质；
+/// 二是抽轨仍要顺序读完整个文件（音轨块遍布每个 cluster），IO 不可避免，但能省掉
+/// 编码的 CPU 和时间。真解不了的轨（DTS/TrueHD…）必须走转码，`copy` 会给到它们吗？
+/// 不会：调用方按 `isDeadCodec` 决定，见前端 ensureAudioTrack。
+fn ffmpeg_audio_args(src: &Path, audio_index: usize, out: &Path, limit_secs: Option<u64>, copy: bool) -> Vec<String> {
     let mut a = ffmpeg_header();
-    a.extend(["-i".into(), src.to_string_lossy().into_owned(), "-map".into(), format!("0:a:{audio_index}"), "-c:a".into(), "aac".into(), "-ac".into(), "2".into(), "-b:a".into(), "192k".into()]);
+    a.extend(["-i".into(), src.to_string_lossy().into_owned(), "-map".into(), format!("0:a:{audio_index}")]);
+    if copy {
+        a.extend(["-c:a".into(), "copy".into()]);
+    } else {
+        a.extend(["-c:a".into(), "aac".into(), "-ac".into(), "2".into(), "-b:a".into(), "192k".into()]);
+    }
     if let Some(s) = limit_secs {
         a.push("-t".into());
         a.push(s.to_string());
@@ -550,17 +562,26 @@ pub async fn transcode_audio_start(
     video_path: String,
     audio_index: usize,
     duration_us: Option<u64>,
+    copy_audio: Option<bool>,
 ) -> Result<String, String> {
-    crate::blocking::blocking(move || transcode_audio_start_impl(&app, video_path, audio_index, duration_us))
-        .await?
+    let copy = copy_audio.unwrap_or(false);
+    crate::blocking::blocking(move || {
+        transcode_audio_start_impl(&app, video_path, audio_index, duration_us, copy)
+    })
+    .await?
 }
 
 /// 实现体：参数只有 AppHandle（发事件/取状态用），其余全是普通类型。
+///
+/// `copy_audio`：这条轨内核本来就解得开（多音轨片子里用户只是想换一条听），
+/// 用 `-c copy` 抽进 mka 而不是转 AAC —— 避免把 5.1 压成立体声。
+/// 传 false/None 就是原来的「转 AAC 2ch 192k」路径。
 fn transcode_audio_start_impl(
     app: &AppHandle,
     video_path: String,
     audio_index: usize,
     duration_us: Option<u64>,
+    copy_audio: bool,
 ) -> Result<String, String> {
     let src = PathBuf::from(&video_path);
     if !src.is_file() {
@@ -573,7 +594,7 @@ fn transcode_audio_start_impl(
         JobSpec {
             slot: Slot::Audio,
             video: video_path,
-            args: ffmpeg_audio_args(&src, audio_index, &tmp, None),
+            args: ffmpeg_audio_args(&src, audio_index, &tmp, None, copy_audio),
             outputs: vec![(tmp, out)],
             duration_us,
         },
@@ -899,7 +920,7 @@ mod tests {
         let src_path = Path::new(&src);
         let args = match sub_index {
             Some(i) => ffmpeg_sub_args(src_path, &[(i, PathBuf::from(&out))]),
-            None => ffmpeg_audio_args(src_path, 0, Path::new(&out), None),
+            None => ffmpeg_audio_args(src_path, 0, Path::new(&out), None, false),
         };
         // 字幕轨开头经常没有对白，窗口放大到 10 分钟
         let limit = if sub_index.is_some() { 600 } else { 30 };

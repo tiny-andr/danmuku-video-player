@@ -1,6 +1,6 @@
 [package]
 name = "danmuku-video-player"
-version = "1.2.8"
+version = "1.2.9"
 description = "Danmuku Video Player 本地视频 + 弹幕播放器（桌面版）"
 edition = "2021"
 
@@ -19,6 +19,7 @@ rfd = "0.15"
 # PGS（蓝光位图字幕）：纯 Rust 的 MKV/SUP 抽取 + RLE 解码，按 Cues 索引只读字幕块
 libpgs = "0.6"
 png = "0.17"
+tauri-plugin-single-instance = "2"
 
 # ffmpeg 子进程绑进 Job Object：父进程被强杀时内核连带杀掉它们，不留孤儿
 [target.'cfg(windows)'.dependencies]

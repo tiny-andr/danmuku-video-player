@@ -741,14 +741,22 @@
     for (var i = 0; i < list.length; i++) removeToast(list[i]);
   }
 
+  // 通知显示时长统一缩放（2026-11-17 用户要求：全部缩短到原来的 60%）。
+  // 只改这个系数、不去动 30 多个调用点的 4000/6000/8000 字面量：以后新加的提示
+  // 自动跟随，也不会漏掉某一条；反过来改一个字面量就等于同时改了两处语义。
+  var TOAST_SCALE = 0.6;
+
   function toast(msg, ms) {
-    var dur = ms || 2600;
+    // 取整：0.6 是二进制浮点，2600*0.6 会算出 1560.0000000000002，直接拼进
+    // transition 字符串里会变成 "width 1560.0000000000002ms"。
+    var dur = Math.round((ms || 2600) * TOAST_SCALE);
     // 长提示按阅读速度给足时间（约 4 字/秒，上限 20 秒）；读得快的人用右上角 × 直接关掉。
+    // 这里的加时公式也要跟着缩放，否则长提示反而比改之前待得更久。
     var len = String(msg || '').length;
     if (len > 20) {
-      dur = Math.max(dur * 2, 1500 + len * 250);
+      dur = Math.max(dur * 2, Math.round((1500 + len * 250) * TOAST_SCALE));
     }
-    var total = Math.min(dur, 20000);
+    var total = Math.min(dur, Math.round(20000 * TOAST_SCALE));
 
     var alive = liveToasts();
     while (alive.length >= TOAST_MAX) removeToast(alive.shift());
@@ -2027,11 +2035,15 @@
       };
     }
 
-    // 音轨菜单入口的显示条件。不能只看「有没有死编码轨」：双 AAC 文件没有死编码轨，
-    // 但内核会播错轨 —— 这种文件更需要入口，否则用户连当前挂的是哪条轨都看不到。
+    // 音轨菜单入口的显示条件。三件事各自都足以让用户需要这个入口：
+    // 1) 有死编码轨（DTS/TrueHD/PCM…）：必须转码才有声；
+    // 2) pin：默认轨内核解不了、或者内核会跳过它去播别的轨（双 AAC 常见），必须接管；
+    // 3) **不止一条音轨**：哪怕每条都能直解、默认轨也选对了（5 条全 AC-3 的片子就是
+    //    这种），用户照样会想换一条语言听 —— 没入口等于告诉他"这文件只有一条轨"。
+    //    第 3 条以前漏了，所以多音轨全 AC-3 的片子里音轨按钮根本不出现。
     function needsAudioEntry(tracks) {
       var c = classifyAudio(tracks);
-      return c.count > 0 && (c.dead > 0 || c.pin);
+      return c.count > 1 || (c.count > 0 && (c.dead > 0 || c.pin));
     }
 
     // 音轨链路诊断：结果累积在 window.__bplayerDiag，出问题时可从 DevTools 直接读
@@ -2129,14 +2141,22 @@
           audioJob.video = normPath(path);
           audioJob.ordinal = ordinal;
           updatePill('audio', -1, 0);
-          invoke('transcode_audio_start', { videoPath: path, audioIndex: audioIdx, durationUs: durationUs || null }).then(function () {
+          // 内核本来就解得开的轨（AC-3 / E-AC-3 / PCM…）用 -c copy 抽进 mka：走 AAC 转码
+          // 会被 -ac 2 压成立体声，用户只是想换个语言听，不该顺手降质。真解不了的轨
+          // （DTS / TrueHD…）才必须转码。
+          // probeTracks 在探测失败/换片途中可能是 null，取 codec 前必须判空
+          var trackCodec = (probeTracks && probeTracks[audioIdx]) ? String(probeTracks[audioIdx].codec || '').toUpperCase() : '';
+          var copyAudio = !!trackCodec && !isDeadCodec(trackCodec);
+          invoke('transcode_audio_start', { videoPath: path, audioIndex: audioIdx, durationUs: durationUs || null, copyAudio: copyAudio }).then(function () {
             // 同一条启动请求也可能晚回：只有这次启动的（片, 轨道）还占着记账位才算数，
             // 否则会给已经换掉的轨道弹一条「正在转换」。
             if (audioJob.video === normPath(path) && audioJob.ordinal === ordinal) {
+              // reason 为 undefined 是"多音轨里用户手动选了一条能直解的轨"，不是解码失败：
+              // 提示要说清楚是在提取，不能沿用"本内核无法解码"那套文案。
               var why2 = reason === 'pin'
                 ? '（' + label + '）是默认音轨，但本内核会跳过它'
-                : '（' + label + '）本内核无法解码';
-              toast('音轨' + ordinal + why2 + '，正在后台转换为 AAC 外挂音轨', 6000);
+                : (reason === 'dead' ? '（' + label + '）本内核无法解码' : '（' + label + '）');
+              toast('音轨' + ordinal + why2 + '，正在后台' + (copyAudio ? '提取为外挂音轨' : '转换为 AAC 外挂音轨'), 6000);
             }
           }).catch(function (e) {
             // 换片 / 片内换轨之后，这次启动失败才回来：记账位已经属于别的任务，
@@ -3456,6 +3476,27 @@
     // 转码进度/完成/失败事件（Rust 侧 ffmpeg 工作线程发出）。
     // 后端有 audio / subtitle 两个独立槽，事件必须按 kind 分流到各自的记账位，
     // 否则一个槽的收尾会把另一个槽还在跑的任务当成过期事件丢掉。
+    // ---- 从命令行 / 文件关联打开 ----
+    // Windows 的「打开方式」、双击关联文件，本质都只是把路径塞进新进程的 argv。
+    // 两条路都要接，因为前端就绪状态不同：
+    //   - 首次启动：后端在 setup 里已经把路径存进 state（那时前端还没加载完，
+    //     emit 会丢），所以这里启动后主动取一次；
+    //   - 程序已经开着：单实例插件把第二实例的 argv 转发给第一实例并 emit 事件。
+    // 两路都收敛到 desktopLoadVideo，和点「打开视频」走完全同一条路径，
+    // 顺序、归属校验、续播提示都自动沿用。
+    function openFromCommandLine(path) {
+      if (!path) return;
+      Promise.resolve(desktopLoadVideo(path, null)).catch(function (e) {
+        toast('打开视频失败：' + clipName(String(e), 40), 7000);
+      });
+    }
+    T.event.listen('bplayer://open-file', function (ev) {
+      if (typeof ev.payload === 'string') openFromCommandLine(ev.payload);
+    });
+    invoke('take_open_file').then(openFromCommandLine).catch(function (e) {
+      diag('open-file-err', { err: String(e) }); // 老版本后端没有这个命令：忽略，不影响正常启动
+    });
+
     T.event.listen('transcode://progress', function (ev) {
       var p = ev.payload || {};
       var vid = p.video ? normPath(p.video) : '';

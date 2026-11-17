@@ -22,6 +22,7 @@ Tauri 2 桌面播放器：打开本机视频，自动配同目录的弹幕 XML �
 | `src-tauri/src/pgs_render.rs` | libpgs 解码 PGS 位图 → base64 PNG |
 | `src-tauri/src/subtitle_text.rs` | 外挂字幕（srt/vtt/ass/ssa）纯 Rust → SRT，**不依赖 ffmpeg** |
 | `src-tauri/src/blocking.rs` | `blocking()`：把阻塞 IO 丢进 spawn_blocking 线程池，命令薄壳统一用它 |
+| `src-tauri/src/open_file.rs` | 从命令行参数/文件关联打开视频：argv 解析、待打开文件 state、`take_open_file` 命令、`bplayer://open-file` 事件 |
 | `src-tauri/src/transcode.rs` | 音轨转码、字幕抽取兜底、audio/subtitle 双任务槽、Job Object |
 | `src-tauri/src/autostart.rs` | 注册表 `Run` 项自启动 |
 
@@ -45,7 +46,7 @@ Start-Process 'src-tauri\target\release\danmuku-video-player.exe'
 注意：`document.getElementById('someRange').value` 在面板**没打开过**时读到的是 HTML 初始值，不是运行时配置。验证默认值必须先把面板打开。
 
 ```powershell
-cargo test --lib                     # Rust 单测 58 条，含合成的 MKV / SUP 端到端
+cargo test --lib                     # Rust 单测 65 条，含合成的 MKV / SUP 端到端、argv 解析
 npm run test:audio                   # 前端选轨决策单测（从 index.html 抠真函数跑，不依赖程序）
 ```
 
@@ -69,7 +70,7 @@ $env:SPARSE_TEST_SRC='<mkv>'; $env:SPARSE_TEST_TRACK='9'; $env:SPARSE_TEST_ASS='
 
 **音频规则（用户明确要求过两次）**：不管能不能转，**只能读默认音轨**；默认轨解不了就静音。Chromium 的真实行为是"挑第一条能解的"，不是播默认轨——所以 `classifyAudio()` 算出的 `pin`（`firstPlayable !== audioIndex`）为真时必须强制隔离并静音原轨，否则会放出一条没人要的评论轨。
 
-**`pin` 优先于"编码都能解"**：双 AAC 文件（默认标在第二条）没有任何死编码轨，但内核照样会播错。所以 `handleAudioCodecs()` 的提前返回必须写在 `pin` 之后，音轨菜单入口用 `needsAudioEntry()`（`dead > 0 || pin`）而不是"有没有死编码轨"。改动这块逻辑跑 `npm run test:audio` 回归。
+**`pin` 优先于"编码都能解"**：双 AAC 文件（默认标在第二条）没有任何死编码轨，但内核照样会播错。所以 `handleAudioCodecs()` 的提前返回必须写在 `pin` 之后。入口判据见下面「音轨入口与切轨」，改动这块逻辑跑 `npm run test:audio` 回归。
 
 **外挂字幕不依赖 ffmpeg**：`subtitle_text.rs` 自己解析 srt/vtt/ass/ssa（编码探测走 `MultiByteToWideChar` 的 936 代码页）。**安装包不带 ffmpeg** —— `target/release` 里没有 `ffmpeg.exe`，`tauri.conf.json` 也没配 `resources`/`externalBin`，只有开发机 PATH 恰好有才work。任何"外挂字幕走 ffmpeg"的写法等于干净安装的机器上一个外挂字幕都挂不上。ffmpeg 只留给 `subtitle_text` 认不出来的格式兜底。
 
@@ -88,7 +89,7 @@ $env:SPARSE_TEST_SRC='<mkv>'; $env:SPARSE_TEST_TRACK='9'; $env:SPARSE_TEST_ASS='
 
 **读文件一律走 `read_capped`**：`MAX_READ_BYTES = 64 MB`，`read_text` / `read_bytes` / `pair_danmaku` / `subtitle_text::to_srt` / ffmpeg 字幕 stdout 全走它。新增任何"整读进内存"的路径也必须走——一个几 GB 的损坏 .xml/.ass 能把进程 OOM 掉（不是报错，是进程直接消失）。弹幕路径超限按「没有弹幕」静默处理，文本/字幕路径返回 Err 给 toast。
 
-**单实例**：`single_instance.rs` 用命名互斥量（`Local\danmuku-video-player-single-instance`）拦第二个实例，必须在 `run()` 最前面调，第二个实例连 webview 都不建就 `exit(0)`。放行条件是 `CreateMutexW` 返回 null 时 fail-open——宁可两实例，也不能让播放器打不开。两个实例同时对同一片转码，会让两个 ffmpeg 写同一个 `.tmp.mka`。
+**单实例 + 命令行打开**：用官方 `tauri-plugin-single-instance`（2.5.x），**必须注册成第一个 plugin**（`run()` 里 `.plugin(...)` 写在最前），第二个实例才会在 webview 创建前被拦下，不会先闪窗口、也不会抢 WebView2 用户数据目录。**不要退回手写命名互斥量**：手写版只能 `exit(0)`，用户双击另一个视频等于什么都没发生；插件会用 `WM_COPYDATA` 把第二个进程的 argv 转发给第一个实例。参数解析在 `open_file.rs::video_from_args`（只认 `VIDEO_EXTS` 里且**文件真实存在**的参数，跳过 `-`/`--` 开关）。两个入口：首次启动后端 `setup` 存 state、前端 `invoke('take_open_file')` 取（那时 webview 还没加载完，emit 必丢）；第二实例走 `stash` + emit `bplayer://open-file` 事件。Windows 没有 macOS 的 `RunEvent::Opened`，只能读 argv。`bundle.fileAssociations` 注册了 11 个视频扩展名。两个实例同时对同一片转码会让两份 ffmpeg 写同一个 `.tmp.mka`，这是单实例唯一的存在理由。
 
 **命令必须 async + 走 `blocking()`**：Tauri 2 的同步命令**不冻窗口消息循环**（实测 3 秒的 SMB `fs_stat` 期间窗口 Responding 一直 True），但**所有 invoke 共用一条串行通道** —— 同一时刻慢命令 2997 ms，并发发起的本地快命令也是 2997 ms；改成 async + `crate::blocking::blocking(...)` 后快命令 2 ms。所以凡是做文件 IO / 等子进程 / 目录遍历的命令都要这么写，否则一条 SMB 断连能把挂字幕、探音轨、刷进度全堵在后面几十秒。例外不用改：`pick_video`/`pick_folder`（rfd 模态对话框要在主线程）、`pgs_image`/`pgs_close`/`pgs_current`（纯内存）、`autostart`（注册表毫秒级）、`transcode_target`（纯计算）。
 
@@ -111,6 +112,8 @@ $env:SPARSE_TEST_SRC='<mkv>'; $env:SPARSE_TEST_TRACK='9'; $env:SPARSE_TEST_ASS='
 **字幕延时在 SRT 文本层做，不在 cue 对象上**：`mountSubtitleText` 把原文留档到 `subSourceText`，延时用 `shiftSrtTimes(text, deltaMs)` 整体位移时间戳后重建 blob 再 `switch()`。重建时**不要传 `name`**（Artplayer 会因此弹一条「切换字幕：xxx」notice）。原文必须留档，否则每拖一次延时就在已位移的文本上再位移一次，越拖越偏。
 
 **三类存档语义别混**：`bplayer_settings`（齿轮页开关，改动即存）、`bplayer_subtitle_style`（字幕样式，**只有点「保存」才写**，预览即时生效但不落盘、不跨片）、`bplayer_resume`（播放位置，自动 5 秒节流存、`ended` 删、30 天过期）。新增任何一个存档都要带 `ver` 字段并对字段做白名单回落。配套的 `subtitleManual` / `danmakuManual` 令牌：**只有非空的手动选择才置位** —— 取消对话框、空结果、关闭字幕、清空弹幕都不置位，否则自动匹配会永久失效。
+
+**音轨入口与切轨**：`needsAudioEntry()` = `count > 1 || (count > 0 && (dead > 0 || pin))` —— **「有多条可选」本身就是入口的理由**，不能只看「要不要修正」。只看 dead/pin 的后果：5 条全 AC-3、默认轨也对、内核能解的片子（多音轨国配片典型）音轨按钮根本不出现，用户以为文件只有一条轨（2026-11-17 实测）。注意「入口显示」和「要不要接管音频管线」是两件独立的事：同一部片可以 `audioPlan().native === true`（不用接管）却仍然必须给入口。手动切轨按编码分流：`isDeadCodec` 为假就 `-c copy` 抽进 mka（转 AAC 会被 `-ac 2` 把 5.1 压成立体声，用户只是换个语言听，不该顺手降质），为真才转 AAC。`ensureAudioTrack` 里读 `probeTracks[audioIdx].codec` **必须先判空**：探测失败/换片途中它是 null，而在 `fs_stat` 的异步回调里抛 ReferenceError 会被静默吞掉，表现成"点了没反应、胶囊卡在某个百分比"。
 
 **设置项改默认值**：`localStorage` 里已经存过的旧值会盖住新默认。凡是改默认值，必须同时升 `SETTINGS_VER` / `CONFIG_VER` / `DENSITY_VER` 并让旧存档（无版本号）回落到新默认，否则老用户看不到变化。
 

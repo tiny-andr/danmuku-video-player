@@ -84,11 +84,21 @@ const entryCases = [
   ['单 AAC 默认轨（无入口）', [A('A_AAC', true)], false],
   ['双 AAC 默认在第二条（必须给入口）', [A('A_AAC'), A('A_AAC', true)], true],
   ['单 DTS（有默认轨解不了，给入口）', [A('A_DTS', true)], true],
+  // 5 条全 AC-3、默认第 1 条：内核能解、也选对了（dead=0 且 pin=false），但用户就是
+  // 想换一条语言听。以前判据只有 dead/pin，这里返回 false —— 7.5 GB 的 5 音轨片子
+  // 连音轨按钮都不出现（2026-11-17 实测），用户根本无从切轨。
+  ['5 条全 AC-3（都能解、默认也对，仍要给入口）',
+    [A('A_AC3', true), A('A_AC3'), A('A_AC3'), A('A_AC3'), A('A_AC3')], true],
   ['无音轨', [], false],
 ];
 for (const [label, tracks, want] of entryCases) {
   check(`entry: ${label}`, needsAudioEntry(tracks), want);
 }
+
+// 「要不要显示入口」和「要不要接管音频管线」是两件独立的事：
+// 5 条 AC-3 不需要接管（内核自己就会选对轨，native 仍为 true），但仍然要给入口。
+check('plan: 5 条全 AC-3 仍交给内核',
+  audioPlan([A('A_AC3', true), A('A_AC3'), A('A_AC3'), A('A_AC3'), A('A_AC3')]).native, true);
 
 // ---- audioPlan：要不要接管（隔离原轨 + 转外挂 mka） ----
 check('plan: 单 AAC 交给内核', audioPlan([A('A_AAC', true)]), {

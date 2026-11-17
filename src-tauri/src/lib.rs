@@ -13,8 +13,8 @@ mod autostart;
 mod blocking;
 mod mkv_probe;
 mod mkv_sub;
+mod open_file;
 mod pgs_render;
-mod single_instance;
 mod subtitle_text;
 mod transcode;
 
@@ -510,15 +510,33 @@ fn app_version() -> String {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    // 单实例闸门必须在任何 Tauri 初始化之前：第二个实例连 webview 都不该建，
-    // 否则会先闪一个窗口再退出，还会和第一个实例抢同一个 WebView2 用户数据目录。
-    // 拦它的理由是转码 —— 两个实例对同一部片会各起一个 ffmpeg 写同一个
-    // `(音轨N).tmp.mka`，产物互相覆盖；关窗时的 cancel_all 也管不到对方进程。
-    single_instance::acquire_or_exit();
-
+    // 单实例 + 命令行参数转发交给官方插件（2.5.x）：
+    //   - 它内部同样用命名互斥量（`{identifier}-sim`）在 webview 创建前拦下第二个实例，
+    //     拦它的理由没变：两个实例对同一部片会各起一个 ffmpeg 写同一个 `(音轨N).tmp.mka`，
+    //     产物互相覆盖；关窗时的 cancel_all 也管不到对方进程。
+    //   - 关键差别是**它会用 WM_COPYDATA 把第二个进程的 argv 转发给第一个实例**。
+    //     以前手写的闸门只会静默 exit(0)，于是「程序已经开着时双击另一个视频」等于
+    //     什么都没发生 —— 那比不开还糟。插件失败时只 warn（互斥量建不出来也照样放行），
+    //     行为和原来手写版的 fail-open 一致。
+    //   - 必须注册成**第一个 plugin**：它要在其它插件初始化与 webview 创建之前跑完，
+    //     第二个实例才不会先闪一个窗口、也不会去抢 WebView2 的用户数据目录。
     tauri::Builder::default()
+        .plugin(tauri_plugin_single_instance::init(|app, argv, _cwd| {
+            // 第二实例带文件参数过来：存 state + 发事件，前端立刻换片。
+            if let Some(path) = open_file::video_from_args(argv) {
+                open_file::stash(app, path);
+            }
+            // 用户双击文件后必须有反应：把已有窗口捞到前台，别只是换个片却停在托盘后面。
+            if let Some(win) = app.get_webview_window("main") {
+                let _ = win.unminimize();
+                let _ = win.show();
+                let _ = win.set_focus();
+            }
+        }))
+        .manage(open_file::PendingOpen::default())
         .invoke_handler(tauri::generate_handler![
             app_version,
+            open_file::take_open_file,
             fs_stat,
             pair_danmaku,
             scan_folder,
@@ -555,6 +573,13 @@ pub fn run() {
                     "Danmuku Video Player v{} · 本地视频 + 弹幕播放器",
                     env!("CARGO_PKG_VERSION")
                 ));
+            }
+            // 首次启动：如果是从「打开方式」/文件关联拉起来的，文件路径就在自己的 argv 里。
+            // 这时 webview 还没加载完，emit 必然丢，所以只落 state，等前端初始化完
+            // 主动 invoke('take_open_file') 取走（第二实例走的是 stash + 事件那条路）。
+            if let Some(path) = open_file::video_from_args(std::env::args()) {
+                let state = app.state::<open_file::PendingOpen>();
+                *state.0.lock().unwrap_or_else(|e| e.into_inner()) = Some(path);
             }
             Ok(())
         })
