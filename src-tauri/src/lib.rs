@@ -9,6 +9,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use tauri::Manager;
 
+mod audio_stream;
 mod autostart;
 mod blocking;
 mod mkv_probe;
@@ -544,6 +545,10 @@ pub fn run() {
             read_bytes,
             scan_subtitles,
             probe_mkv_tracks,
+            audio_stream::audio_stream_start,
+            audio_stream::audio_stream_read,
+            audio_stream::audio_stream_stop,
+            audio_stream::audio_stream_state,
             transcode::transcode_target,
             transcode::transcode_audio_start,
             transcode::extract_subtitle_text,
@@ -562,6 +567,7 @@ pub fn run() {
             reveal_path,
             sidecar_cache_files
         ])
+        .manage(audio_stream::StreamState::default())
         .manage(transcode::JobState::default())
         .manage::<pgs_render::PgsState>(std::sync::Mutex::new(None))
         .setup(|app| {
@@ -574,7 +580,14 @@ pub fn run() {
                     env!("CARGO_PKG_VERSION")
                 ));
             }
-            // 首次启动：如果是从「打开方式」/文件关联拉起来的，文件路径就在自己的 argv 里。
+            // 随包分发的 ffmpeg 落在资源目录根（tauri.conf.json 的 bundle.resources
+            // 把它映射成 "ffmpeg.exe"）：干净机器 PATH 里没有 ffmpeg，不解析这个路径，
+            // 音轨转码在"干净安装"的机器上就完全不可用。
+            if let Ok(p) = app.path().resolve("ffmpeg.exe", tauri::path::BaseDirectory::Resource) {
+                if p.is_file() {
+                    transcode::set_bundled_ffmpeg(p);
+                }
+            }            // 首次启动：如果是从「打开方式」/文件关联拉起来的，文件路径就在自己的 argv 里。
             // 这时 webview 还没加载完，emit 必然丢，所以只落 state，等前端初始化完
             // 主动 invoke('take_open_file') 取走（第二实例走的是 stash + 事件那条路）。
             if let Some(path) = open_file::video_from_args(std::env::args()) {
@@ -586,7 +599,9 @@ pub fn run() {
         .on_window_event(|window, event| {
             // 关窗即杀所有后台子进程（音轨槽 + 字幕槽），不让 ffmpeg 变孤儿
             if let tauri::WindowEvent::Destroyed = event {
-                window.app_handle().state::<transcode::JobState>().cancel_all();
+                let app = window.app_handle();
+                app.state::<transcode::JobState>().cancel_all();
+                audio_stream::shutdown(app);
             }
         })
         .run(tauri::generate_context!())

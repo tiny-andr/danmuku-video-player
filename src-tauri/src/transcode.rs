@@ -23,7 +23,7 @@ use std::os::windows::process::CommandExt;
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 /// 统一的子进程外壳：Windows 上隐藏控制台窗口。
-fn hidden_command(program: impl AsRef<std::ffi::OsStr>) -> Command {
+pub(crate) fn hidden_command(program: impl AsRef<std::ffi::OsStr>) -> Command {
     let mut cmd = Command::new(program);
     #[cfg(windows)]
     cmd.creation_flags(CREATE_NO_WINDOW);
@@ -34,7 +34,7 @@ fn hidden_command(program: impl AsRef<std::ffi::OsStr>) -> Command {
 // 任务管理器强杀），内核都会连带杀掉 job 里的 ffmpeg。光靠 window 事件回调不够 ——
 // 强杀时回调根本不执行，ffmpeg 会变孤儿继续占磁盘 IO 转两分钟。
 #[cfg(windows)]
-mod job {
+pub(crate) mod job {
     use std::process::Child;
     use std::sync::OnceLock;
     use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
@@ -83,7 +83,7 @@ mod job {
     }
 }
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter, Manager};
 
@@ -268,8 +268,25 @@ pub fn is_cache_name(name: &str) -> bool {
     }
 }
 
-/// ffmpeg 定位：exe 同目录优先，其次 PATH。
-fn find_ffmpeg() -> Result<PathBuf, String> {
+/// 随安装包分发的 ffmpeg 路径。
+///
+/// Tauri 的 resource_dir 只能在 AppHandle 上解析，而 find_ffmpeg 会被没有 AppHandle 的
+/// 辅助函数调用（字幕兜底、单元测试），所以启动时解析一次存这里。
+/// 干净机器的 PATH 里没有 ffmpeg，只有这份能用 —— 不打进安装包的后果是
+/// "干净安装之后一条死编码音轨都转不了"。
+static BUNDLED_FFMPEG: OnceLock<PathBuf> = OnceLock::new();
+
+pub fn set_bundled_ffmpeg(p: PathBuf) {
+    let _ = BUNDLED_FFMPEG.set(p);
+}
+
+/// ffmpeg 定位：随包分发的优先，其次 exe 同目录，最后 PATH。
+pub(crate) fn find_ffmpeg() -> Result<PathBuf, String> {
+    if let Some(p) = BUNDLED_FFMPEG.get() {
+        if p.is_file() {
+            return Ok(p.clone());
+        }
+    }
     if let Ok(exe) = std::env::current_exe() {
         let sibling = exe.parent().map(|d| d.join("ffmpeg.exe")).unwrap_or_default();
         if sibling.is_file() {
@@ -403,7 +420,7 @@ fn pump_progress(
 }
 
 /// 收集 stderr 全文（错误场景只取最后一行展示）。
-fn drain_stderr(stderr: ChildStderr) -> String {
+pub(crate) fn drain_stderr(stderr: ChildStderr) -> String {
     let mut tail = String::new();
     for line in BufReader::new(stderr).lines().flatten() {
         if tail.len() > 4000 {
@@ -415,7 +432,7 @@ fn drain_stderr(stderr: ChildStderr) -> String {
     tail
 }
 
-fn last_err_line(tail: &str) -> String {
+pub(crate) fn last_err_line(tail: &str) -> String {
     let msg = tail.lines().last().unwrap_or("").trim();
     if msg.is_empty() {
         "ffmpeg 异常退出".into()

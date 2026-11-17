@@ -24,6 +24,7 @@ Tauri 2 桌面播放器：打开本机视频，自动配同目录的弹幕 XML �
 | `src-tauri/src/blocking.rs` | `blocking()`：把阻塞 IO 丢进 spawn_blocking 线程池，命令薄壳统一用它 |
 | `src-tauri/src/open_file.rs` | 从命令行参数/文件关联打开视频：argv 解析、待打开文件 state、`take_open_file` 命令、`bplayer://open-file` 事件 |
 | `src-tauri/src/transcode.rs` | 音轨转码、字幕抽取兜底、audio/subtitle 双任务槽、Job Object |
+| `src-tauri/src/audio_stream.rs` | 流式音轨：ffmpeg 从 seek 点编 fMP4 写管道，按 fragment 切块交给前端 MSE（pull 模式） |
 | `src-tauri/src/autostart.rs` | 注册表 `Run` 项自启动 |
 
 ## 3. 构建与验证
@@ -46,7 +47,7 @@ Start-Process 'src-tauri\target\release\danmuku-video-player.exe'
 注意：`document.getElementById('someRange').value` 在面板**没打开过**时读到的是 HTML 初始值，不是运行时配置。验证默认值必须先把面板打开。
 
 ```powershell
-cargo test --lib                     # Rust 单测 65 条，含合成的 MKV / SUP 端到端、argv 解析
+cargo test --lib                     # Rust 单测 74 条，含合成的 MKV / SUP 端到端、argv 解析
 npm run test:audio                   # 前端选轨决策单测（从 index.html 抠真函数跑，不依赖程序）
 ```
 
@@ -72,7 +73,7 @@ $env:SPARSE_TEST_SRC='<mkv>'; $env:SPARSE_TEST_TRACK='9'; $env:SPARSE_TEST_ASS='
 
 **`pin` 优先于"编码都能解"**：双 AAC 文件（默认标在第二条）没有任何死编码轨，但内核照样会播错。所以 `handleAudioCodecs()` 的提前返回必须写在 `pin` 之后。入口判据见下面「音轨入口与切轨」，改动这块逻辑跑 `npm run test:audio` 回归。
 
-**外挂字幕不依赖 ffmpeg**：`subtitle_text.rs` 自己解析 srt/vtt/ass/ssa（编码探测走 `MultiByteToWideChar` 的 936 代码页）。**安装包不带 ffmpeg** —— `target/release` 里没有 `ffmpeg.exe`，`tauri.conf.json` 也没配 `resources`/`externalBin`，只有开发机 PATH 恰好有才work。任何"外挂字幕走 ffmpeg"的写法等于干净安装的机器上一个外挂字幕都挂不上。ffmpeg 只留给 `subtitle_text` 认不出来的格式兜底。
+**ffmpeg 随安装包分发（1.3.0 起）**：`src-tauri/resources/ffmpeg.exe` 是裁剪到 3.31 MiB 的 LGPL 构建（只留音频链：13 个音频解码器 + AAC 编码 + 5 个解封装 + 4 个封装；无视频编解码、无网络、无字幕解码、无 zlib），`tauri.conf.json` 的 `bundle.resources` 把它映射到安装目录根。`find_ffmpeg()` 定位顺序是 **随包分发 → exe 同目录 → PATH**：启动时 `setup` 用 `BaseDirectory::Resource` 解析一次存进 `transcode::BUNDLED_FFMPEG`（`OnceLock`），因为 `find_ffmpeg` 会被没有 AppHandle 的辅助函数调用。不打包的后果是干净机器 PATH 里没有 ffmpeg，音轨转码整个不可用。**外挂字幕仍然不走 ffmpeg**：`subtitle_text.rs` 自己解析 srt/vtt/ass/ssa（编码探测走 `MultiByteToWideChar` 的 936 代码页），ffmpeg 只留给它认不出来的格式兜底 —— 别把字幕路径改成依赖 ffmpeg。
 
 **删文件前先精确匹配**：`clean_sidecar_tmp()` 只认 `` {stem} (音轨N).tmp.mka `` / `` {stem} (字幕N).tmp.srt ``（`is_our_sidecar_tmp`）。**不要退回「基名前缀 + 含 `.tmp.`」**——实测那样会把用户目录里 `反派 (上).tmp.txt`、`某片 (备注).tmp.mka` 这类普通文件一起删掉，不可逆。
 
@@ -81,6 +82,16 @@ $env:SPARSE_TEST_SRC='<mkv>'; $env:SPARSE_TEST_TRACK='9'; $env:SPARSE_TEST_ASS='
 **稀疏抽取 fail-closed**：`mkv_sub.rs` 只要有一条 cue 解析不出（缺 `CueRelativePosition`、block 带 lacing、`TimestampScale != 1e6`、Cues 被截断、ASS 行格式不对），就整轨返回 `Err` 让调用方回退 ffmpeg。**不要改回"失败就 continue"**——那样会产出一份缺行却看起来正常的 SRT，用户只会觉得"这段怎么没字幕"，而且无从排查。
 
 **ffmpeg 调用**：必须走 `hidden_command()`（`CREATE_NO_WINDOW`），否则会弹黑框；必须 `job::assign()` 进 Job Object，否则宿主被强杀后留下孤儿进程；同时把 `.tmp.*` 半成品清掉。
+
+**流式音轨（C 级）是"单进程 + MSE"，不要退回"整条转完再挂文件"**：真解不了的音轨（DTS / TrueHD / DTS-HD）转 AAC 只有 38~76 倍实时，2 小时片子要 2~3 分钟才出成品，用户点开时不能干等。`audio_stream.rs` 从 seek 点起一路 ffmpeg 编 fMP4 写到 stdout，`FragmentSplitter` 按 `moof`/`mdat` 切块，前端拉一块 append 一块 —— init + 首块实测 60~70 ms 就绪。
+
+- **每段单独起一个 ffmpeg 会在接缝掉约 21 ms 声音**（编码器 flush 尾部填充 + 新编码器 pre-roll，`empty_moov` 没有 edit list 可裁）。必须单进程连续编码，seek 时杀掉重起，代价只有 ~70 ms。
+- **后端用 pull 而不是 push**：前端 `invoke('audio_stream_read')` 主动拉，`audio_stream_start/stop/state` 管生命周期。转码比播放快 40~80 倍，push（事件 / Channel）没有背压，2 小时片子两分钟就把几百 MB 推进前端内存；pull 下"前端不来取 = 读线程不读 stdout = ffmpeg 写满管道自己阻塞"，缓冲上限天然卡死，顺带省 CPU。
+- **`mfra` 绝不能交给 MSE**：ffmpeg 会在流末尾追加 `mfra`（fMP4 文件索引），播放用不到，还可能让 source buffer 判成非法 box。`FragmentSplitter` 在 `init_sent` 之后只放行 `moof` / `mdat`。
+- **ffmpeg 参数**：`-ss` 放 `-i` 之前（输入端快速 seek，输出时间戳由 ffmpeg 归零）；`-ac 2` 必加（WebView2 解码上限 6 声道，7.1 是静音）；`-map_chapters -1` 必加（否则 mov muxer 把 MKV 章节写成一条 QuickTime text 轨）；`-frag_duration` 单位是**微秒**；管道必须 `-flush_packets 1`。
+- **前端三个必踩的坑**：`empty_moov` 下 Chromium 把 `duration` 报成 `Infinity`（**不是 NaN**），必须手动 `ms.duration = 总时长`；`sb.timestampOffset` 必须在第一次 `appendBuffer` **之前**设（之后改抛 `InvalidStateError`），它负责把"流内时间 0"摆到视频的起始秒；`QuotaExceededError` 要 `remove()` 播放头之前的区间再重试。
+- **seek 要监听 `video:seeking`，不是 `art.on('seek')`**：直接改 `video.currentTime` 只产生原生事件，Artplayer 转发成 `video:seeking`；`art.on('seek')` 只在它自己的 seek 流程里发。两条都挂上，靠 pending 标志去重。落点不在 `sb.buffered` 里就杀掉后端重起并从新位置重建，否则浏览器只会把 `currentTime` 夹到缓冲末端、`seeked` 永远不来。
+- **只替代「内核真解不了」那一路**：`ensureAudioTrack` 里只有 `isDeadCodec` 为真才进流式；能 copy 的（AC-3 / E-AC-3 / PCM）继续走原来的 `-c copy` 抽 mka，否则会把 5.1 压成 2.0。
 
 **CSP 有两个不能动的例外**：`tauri.conf.json` 配了 CSP，但
 - `style-src` 必须带 `'unsafe-inline'`，**并且**必须把 `style-src` 写进 `dangerousDisableAssetCspModification`。Tauri 编译期会给 style-src 注入 nonce，而 CSP 规范规定「sources 里有 nonce/hash 时 `unsafe-inline` 被忽略」，于是 Artplayer 运行时动态创建的 `<style>` 全被挡（实测 24 条 violation、界面样式失效）。

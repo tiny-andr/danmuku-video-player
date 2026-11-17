@@ -426,7 +426,6 @@
     <div class="resume-bar" id="resumeBar" hidden>
       <span class="resume-text">上次看到 <b id="resumeTime">--:--</b></span>
       <button type="button" class="resume-btn primary" id="resumeContinue">继续播放</button>
-      <button type="button" class="resume-btn" id="resumeRestart">从头开始</button>
     </div>
   </div>
 
@@ -1209,7 +1208,7 @@
     }
   }
 
-  function applyDanmakuText(name, text, t0) {
+  function applyDanmakuText(name, text, t0, auto) {
     var list;
     if (/\.json$/i.test(name)) list = parseJsonDanmaku(text);
     else list = parseBiliXml(text);
@@ -1220,7 +1219,10 @@
     $('infobar').hidden = false;
     $('infoCount').textContent = list.length.toLocaleString() + ' 条';
     $('infoParse').textContent = ms + ' ms';
-    toast('已装载 ' + list.length.toLocaleString() + ' 条弹幕');
+    // 自动配对和手动加载合并成一条提示：以前「已自动加载同名弹幕」和「已装载 N 条」
+    // 前后脚各弹一次，一次开片就多占一格，看着像发生了两件事。
+    if (auto) toast('已自动加载同名弹幕 · ' + list.length.toLocaleString() + ' 条');
+    else toast('已装载 ' + list.length.toLocaleString() + ' 条弹幕');
   }
 
   /* 弹幕解析任务代际：切换视频/清空后，过期解析结果直接丢弃。
@@ -1906,14 +1908,14 @@
       return scan;
     }
 
-    function desktopLoadDanmaku(name, text) {
+    function desktopLoadDanmaku(name, text, auto) {
       chipDanmaku.textContent = '💬 解析中…';
       var token = ++danmakuLoadToken;
       var t0 = performance.now();
       setTimeout(function () {
         if (token !== danmakuLoadToken) return;
         try {
-          applyDanmakuText(name, text, t0);
+          applyDanmakuText(name, text, t0, auto);
         } catch (e) {
           // 解析是纯函数，抛错（最典型：JSON 带 UTF-8 BOM、结构不对）以前会冒到
           // window.onerror，chip 永远停在「解析中…」，用户等一个永远不会来的结果。
@@ -2137,6 +2139,15 @@
               + '需要声音请到「音轨」菜单点这条轨道开始转换；也可以在设置中开启自动音轨处理', 9000);
             return;
           }
+          if (USE_STREAM_AUDIO) {
+            var probeCodec = (probeTracks && probeTracks[audioIdx]) ? String(probeTracks[audioIdx].codec || '').toUpperCase() : '';
+            // 只有「内核真解不了」的轨才走流式转码；能 copy 的继续走旧路，免得把 5.1 压成 2.0
+            if (probeCodec && isDeadCodec(probeCodec)) {
+              diag('stream-start', { idx: audioIdx, from: (art && art.currentTime) || 0 });
+              startStreamAudio(path, audioIdx, (art && art.currentTime) || 0);
+              return;
+            }
+          }
           if (audioJob.video === normPath(path) && audioJob.ordinal === ordinal) return; // 这条已在转
           audioJob.video = normPath(path);
           audioJob.ordinal = ordinal;
@@ -2210,6 +2221,7 @@
 
     // 挂载外挂音频（audio-track 插件用独立 Audio 元素跟视频同步；原音轨无声，不会打架）
     function engageExternalAudio(path, mkaPath, ordinal, silent) {
+      stopStreamAudio();
       diag('engage', { hasTrack: !!audioTrack, samePath: normPath(currentVideoPath) === normPath(path) });
       if (!audioTrack || normPath(currentVideoPath) !== normPath(path)) return;
       externalOrdinal = ordinal;
@@ -2235,6 +2247,7 @@
     }
 
     function resetExternalAudio() {
+      stopStreamAudio();
       releaseVideoAudio();
       if (audioTrack) {
         try {
@@ -2245,6 +2258,266 @@
       }
       externalOrdinal = -1;
       refreshAudioMenu();
+    }
+
+    // ---- 流式音轨（MSE）：从当前位置开始边转边播 ----
+    // 旧路径是「整条转成 (音轨N).mka 再挂载」：DTS / TrueHD 这类真解不了的轨，2 小时的
+    // 片子要等 2~3 分钟才出声。新路径把转码输出按 1 秒 fragment 切块 append 进 MSE：
+    // init + 首块实测 60~70 ms 就绪，之后转码一直远快于播放，缓冲只会越攒越多。
+    // 开关只是过渡期回退用，等流式在真机片源上验稳了删旧路径。
+    var USE_STREAM_AUDIO = true;
+    var streamAudio = null;
+    var STREAM_CHUNK_BYTES = 262144;   // 单次向后端要 256 KB（约 10 秒 192k 音频）
+    var STREAM_QUEUE_BYTES = 1048576;  // 前端本地攒到 1 MB 就再去要下一块
+    var STREAM_AHEAD_MAX = 120;        // 缓冲领先播放头超过这么多秒就停手（背压）
+    var STREAM_MIME = 'audio/mp4; codecs="mp4a.40.2"';
+    var streamSeekHandler = null;
+    var streamSeekPending = false;
+
+    function streamPlayhead() {
+      return (audioTrack && audioTrack.audio) ? (audioTrack.audio.currentTime || 0) : 0;
+    }
+
+    // 停掉当前流并清空 <audio>。seeking / 换轨 / 换片 / 关页都走这里。
+    function stopStreamAudio() {
+      var s = streamAudio;
+      streamAudio = null;
+      if (s) {
+        s.stopped = true;
+        if (s.id) { try { invoke('audio_stream_stop', { id: s.id }); } catch (e) { } }
+        try { if (s.ms && s.ms.readyState === 'open') s.ms.endOfStream(); } catch (e) { }
+        try { URL.revokeObjectURL(s.url); } catch (e) { }
+      }
+      if (audioTrack) {
+        try {
+          audioTrack.audio.pause();
+          audioTrack.audio.removeAttribute('src');
+          audioTrack.audio.load();
+        } catch (e) { }
+      }
+    }
+
+    function streamAudioFailed(why) {
+      diag('stream-audio-fail', { why: String(why) });
+      stopStreamAudio();
+      externalOrdinal = -1;
+      refreshAudioMenu();
+      toast('音轨处理失败：' + why, 9000);
+    }
+
+    // 当前缓冲里有没有能直接播到这个位置（留 0.5 秒余量给解码）
+    function streamBufferedAt(t) {
+      var s = streamAudio;
+      if (!s || !s.sb) return false;
+      var b = s.sb.buffered;
+      for (var i = 0; i < b.length; i++) {
+        if (t >= b.start(i) && t + 0.5 < b.end(i)) return true;
+      }
+      return false;
+    }
+
+    function hookStreamSeek() {
+      if (!art) return;
+      if (streamSeekHandler) {
+        try { art.off('seek', streamSeekHandler); } catch (e) { }
+        try { art.off('video:seeking', streamSeekHandler); } catch (e) { }
+      }
+      streamSeekHandler = function () {
+        if (streamSeekPending) return;
+        streamSeekPending = true;
+        setTimeout(function () { streamSeekPending = false; streamAudioSeek(); }, 0);
+      };
+      // 直接改 video.currentTime 只产生原生事件，Artplayer 一定会转发 video:seeking；
+      // art.on('seek') 只在它自己的 seek 流程里发。两条都挂上，靠 pending 去重。
+      try { art.on('video:seeking', streamSeekHandler); } catch (e) { }
+      try { art.on('seek', streamSeekHandler); } catch (e) { }
+    }
+
+    // 拖进度条：落点已经缓冲了就交给浏览器；没有就让后端从新位置重转、MSE 整条重建。
+    function streamAudioSeek() {
+      var s = streamAudio;
+      if (!s || !art) return;
+      var t = art.currentTime || 0;
+      diag('stream-seek-check', { t: t, buffered: streamBufferedAt(t) });
+      if (streamBufferedAt(t)) return;
+      diag('stream-seek-restart', { from: s.startSec, to: t });
+      startStreamAudio(currentVideoPath, s.audioIdx, t);
+    }
+
+    // 启动一路流：起 MediaSource → 等 sourceopen → 起后端 ffmpeg → 循环拉块
+    function startStreamAudio(path, audioIdx, startSec) {
+      if (!audioTrack || !art) return;
+      if (normPath(currentVideoPath) !== normPath(path)) return;
+      stopStreamAudio();
+      externalOrdinal = audioIdx + 1;
+      isolateVideoAudio();
+      hookStreamSeek();
+      var from = Math.max(0, startSec || 0);
+      var total = probeDurationUs ? (probeDurationUs / 1000000) : (art.duration || 0);
+      var ms = new MediaSource();
+      var url = URL.createObjectURL(ms);
+      var s = {
+        id: 0, audioIdx: audioIdx, startSec: from, total: total,
+        ms: ms, sb: null, url: url,
+        queue: [], queued: 0, pulling: false, appending: false,
+        eof: false, stopped: false, retries: 0, bufferedEnd: 0,
+        pendingSeek: (from > 0.5) ? from : null
+      };
+      streamAudio = s;
+      ms.addEventListener('sourceopen', function () {
+        if (streamAudio !== s || s.stopped) return;
+        try {
+          s.sb = ms.addSourceBuffer(STREAM_MIME);
+        } catch (e) {
+          streamAudioFailed('当前内核不支持 MSE 音频解码（' + STREAM_MIME + '）');
+          return;
+        }
+        s.sb.mode = 'segments';
+        // ffmpeg 用 -ss 定位后输出时间戳从 0 开始，所以媒体时间轴 0 要摆到视频的 from 处。
+        // 必须在第一次 appendBuffer 之前设，之后改会抛 InvalidStateError。
+        s.sb.timestampOffset = from;
+        // empty_moov 下 Chromium 把 duration 报成 Infinity（不是 NaN），
+        // 不手动设的话进度条和 seek 范围都不可用。
+        if (total > 0) { try { ms.duration = total; } catch (e) { } }
+        s.sb.addEventListener('updateend', onStreamUpdateEnd);
+        s.sb.addEventListener('error', function () { streamAudioFailed('SourceBuffer 报错'); });
+        invoke('audio_stream_start', { videoPath: path, audioIndex: audioIdx, startSecs: from }).then(function (info) {
+          if (streamAudio !== s || s.stopped) {
+            try { invoke('audio_stream_stop', { id: info.id }); } catch (e) { }
+            return;
+          }
+          s.id = info.id;
+          pullStreamChunk();
+        }).catch(function (e) {
+          streamAudioFailed('启动音频转码失败：' + e);
+        });
+      });
+      try {
+        audioTrack.audio.src = url;
+        audioTrack.update({ url: url }); // 同步插件内部记录，它后面才会认这条音轨
+      } catch (e) {
+        streamAudioFailed('挂载音频元素失败：' + e);
+      }
+    }
+
+    // 调试探针：真机验证时从 CDP 直接读流状态（没有 UI 用途，也不影响正常播放）
+    window.__bplayerStream = function () {
+      var s = streamAudio;
+      if (!s) return null;
+      var b = s.sb ? s.sb.buffered : null;
+      var ranges = [];
+      if (b) { for (var i = 0; i < b.length; i++) ranges.push([b.start(i), b.end(i)]); }
+      var a = audioTrack ? audioTrack.audio : null;
+      return {
+        id: s.id, startSec: s.startSec, eof: s.eof, stopped: s.stopped,
+        queued: s.queued, queueLen: s.queue.length, appending: s.appending, pulling: s.pulling,
+        buffered: ranges, bufferedEnd: s.bufferedEnd,
+        audioCurrentTime: a ? a.currentTime : null,
+        audioDuration: a ? (isFinite(a.duration) ? a.duration : String(a.duration)) : null,
+        audioPaused: a ? a.paused : null,
+        decodedBytes: a ? (a.webkitAudioDecodedByteCount || 0) : null,
+        readyState: a ? a.readyState : null,
+        volume: a ? a.volume : null,
+        muted: a ? a.muted : null,
+        paused: a ? a.paused : null,
+        src: a ? String(a.src || '').slice(0, 32) : null
+      };
+    };
+    function pullStreamChunk() {
+      var s = streamAudio;
+      if (!s || s.stopped || s.eof || s.pulling || !s.id) return;
+      s.pulling = true;
+      invoke('audio_stream_read', { id: s.id, maxBytes: STREAM_CHUNK_BYTES }).then(function (buf) {
+        s.pulling = false;
+        if (streamAudio !== s || s.stopped) return;
+        s.retries = 0;
+        var bytes = null;
+        try {
+          bytes = (buf instanceof ArrayBuffer) ? new Uint8Array(buf)
+            : (buf && buf.buffer ? new Uint8Array(buf.buffer) : new Uint8Array(buf));
+        } catch (e) { bytes = null; }
+        if (!bytes || !bytes.length) {
+          // 后端返回空数组 = 整条音轨已经转完
+          s.eof = true;
+          if (!s.queue.length && s.ms.readyState === 'open') {
+            try { s.ms.endOfStream(); } catch (e) { }
+          }
+          return;
+        }
+        s.queue.push(bytes);
+        s.queued += bytes.length;
+        appendStreamChunk();
+        if (s.queued < STREAM_QUEUE_BYTES) pullStreamChunk();
+      }).catch(function (e) {
+        s.pulling = false;
+        if (streamAudio !== s || s.stopped) return;
+        s.retries++;
+        // 转码刚起时后端可能还在探测，短暂没数据会超时；重试几次再判死
+        if (s.retries > 4) { streamAudioFailed('读取转码输出失败：' + e); return; }
+        setTimeout(function () { pullStreamChunk(); }, 300 * s.retries);
+      });
+    }
+
+    function appendStreamChunk() {
+      var s = streamAudio;
+      if (!s || !s.sb || s.stopped || s.appending || !s.queue.length || s.sb.updating) return;
+      var chunk = s.queue.shift();
+      s.queued -= chunk.length;
+      s.appending = true;
+      try {
+        s.sb.appendBuffer(chunk);
+      } catch (e) {
+        s.appending = false;
+        s.queue.unshift(chunk);
+        s.queued += chunk.length;
+        if (e && e.name === 'QuotaExceededError') { evictStreamBuffer(); return; }
+        streamAudioFailed('写入 MSE 失败：' + (e && e.name ? e.name : e));
+      }
+    }
+
+    function evictStreamBuffer() {
+      var s = streamAudio;
+      if (!s || !s.sb) return;
+      var now = streamPlayhead();
+      if (now > 30) {
+        try { s.sb.remove(0, now - 10); } catch (e) { }
+        setTimeout(appendStreamChunk, 400);
+      } else {
+        // 播放头还在开头配额就爆，说明是真不够用；硬撑只会死循环，报错比卡死好
+        streamAudioFailed('浏览器音频缓冲配额不足');
+      }
+    }
+
+    function onStreamUpdateEnd() {
+      var s = streamAudio;
+      if (!s || !s.sb) return;
+      s.appending = false;
+      var b = s.sb.buffered;
+      if (b.length) s.bufferedEnd = b.end(b.length - 1);
+      // 拖到还没缓冲的位置时浏览器只把 currentTime 夹到缓冲末尾、seeked 永远不来，
+      // 数据补上后它也不会自动跳过去 —— 目标位置得自己记着补一次
+      if (s.pendingSeek != null && s.bufferedEnd > s.pendingSeek + 0.3) {
+        var t = s.pendingSeek;
+        s.pendingSeek = null;
+        try { if (audioTrack) audioTrack.audio.currentTime = t; } catch (e) { }
+      }
+      appendStreamChunk();
+      if (s.eof && !s.queue.length && s.ms.readyState === 'open') {
+        try { s.ms.endOfStream(); } catch (e) { }
+        return;
+      }
+      maybePull();
+    }
+
+    function maybePull() {
+      var s = streamAudio;
+      if (!s || s.stopped || s.eof || s.pulling) return;
+      var ahead = s.bufferedEnd - streamPlayhead();
+      // 背压：缓冲已经领先播放头太多就停手。后端队列攒满后 ffmpeg 写管道会被阻塞，
+      // 连带省 CPU —— 不这么做，2 小时的片子会在 2 分钟内把几百 MB 全推进内存。
+      if (ahead > STREAM_AHEAD_MAX) { setTimeout(maybePull, 1000); return; }
+      if (s.queued >= STREAM_QUEUE_BYTES) { appendStreamChunk(); return; }
+      pullStreamChunk();
     }
 
     // 整片 AAC 缓存路径（同名 + " (AAC).mkv"）：用于命中已有缓存，未命中则走外挂音轨
@@ -2877,7 +3150,6 @@
     var resumeHintedPath = '';  // 本次会话已经提示过的片：同一部只问一次（播完 ended 后可再问）
     var resumeReady = false;    // 当前源的元数据已就绪：没就绪时 duration/currentTime 都是旧片的
     var resumeSavedAt = 0;      // timeupdate 的 5 秒节流时间戳
-    var resumeHoldUntil = 0;    // 这段窗口内不保存：「从头开始」的 seek 到 0 不能按"不值得续播"删记录
 
     function hideResumeBar() {
       clearTimeout(resumeBarTimer);
@@ -2893,7 +3165,7 @@
       resumeBarAt = art && art.video ? (art.video.currentTime || 0) : 0;
       $('resumeTime').textContent = fmtDuration(item.position);
       $('resumeBar').hidden = false;
-      // 10 秒无操作 = 用户懒得选，按「从头开始」继续。注意播放本身从打开起就在跑，
+      // 10 秒无操作 = 用户懒得选，视为不续播（播放本来就从 0 在跑）。注意播放从打开起就在跑，
       // 这里只收浮条、绝不 pause —— 为了问一句就把画面钉住，比丢进度更让人火大。
       clearTimeout(resumeBarTimer);
       resumeBarTimer = setTimeout(function () { hideResumeBar(); }, 10000);
@@ -2907,7 +3179,6 @@
       // 照常保存会把旧记录覆盖掉（位置太靠前还会直接删掉），用户还没点就先没了。
       // 安卓版同样在 savePosition 里用 pendingResume 把这段时间隔开。
       if (resumeBarItem) return;
-      if (Date.now() < resumeHoldUntil) return; // 「从头开始」刚 seek 到 0 的那一下也不记
       var v = art.video;
       // 非法值（还没元数据 / 直播 Infinity）由 resumeSave 自己过滤
       resume.save(currentVideoPath, v.currentTime, v.duration, Date.now());
@@ -2964,18 +3235,6 @@
       if (resumeFinite(d) && d > 0 && to > d - 1) to = Math.max(0, d - 1);
       try { art.currentTime = to; } catch (e) { }
       try { Promise.resolve(art.play()).catch(function () { }); } catch (e) { }
-    });
-    $('resumeRestart').addEventListener('click', function () {
-      // 不删记录：用户可能只是暂时重看一遍，之后保存的位置会自然覆盖它。
-      // 但 seek 到 0 会立刻触发 seeked 保存，而"位置 0"按规则又会删掉旧记录 ——
-      // 所以这两个动作之间的窗口先按住不存（2 秒足够覆盖这次 seek，之后照常记新位置）。
-      resumeHoldUntil = Date.now() + 2000;
-      hideResumeBar();
-      try {
-        if (!art) return;
-        art.currentTime = 0;
-        Promise.resolve(art.play()).catch(function () { });
-      } catch (e) { }
     });
 
     // 音轨和字幕各占一颗胶囊，标签由 kind 决定，不再有「当前任务类型」这种全局态
@@ -3189,9 +3448,9 @@
         // 晚到的自动结果直接丢弃：不清空他挂的内容、不弹「已自动加载同名弹幕」。
         if (danmakuManual) return seq;
         if (pair) {
-          desktopLoadDanmaku(pair.name, pair.text);
-          // 同名配对永远只有这一个结果（xml 优先于 json），文件名没有辨识价值
-          toast('已自动加载同名弹幕');
+          // 同名配对只有这一个结果（xml 优先于 json），文件名没有辨识价值；
+          // 「自动加载」和「装载条数」并成一条，别再各弹一次。
+          desktopLoadDanmaku(pair.name, pair.text, true);
         } else {
           clearDanmaku();
           // 不写片名：用户刚打开的就是这部片，名字又长，写出来只会把提示撑成两行
