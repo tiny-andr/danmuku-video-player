@@ -2085,10 +2085,9 @@
           }
           // 内核「第一条能解的轨道」恰好就是默认轨：交给内核即可
           if (plan.native) {
+            // 不再提示「编码不可靠、可能无声」：内核真解不了时用户自己听得出来，
+            // 音轨菜单就在那儿，每次开片先恐吓一句只是多一条噪音。
             diag('audio-native-default');
-            if (plan.shake.length) {
-              toast('音轨编码（' + plan.shake.join(' / ') + '）解码不可靠（随 WebView2 版本而定），可能无声', 8000);
-            }
             return;
           }
           // 内核会选中非默认轨（默认轨解不了，或它前面还有别的可解轨）。
@@ -2270,22 +2269,64 @@
     var STREAM_CHUNK_BYTES = 262144;   // 单次向后端要 256 KB（约 10 秒 192k 音频）
     var STREAM_QUEUE_BYTES = 1048576;  // 前端本地攒到 1 MB 就再去要下一块
     var STREAM_AHEAD_MAX = 120;        // 缓冲领先播放头超过这么多秒就停手（背压）
+    var STREAM_KEEP_BACK = 60;         // 播放头之前保留这么多秒供回拖，再往前回收
     var STREAM_MIME = 'audio/mp4; codecs="mp4a.40.2"';
     var streamSeekHandler = null;
+    var streamTrimTimer = null;   // 数据一次性到齐后没有 updateend 了，只能靠定时回收
     var streamSeekPending = false;
 
+    var streamTick = 0;
+
+    // 前瞻窗口是否已满。MSE 侧领先播放头太多就停止消费本地队列，
+    // 本地队列满了后端就不再读 ffmpeg 的 stdout，转码进程自己阻塞。
+    function streamAheadFull(s) {
+      return (s.bufferedEnd - streamPlayhead()) > STREAM_AHEAD_MAX;
+    }
+
     function streamPlayhead() {
-      return (audioTrack && audioTrack.audio) ? (audioTrack.audio.currentTime || 0) : 0;
+      var a = audioTrack && audioTrack.audio;
+      var t = a ? a.currentTime : 0;
+      // NaN 参与比较永远为 false：播放头算不出来时「领先太多要停手」会被判成「继续拉」，
+      // 一路把 MSE 配额拉爆。所以这里必须给出一个确定的数。
+      return (isFinite(t) && t > 0) ? t : 0;
+    }
+
+    // 回收播放头之前的老缓冲。
+    //
+    // 长片播到后面时 buffered 是从片头一路累积到播放头的（MediaSource 只进不出），
+    // 192k AAC 播两三个小时就是上百 MB，必然撞上 Chromium 的 SourceBuffer 配额。
+    // 每次 append 完把「播放头前 60 秒」以外的部分 remove 掉，占用就恒定为
+    // 回看 60 秒 + 前瞻 120 秒 ≈ 4 MB，播多久都不涨。
+    // 返回 true 表示刚发起 remove（它还会再触发一次 updateend，届时继续 append）。
+    function trimStreamBuffer() {
+      var s = streamAudio;
+      if (!s || !s.sb || s.stopped || s.sb.updating) return false;
+      if (!s.ms || s.ms.readyState !== 'open') return false; // ended 后 remove 会抛 InvalidStateError
+      var b = s.sb.buffered;
+      if (!b.length) return false;
+      var now = streamPlayhead();
+      if (!now) now = s.startSec;
+      var keepFrom = now - STREAM_KEEP_BACK;
+      var first = b.start(0);
+      if (keepFrom > first + 5) {
+        try {
+          s.sb.remove(first, keepFrom);
+          return true;
+        } catch (e) { diag('stream-trim-err', { err: String(e) }); }
+      }
+      return false;
     }
 
     // 停掉当前流并清空 <audio>。seeking / 换轨 / 换片 / 关页都走这里。
     function stopStreamAudio() {
+      if (streamTrimTimer) { clearInterval(streamTrimTimer); streamTrimTimer = null; }
       var s = streamAudio;
       streamAudio = null;
       if (s) {
         s.stopped = true;
         if (s.id) { try { invoke('audio_stream_stop', { id: s.id }); } catch (e) { } }
-        try { if (s.ms && s.ms.readyState === 'open') s.ms.endOfStream(); } catch (e) { }
+        try { if (s.sb) s.sb.abort(); } catch (e) { }
+        try { if (s.ms && (s.ms.readyState === 'open' || s.ms.readyState === 'ended')) s.ms.endOfStream(); } catch (e) { }
         try { URL.revokeObjectURL(s.url); } catch (e) { }
       }
       if (audioTrack) {
@@ -2348,6 +2389,7 @@
     function startStreamAudio(path, audioIdx, startSec) {
       if (!audioTrack || !art) return;
       if (normPath(currentVideoPath) !== normPath(path)) return;
+      diag('stream-open', { from: Math.round(startSec || 0), prev: !!streamAudio });
       stopStreamAudio();
       externalOrdinal = audioIdx + 1;
       isolateVideoAudio();
@@ -2364,8 +2406,20 @@
         pendingSeek: (from > 0.5) ? from : null
       };
       streamAudio = s;
+      // 转码远快于播放：200 秒的片 4 秒就全部 append 完，之后不会再有 updateend，
+      // 光靠 append 回调永远回收不了旧缓冲。播放头每前进 60 秒才需要回收一次，
+      // 5 秒检查一遍就够了（192k 音频 5 秒才 120 KB）。
+      if (streamTrimTimer) clearInterval(streamTrimTimer);
+      streamTrimTimer = setInterval(function () {
+        if (!streamAudio) { clearInterval(streamTrimTimer); streamTrimTimer = null; return; }
+        appendStreamChunk();                                   // 窗口腾出来就继续喂本地队列
+        if ((streamTick++ % 5) === 0) trimStreamBuffer();       // 回收旧缓冲
+      }, 1000);
       ms.addEventListener('sourceopen', function () {
         if (streamAudio !== s || s.stopped) return;
+        // 同一个 MediaSource 的 sourceopen 会重复触发（实测 sb.remove() 之后会再来一次），
+        // 重复走 addSourceBuffer 会抛 NotSupportedError，被当成「内核不支持 MSE」整条杀掉。
+        if (s.sb) return;
         try {
           s.sb = ms.addSourceBuffer(STREAM_MIME);
         } catch (e) {
@@ -2447,7 +2501,7 @@
         s.queue.push(bytes);
         s.queued += bytes.length;
         appendStreamChunk();
-        if (s.queued < STREAM_QUEUE_BYTES) pullStreamChunk();
+        if (s.queued < STREAM_QUEUE_BYTES && !streamAheadFull(s)) pullStreamChunk();
       }).catch(function (e) {
         s.pulling = false;
         if (streamAudio !== s || s.stopped) return;
@@ -2461,6 +2515,7 @@
     function appendStreamChunk() {
       var s = streamAudio;
       if (!s || !s.sb || s.stopped || s.appending || !s.queue.length || s.sb.updating) return;
+      if (!s.eof && streamAheadFull(s)) return; // 窗口满了就先攒着，等播放把位置腾出来
       var chunk = s.queue.shift();
       s.queued -= chunk.length;
       s.appending = true;
@@ -2478,14 +2533,11 @@
     function evictStreamBuffer() {
       var s = streamAudio;
       if (!s || !s.sb) return;
-      var now = streamPlayhead();
-      if (now > 30) {
-        try { s.sb.remove(0, now - 10); } catch (e) { }
-        setTimeout(appendStreamChunk, 400);
-      } else {
-        // 播放头还在开头配额就爆，说明是真不够用；硬撑只会死循环，报错比卡死好
-        streamAudioFailed('浏览器音频缓冲配额不足');
-      }
+      if (trimStreamBuffer()) { setTimeout(appendStreamChunk, 200); return; }
+      // 播放头前后都没有可回收的数据还爆配额 = 这条 MediaSource 已经不可恢复。
+      // 与其弹一句用户没法处理的错误，不如从当前位置换一条新的流接着播。
+      diag('stream-quota-rebuild', { playhead: streamPlayhead(), start: s.startSec });
+      startStreamAudio(currentVideoPath, s.audioIdx, Math.max(0, (streamPlayhead() || s.startSec) - 1));
     }
 
     function onStreamUpdateEnd() {
@@ -2494,6 +2546,7 @@
       s.appending = false;
       var b = s.sb.buffered;
       if (b.length) s.bufferedEnd = b.end(b.length - 1);
+      if (trimStreamBuffer()) return; // 刚发起 remove，等它自己的 updateend 回来再继续
       // 拖到还没缓冲的位置时浏览器只把 currentTime 夹到缓冲末尾、seeked 永远不来，
       // 数据补上后它也不会自动跳过去 —— 目标位置得自己记着补一次
       if (s.pendingSeek != null && s.bufferedEnd > s.pendingSeek + 0.3) {

@@ -92,6 +92,9 @@ $env:SPARSE_TEST_SRC='<mkv>'; $env:SPARSE_TEST_TRACK='9'; $env:SPARSE_TEST_ASS='
 - **前端三个必踩的坑**：`empty_moov` 下 Chromium 把 `duration` 报成 `Infinity`（**不是 NaN**），必须手动 `ms.duration = 总时长`；`sb.timestampOffset` 必须在第一次 `appendBuffer` **之前**设（之后改抛 `InvalidStateError`），它负责把"流内时间 0"摆到视频的起始秒；`QuotaExceededError` 要 `remove()` 播放头之前的区间再重试。
 - **seek 要监听 `video:seeking`，不是 `art.on('seek')`**：直接改 `video.currentTime` 只产生原生事件，Artplayer 转发成 `video:seeking`；`art.on('seek')` 只在它自己的 seek 流程里发。两条都挂上，靠 pending 标志去重。落点不在 `sb.buffered` 里就杀掉后端重起并从新位置重建，否则浏览器只会把 `currentTime` 夹到缓冲末端、`seeked` 永远不来。
 - **只替代「内核真解不了」那一路**：`ensureAudioTrack` 里只有 `isDeadCodec` 为真才进流式；能 copy 的（AC-3 / E-AC-3 / PCM）继续走原来的 `-c copy` 抽 mka，否则会把 5.1 压成 2.0。
+- **必须回收旧缓冲，否则长片必炸 MSE 配额**：`buffered` 只进不出，转码 60~76 倍实时，几秒钟就能把几百秒塞进去。三层约束缺一不可：① `pullStreamChunk` 的递归也要过 `streamAheadFull`（只判本地队列长度会把几百秒拉进来）；② `appendStreamChunk` 超前瞻窗口就不消费；③ 每秒 tick 驱动 append、每 5 秒 `trimStreamBuffer()` 把播放头 60 秒以外的 `remove` 掉。第 ③ 步必须走定时器——数据一次性到齐后不会再有 `updateend`，光靠 append 回调永远回收不了。实测 8 分钟片不修时 4 秒内 buffered 冲到 457 秒（约 11 MB）并 `QuotaExceededError`；修完恒定在 181~189 秒。
+- **同一个 MediaSource 的 `sourceopen` 会重复触发**（实测 `sb.remove()` 之后会再来一次）。回调里必须先判 `if (s.sb) return`，否则第二次 `addSourceBuffer` 抛 `NotSupportedError`，被当成「内核不支持 MSE」把整条流杀掉。
+- **`SourceBuffer.remove()` 在 `MediaSource.readyState` 变成 `ended` 后会抛 `InvalidStateError`**：trim 前必须检查 `ms.readyState === 'open'`；短片转码几秒就跑完、`ended` 之后确实不需要再回收。
 
 **CSP 有两个不能动的例外**：`tauri.conf.json` 配了 CSP，但
 - `style-src` 必须带 `'unsafe-inline'`，**并且**必须把 `style-src` 写进 `dangerousDisableAssetCspModification`。Tauri 编译期会给 style-src 注入 nonce，而 CSP 规范规定「sources 里有 nonce/hash 时 `unsafe-inline` 被忽略」，于是 Artplayer 运行时动态创建的 `<style>` 全被挡（实测 24 条 violation、界面样式失效）。
