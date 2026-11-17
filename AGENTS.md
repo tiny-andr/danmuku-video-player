@@ -125,6 +125,7 @@ $env:SPARSE_TEST_SRC='<mkv>'; $env:SPARSE_TEST_TRACK='9'; $env:SPARSE_TEST_ASS='
 
 **字幕延时在 SRT 文本层做，不在 cue 对象上**：`mountSubtitleText` 把原文留档到 `subSourceText`，延时用 `shiftSrtTimes(text, deltaMs)` 整体位移时间戳后重建 blob 再 `switch()`。重建时**不要传 `name`**（Artplayer 会因此弹一条「切换字幕：xxx」notice）。原文必须留档，否则每拖一次延时就在已位移的文本上再位移一次，越拖越偏。
 
+**字幕自动挂载优先级**：外挂（精确同名 / 语言后缀变体 / 拖入的都算）> 内嵌 `default` 轨 > 唯一一条内嵌文本轨 > 位图兜底 > 静默。**不要退回「精确同名 > 内嵌默认 > 变体外挂 > 位图」的四级排序** —— 只要目录里有外挂字幕就该用它，不该因为后缀差个 `.chs` 就退而去抽内嵌（抽内嵌要读整遍文件）。内嵌只认 `default` 标记，多条都没标默认时不替用户选。一条候选都没有时静默返回，**不弹任何提示**。改这块跑 `H:\tmp\bplayer-audit\subtitle-automount-test.mjs`。
 **三类存档语义别混**：`bplayer_settings`（齿轮页开关，改动即存）、`bplayer_subtitle_style`（字幕样式，**只有点「保存」才写**，预览即时生效但不落盘、不跨片）、`bplayer_resume`（播放位置，自动 5 秒节流存、`ended` 删、30 天过期）。新增任何一个存档都要带 `ver` 字段并对字段做白名单回落。配套的 `subtitleManual` / `danmakuManual` 令牌：**只有非空的手动选择才置位** —— 取消对话框、空结果、关闭字幕、清空弹幕都不置位，否则自动匹配会永久失效。
 
 **音轨入口与切轨**：`needsAudioEntry()` = `count > 1 || (count > 0 && (dead > 0 || pin))` —— **「有多条可选」本身就是入口的理由**，不能只看「要不要修正」。只看 dead/pin 的后果：5 条全 AC-3、默认轨也对、内核能解的片子（多音轨国配片典型）音轨按钮根本不出现，用户以为文件只有一条轨（2026-11-17 实测）。注意「入口显示」和「要不要接管音频管线」是两件独立的事：同一部片可以 `audioPlan().native === true`（不用接管）却仍然必须给入口。手动切轨按编码分流：`isDeadCodec` 为假就 `-c copy` 抽进 mka（转 AAC 会被 `-ac 2` 把 5.1 压成立体声，用户只是换个语言听，不该顺手降质），为真才转 AAC。`ensureAudioTrack` 里读 `probeTracks[audioIdx].codec` **必须先判空**：探测失败/换片途中它是 null，而在 `fs_stat` 的异步回调里抛 ReferenceError 会被静默吞掉，表现成"点了没反应、胶囊卡在某个百分比"。

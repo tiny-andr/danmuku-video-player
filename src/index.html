@@ -600,12 +600,13 @@
   // 1.2.6：弹幕默认改为 极慢 / 同步速度 / 显示区域 1/4 / 不透明 100%，旧存档按新默认走一次
   var CONFIG_VER = 2;
 
-  /* ---- 应用设置（齿轮页）：音轨自动转换默认开，字幕默认关 ---- */
+  /* ---- 应用设置（齿轮页）：音轨与字幕的自动转换都默认开 ---- */
   var SETTINGS_KEY = 'bplayer_settings';
   // 3：画面适配模式（fit）进存档。必须升版本号 —— 旧存档没有 fit 字段，
   // 不升的话 localStorage 里的旧值会盖住新默认，老用户永远拿不到新的默认。
-  var SETTINGS_VER = 3;
-  var appSettings = { autoAudio: true, autoSubtitle: false, fit: 'contain' };
+  // 4：字幕自动转换改成默认开。
+  var SETTINGS_VER = 4;
+  var appSettings = { autoAudio: true, autoSubtitle: true, fit: 'contain' };
 
   // 画面适配三档。contain 是唯一不变形的模式，所以是默认值：
   // 以前 `.art-video` 没有任何 object-fit 规则，浏览器初始值就是 fill ——
@@ -625,10 +626,21 @@
   function loadAppSettings() {
     try {
       var c = JSON.parse(localStorage.getItem(SETTINGS_KEY)) || {};
-      if (c.ver !== SETTINGS_VER) return; // 旧版存档：沿用新的默认值
-      appSettings.autoAudio = !!c.autoAudio;
-      appSettings.autoSubtitle = !!c.autoSubtitle;
-      if (isFitMode(c.fit)) appSettings.fit = c.fit; // 白名单：存档被改坏就回默认
+      // 4 版存档：三项都读。
+      if (c.ver === SETTINGS_VER) {
+        appSettings.autoAudio = !!c.autoAudio;
+        appSettings.autoSubtitle = !!c.autoSubtitle;
+        if (isFitMode(c.fit)) appSettings.fit = c.fit; // 白名单：存档被改坏就回默认
+        return;
+      }
+      // 3 版存档：存进去的 autoSubtitle=false 是当时的默认值，不是用户主动关的，
+      // 所以这一项让它落到新默认（开）；其余用户真的调过的设置（音轨、画面适配）照旧保留。
+      if (c.ver === 3) {
+        appSettings.autoAudio = !!c.autoAudio;
+        if (isFitMode(c.fit)) appSettings.fit = c.fit;
+        return;
+      }
+      // 更老的存档没有可迁移的字段：整体沿用新默认。
     } catch (e) { /* 配置损坏按默认值 */ }
   }
 
@@ -3165,33 +3177,32 @@
       refreshSubtitleMenu();
     }
 
-    // 自动挂载优先级：同名/变体外挂 > 默认内嵌文本轨 > 第一条内嵌文本轨 > 第一条外挂 > 位图。
-    // 位图（PGS）排最后：解析要解位图（几秒、几十 MB 内存），而且不可搜索、样式不可控，
-    // 只要还有任何文本字幕就先用文本；位图只在「全 PGS、一个文本轨都没有」时兜底
-    // （《潘神》这种片，以前自动字幕等于没开）。位图解码是重操作，只在开了自动字幕时碰。
+    // 自动挂载优先级（用户定）：外挂字幕 > 内嵌默认轨 > 什么都不做。
+    // 不再做「精确同名 > 语言变体 > 位图」的多级排序 —— 只要有外挂就用外挂（文件名
+    // 差不多就够了，没必要因为后缀差个 .chs 就退而求其次去抽内嵌）；没有外挂才看内嵌，
+    // 而且只认标记为默认的那条，多条内嵌轨又都没标默认时不替用户做主。
+    // 一条候选都没有时静默返回：开片不该被字幕的事情打扰。
     function autoMountSubtitle() {
       // B4：用户已经亲手选过字幕（菜单点选 / 拖入文件，含 PGS 位图轨），
       // 自动挂载只管"没选过"的情况，不能再覆盖他的选择。
       if (subtitleManual) return;
-      var vb = baseName(currentVideoName).toLowerCase();
-      var exact = subItems.filter(function (s) {
-        if (s.kind !== 'ext') return false;
-        var b = baseName(s.name).toLowerCase();
-        return b === vb || b.indexOf(vb + '.') === 0;
-      });
-      var embDefault = subItems.filter(function (s) { return s.kind === 'embedded' && s.default; });
-      var embFirst = subItems.filter(function (s) { return s.kind === 'embedded'; });
-      var extFirst = subItems.filter(function (s) { return s.kind === 'ext'; });
-      // disabled 的是 VobSub 等 libpgs 吃不下的图形字幕，不能作为兜底候选
-      var bitmap = subItems.filter(function (s) { return s.kind === 'bitmap' && !s.disabled; });
-      var cand = exact[0];
-      // 内嵌文本轨要抽 SRT（读整遍文件），只在你开启了自动转换时才自动挂
-      if (!cand && appSettings.autoSubtitle) cand = embDefault[0] || embFirst[0];
-      if (!cand) cand = extFirst[0];
-      // 位图放 extFirst 之后：外挂文本可搜索、样式可控、解析几乎零成本，比位图好；
-      // 只有完全没有文本候选时才值得为位图付解码开销（手机版顺序也是 ext → embedded → bitmap）
-      if (!cand && appSettings.autoSubtitle) cand = bitmap[0];
-      if (cand) mountSubtitle(cand, !!exact[0]);
+      // 1) 外挂：精确同名、语言后缀变体、拖进来的都算
+      var ext = subItems.filter(function (s) { return s.kind === 'ext'; })[0];
+      if (ext) { mountSubtitle(ext, true); return; }
+      // 2) 内嵌默认轨：抽内嵌要读整遍文件（几秒），仍然尊重「自动转换字幕」开关
+      if (!appSettings.autoSubtitle) return;
+      var textDefault = subItems.filter(function (s) { return s.kind === 'embedded' && s.default; })[0];
+      if (textDefault) { mountSubtitle(textDefault, true); return; }
+      var bmpDefault = subItems.filter(function (s) { return s.kind === 'bitmap' && !s.disabled && s.default; })[0];
+      if (bmpDefault) { mountSubtitle(bmpDefault, true); return; }
+      // 没标默认、但整部片只有一条内嵌文本轨：它就是唯一选择，挂上
+      var embAll = subItems.filter(function (s) { return s.kind === 'embedded'; });
+      if (embAll.length === 1) { mountSubtitle(embAll[0], true); return; }
+      // 位图兜底：文本轨一条可用的都没有时，能看的位图也比没字幕强
+      // （《潘神》这类全 PGS 的片，以前自动字幕等于没开）
+      var bmpAny = subItems.filter(function (s) { return s.kind === 'bitmap' && !s.disabled; })[0];
+      if (bmpAny) { mountSubtitle(bmpAny, true); return; }
+      // 4) 外挂和内嵌都没有：什么都不做，也不提示
     }
 
     /* ---- B3 断点续播的 UI 与时机 ----
