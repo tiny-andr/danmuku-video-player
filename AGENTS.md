@@ -13,7 +13,7 @@ Tauri 2 桌面播放器：打开本机视频，自动配同目录的弹幕 XML �
 
 | 文件 | 职责 |
 |---|---|
-| `src/index.html` (~3500 行) | 整个前端。播放器装配、弹幕、字幕菜单 + 字幕样式/位置/延时、音轨菜单、画面适配、停止播放、断点续播、设置页、拖放、进度胶囊 |
+| `src/index.html` (~3700 行) | 整个前端。播放器装配、弹幕、字幕菜单 + 字幕样式/位置/延时、音轨菜单、画面适配、停止播放、断点续播、设置页、拖放、进度胶囊 |
 | `src/vendor/artplayer.js` | 播放器内核，本地副本，**不要改** |
 | `src/vendor/artplayer-plugin-danmuku.js` | 弹幕插件，本地副本，只在必要时打补丁（`.orig.js` 保留原版） |
 | `src-tauri/src/lib.rs` | 命令注册、选文件/选文件夹、目录扫描、`reveal_path`、`sidecar_cache_files` |
@@ -27,7 +27,311 @@ Tauri 2 桌面播放器：打开本机视频，自动配同目录的弹幕 XML �
 | `src-tauri/src/audio_stream.rs` | 流式音轨：ffmpeg 从 seek 点编 fMP4 写管道，按 fragment 切块交给前端 MSE（pull 模式） |
 | `src-tauri/src/autostart.rs` | 注册表 `Run` 项自启动 |
 
-## 3. 构建与验证
+## 3. 模块实现
+
+逐个模块记录：它负责什么、对外暴露什么、内部怎么流转、失败时是什么语义。**「为什么这么写」在 §5 硬性约束里**，这里只写实现事实。
+
+### 3.1 `blocking.rs` — 命令的线程模型
+
+Tauri 2 的所有 `invoke` **共用一条串行通道**。同步命令不会冻住窗口消息循环（窗口 Responding 一直为 true），但一条 3 秒的 SMB `fs_stat` 会把之后所有命令一起堵到 3 秒才返回。这个模块就是那层把阻塞段挪出通道的薄壳。
+
+```rust
+pub(crate) async fn blocking<T, F>(f: F) -> Result<T, String>
+where F: FnOnce() -> T + Send + 'static, T: Send + 'static
+```
+
+- 内部就是 `tauri::async_runtime::spawn_blocking(f).await`，失败（panic / 运行时关闭）映射成 `"后台任务异常退出: {e}"`。
+- 返回 `Result` 而不是 `T`：调用方通常 `unwrap_or` / `unwrap_or_else` 兜一个安全值，保持命令原本「永不 reject」的语义。
+- **标准形态**：命令声明成 `async fn`，函数体只有一行 `blocking(move || xxx_impl(...)).await?`；`xxx_impl` 是同步函数、不碰任何 Tauri 类型、返回值直接给前端 —— 这样纯逻辑可以单测，前端调用点零改动。
+- 例外（不需要套壳）：`pick_video` / `pick_folder`（rfd 模态必须主线程）、`pgs_image` / `pgs_close` / `pgs_current`（纯内存）、`autostart` 系列（注册表毫秒级）、`transcode_target`（纯路径计算）。
+
+### 3.2 `lib.rs` — 命令注册与文件系统
+
+模块声明的 9 个 `mod`、`VIDEO_EXTS`（11 个扩展名：mp4/m4v/webm/mov/mkv/avi/ts/flv/wmv/mpg/mpeg）、`run()` 里的插件与 `setup` 都在这里。文件系统类命令：
+
+| 命令 | 返回 | 说明 |
+|---|---|---|
+| `fs_stat(path)` | `FsStat { kind, size }` | `kind` 三态 `file` / `dir` / `missing`，**不存在不报错** |
+| `scan_folder(dir)` | `FolderScan` | 剧集列表（视频 + 是否配到同名弹幕） |
+| `scan_subtitles(video_path)` | `Vec<SubFile>` | 同目录外挂字幕候选 |
+| `pair_danmaku(video_path)` | `Option<DanmakuPayload>` | 同名 `.xml` / `.json` 配对，**xml 优先、忽略大小写** |
+| `read_text(path)` / `read_bytes(path)` | `Result<String, String>` | 整读，走 `read_capped`（64 MB 上限） |
+| `probe_mkv_tracks(path)` | `Result<MkvProbe, String>` | 转 `mkv_probe::probe` |
+| `sidecar_cache_files(video_path)` | `Vec<String>` | 列同目录已有的 `(音轨N).mka` / `(字幕N).srt` |
+| `reveal_path(path)` | `Result<(), String>` | 资源管理器定位文件 |
+| `app_version()` | `String` | 读 `CARGO_PKG_VERSION` |
+
+- `VIDEO_EXTS` / `is_video()` / `base_name()` 是**唯一一份**扩展名与基名规则，目录扫描、打开对话框、文件关联三处共用。
+- `read_capped(path, MAX_READ_BYTES)` 是**所有整读路径的强制入口**（弹幕 / 文本 / 字幕 / ffmpeg stdout），超限即 Err。弹幕路径把 Err 当「没有弹幕」静默处理，文本/字幕路径把 Err 交给 toast。
+- `run()` 顺序：**`.plugin(tauri_plugin_single_instance)` 必须第一个** → 其余插件 → `setup`（解析 bundled ffmpeg 路径存进 `transcode::BUNDLED_FFMPEG`、把 argv 里的视频存进 `PendingOpen`）→ `.invoke_handler(generate_handler![...])`。前端命令清单以 `generate_handler!` 为准。
+
+### 3.3 `mkv_probe.rs` — MKV 轨道表
+
+纯 std 解析 EBML，**不用 ffprobe**（安装包不带它）。目的是开播前就知道哪条音轨内核解不了，把「视频照播、音频静默消失」变成明确提示。
+
+```
+probe(path) -> Result<MkvProbe, String>
+  loop next_element():
+    ID_EBML   -> skip
+    ID_SEGMENT-> scan_segment()
+    其他       -> skip（容忍前导 Void）
+  非 EBML  -> Err("不是 EBML 容器（MKV/WebM）")
+```
+
+- `MkvProbe { tracks: Vec<MkvTrack>, duration_us: Option<u64> }`；`MkvTrack { kind, codec, lang, name, number, default }`。
+- `kind` 四态：`video` / `audio` / `subtitle` / `other`（TrackType 1/2/17，其余归 other）。
+- `codec` 是 CodecID 原样字符串（`A_AAC` / `A_DTS` / `V_MPEGH/ISO/HEVC`）—— 前端的可解码判定直接比对它。
+- **`number` 是 Matroska TrackNumber，不是 0 基索引**。Cues 索引和 PGS 渲染都按它定位；前端拿到的「第几条轨」是另一个概念，两者不能混用。
+- `duration_us` 来自 `Info/Duration × TimestampScale`，转码进度条用；读不到就是 `None`，调用方必须容忍。
+- 只读文件头：Tracks 在 Cluster 之前，大文件也是毫秒级。
+
+### 3.4 `mkv_sub.rs` — 内嵌文本字幕稀疏抽取
+
+用 Cues 索引按字节位置跳读，只碰字幕块，不扫全片。实测 Free Guy（27.95 GB / 1902 条 subrip）：ffmpeg 顺序抽 195.6 s → 稀疏抽 0.19 s，产物逐字节相同。
+
+```rust
+pub fn sparse_extract_srt(path: &Path, track_number: u32, is_ass: bool) -> Result<String, String>
+pub fn strip_markup(srt: &str) -> String      // 被 subtitle_text 复用
+```
+
+流程：
+
+1. `locate_cues()` — 读前 2 MiB → 找 `Segment` → 走 `SeekHead` 找到 `Cues` 绝对位置，同时取 `TimestampScale`。**读不到 TimestampScale 就 Err**（按 1e6 猜会让整条时间轴按比例错位）。
+2. `read_cues()` — 一次读整个 Cues 元素，解析 `CuePoint` 的 `CueTime` / `CueTrack` / `CueClusterPosition` / `CueRelativePosition`，按目标 `track_number` 过滤。
+3. 逐 cue：seek 到簇起点 → 读簇头（96 B）→ 取 `ClusterTimestamp` → `block_off = 簇payload起点 + CueRelativePosition` → 读块 → `parse_block()`。
+4. `parse_block()` 返回 `(track, rel_ts, duration, payload)`；`start_ms = cluster_ts + rel_ts`。
+5. 文本化：SRT 原样保留行；ASS 走 `ass_line_to_text()`（`Dialogue:` 前缀跳 9 段，否则跳 8 段，再 `ass_clean_text()` 去 `{\...}` 覆盖标签、处理 `\N` / `\n` / `\h`）。
+6. 排序、按 `duration`（BlockDuration）或下一条 `start_ms` 算结束时间、拼 SRT。
+
+**失败语义是整轨 fail-closed**：任何一条 cue 解析不出（缺 `CueRelativePosition`、block 带 lacing、cluster 头异常、时间戳溢出、ASS 行格式不对）→ 返回 `Err("稀疏解析失败 n/m 条，整轨拒绝")`，调用方回退 ffmpeg 顺序抽。
+
+单测里有一条**不依赖任何片源**的端到端：内存里拼真 EBML（EBML 头 + Segment{Info + SeekHead + Cues + Cluster}）写临时文件，真跑全链路并逐字节比对 SRT / ASS 输出。
+
+### 3.5 `subtitle_text.rs` — 外挂字幕解析
+
+`srt` / `vtt` / `ass` / `ssa` 全是纯文本容器，「转换」只是重排时间轴、丢样式，不需要解码器。自己实现，ffmpeg 只留给认不出来的格式兜底。
+
+```rust
+pub fn to_srt(path: &Path) -> Result<String, String>
+pub fn decode_text(bytes: &[u8]) -> String
+```
+
+- `to_srt()`：`read_capped`（64 MB）→ `decode_text()` → 按扩展名分派 `normalize_srt` / `vtt_to_srt` / `ass_to_srt` → `strip_markup()` → 空结果 Err。
+- 复用 `mkv_sub` 的 `strip_markup` / `ass_clean_text` / `fmt_ts` —— 内嵌和外挂的 ASS 清洗规则是同一份。
+- `decode_text()` 是**编码探测链**，顺序不能改：`BOM 优先` → `无 BOM 的 UTF-16 启发式` → `严格 UTF-8` → `GBK（MultiByteToWideChar 936）` → `有损 UTF-8`。
+- 为什么 BOM 必须排第一：UTF-16LE 的中文（如「你」= `60 4F`）整段字节流**恰好是合法 UTF-8**，先试严格 UTF-8 会"成功"并返回 `` `O}Y `` 这类垃圾，用户看到乱码而连 GBK 回退都不会触发。
+- 用 `windows-sys` 的系统 API 解码 GBK，不引第三方编码库（`windows-sys` 已是依赖）。
+
+### 3.6 `pgs_render.rs` — PGS 位图字幕
+
+蓝光位图字幕 Chromium 不认，这里把它还原成图片叠在画面上。不落盘、不 OCR。
+
+```
+pgs_open(video_path, track)  -> PgsIndex        (async + blocking，几秒)
+pgs_image(index)             -> Result<String>  (base64 PNG，纯内存)
+pgs_close()                  -> ()
+pgs_current()                -> Option<(String, u32)>   当前文档的 (视频, 轨道号)
+```
+
+- 数据流：`libpgs` 按 Cues 抽取显示集 → `decode_rle()` 解位图 → 合成到画布 → 裁掉透明边 → `png` 编码 → `Vec<Vec<u8>>` 全部存进 `PgsDoc`，`PgsIndex`（画布尺寸 + 事件表）交给前端，图像按需 `pgs_image(index)` 取。
+- 实测（潘神 UHD 35.6 GB / 1669 个显示集）：只读 **13.4 MB**（文件的 0.038%），冷启动 7.3 s、缓存热 50 ms；合成 884 张裁边 PNG 约 2.5 s，合计约 30 MB 内存。
+- **事件切分**：显示集里出现 PCS 对象且「构图签名」（对象 id/版本/坐标 + 调色板）变化 = 新事件；下一次清屏显示集结束它。纯调色板更新（`palette_only`）**不产生新事件**，只重绘已有事件。
+- `PgsEvent { start, end, x, y, w, h }` 的时间单位是**毫秒**，坐标是**裁边后**位图在 PGS 画布上的位置；前端按 `canvas_w/h` 和可见画面框等比摆放。
+- **单例 state**：`PgsState = Mutex<Option<PgsDoc>>`，同一时刻只存在一份文档。`pgs_open` 里用 `PGS_GEN: AtomicU64` 认号 —— 前端连点两条 PGS 轨时，先发出的那次 build 可能更慢，一完成就无条件写 state 会把后发者已经写好的文档盖回去，`pgs_image` 随后按序号取到另一条轨的图。`pgs_current` 就是给前端判断"现在挂的是不是我要的那条"用的。
+- 锁中毒不能跟着 panic（持锁方只做整体替换 Option，不存在半个状态），统一 `unwrap_or_else(|e| e.into_inner())`。
+
+### 3.7 `transcode.rs` — 音轨转码 + 字幕兜底 + 双任务槽
+
+后台媒体处理，一个模块管两条互不干扰的流水线：音轨 → `(音轨N).mka`（落视频同目录），内嵌文本字幕 → SRT（只进内存，不落盘）。
+
+**子进程包装**（全模块统一）：
+
+```rust
+pub(crate) fn hidden_command(program) -> Command   // Windows CREATE_NO_WINDOW，不弹黑框
+pub fn assign(child: &Child) -> bool               // 绑进带 KILL_ON_JOB_CLOSE 的 Job Object
+```
+
+Job Object 是 `OnceLock` 单例：父进程无论怎么死（点关闭 / 崩溃 / 任务管理器强杀），内核都会连带杀掉 job 里的 ffmpeg。光靠 window 事件回调不够 —— 强杀时回调根本不执行，ffmpeg 会变孤儿继续占 IO。
+
+**ffmpeg 定位** `find_ffmpeg()`：`BUNDLED_FFMPEG`（`OnceLock`，启动时 setup 从 `BaseDirectory::Resource` 解析）→ exe 同目录 → PATH。它是普通函数、拿不到 AppHandle，所以路径必须提前注入。
+
+**任务模型**：
+
+- `JobSlots { audio: Mutex<Option<TranscodeJob>>, subtitle: ... }` —— 两个独立槽，互不杀。
+- `JOB_GEN: AtomicU64`，每个任务 `fetch_add(1)` 拿号；worker 完成时 `take_if_gen(|j| j.gen == gen)` 认领自己那单。号只增不减。
+- 产物先写 `{stem} (音轨N).tmp.mka`，成功后原子重命名 —— 半成品永远不会被当成缓存命中。
+- 进度/结果靠事件：`transcode://progress`（`{ kind, video, index, percent, written }`）、`done`、`error`、`cancelled`。
+- kill 一律在锁外做（等子进程退出要几百毫秒，拿锁会把另一个槽的命令一起卡住）。
+
+**命令**：
+
+| 命令 | 说明 |
+|---|---|
+| `transcode_audio_start(video, index, ...)` | 起音轨任务（async + blocking） |
+| `transcode_audio_cancel()` | 只杀音轨槽 |
+| `transcode_cancel_all()` | 两个槽都杀，返回杀掉的个数 |
+| `transcode_target(video, index)` | 纯计算：mka 目标路径（不 IO，不用套壳） |
+| `subtitle_to_srt_text(path)` | 外挂字幕 → SRT 文本 |
+| `extract_subtitle_text(video, subs, ...)` | 内嵌字幕：先试 `mkv_sub` 稀疏抽，失败回退 ffmpeg 顺序抽 |
+| `clean_sidecar_tmp(video)` | 只删 `is_our_sidecar_tmp` 认定的半成品 |
+
+**命名与清理**：`mka_cache_path()` / `srt_cache_path()` 是唯一一份产物命名规则；`is_our_sidecar_tmp()` 只认 `{stem} (音轨N).tmp.mka` / `{stem} (字幕N).tmp.srt` 两种精确形态。`CACHE_TAG = " (AAC)"` 用于识别旧版整片缓存。
+
+**分流规则**（谁走 copy、谁走转码）不在这个模块里定，由前端 `ensureAudioTrack` 按 `isDeadCodec` 决定，模块只执行 `copy: bool` 参数。见 §3.15。
+
+### 3.8 `audio_stream.rs` — 流式音轨（C 级）
+
+真解不了的音轨（DTS / TrueHD / DTS-HD）整条转完要 2~3 分钟，这里改成从 seek 点开始边转边喂 MSE，**init + 首块实测 60~70 ms 就绪**。
+
+```
+audio_stream_start(video, audioIndex, startSecs) -> StreamInfo { id, mime, start_secs }
+audio_stream_read(id, maxBytes)                  -> Vec<u8>    // 长度 0 = 流结束
+audio_stream_stop(id)                            -> bool
+audio_stream_state(id)                           -> String     // 诊断用
+```
+
+- 一个 `StreamState(Mutex<Option<StreamHandle>>)` 单例，**同时只允许一路**；`shutdown(app)` 在窗口销毁时清掉。
+- 内部：子进程 `ffmpeg -ss <start> -i <video> -map 0:a:N -ac 2 ... -f mp4 -movflags +frag_keyframe+empty_moov+default_base_moof -flush_packets 1 -` 写 stdout；读线程按 ISO-BMFF box 边界增量切块塞进 `VecDeque`，前端 `read` 就是从这个队列取。
+- **`FragmentSplitter`**：第一块是 init（`ftyp` + `moov`），之后每块 `moof` + `mdat`（一个 1 秒 fragment）。`init_sent` 之后**只放行 `moof` / `mdat`**，`mfra` 一律丢弃。
+- **pull 模型的实现**：`read` 命令用 `Condvar` 等数据；前端不来取 → 队列满 → 读线程不读 stdout → ffmpeg 写满管道自己阻塞。缓冲上限天然卡死。
+- 常量：`MAX_BUFFERED_BYTES` 8 MB（约 5.5 分钟 192k）、`MAX_BOX_BYTES` 64 MB（防损坏数据吃穿内存）、`MAX_READ_BYTES` 4 MB（单次 IPC 上限）、`WAIT_TIMEOUT` 30 s（NAS 断连时 ffmpeg 可能长时间不吐数据）。
+- `MIME_AAC = audio/mp4; codecs="mp4a.40.2"` —— 前端 `addSourceBuffer` 直接用 `info.mime`。
+- 前端配套的三个 MSE 坑（`duration = Infinity`、`timestampOffset` 必须先设、`QuotaExceededError`）见 §5。
+
+### 3.9 `open_file.rs` — 命令行 / 文件关联打开
+
+Windows 没有 macOS 的 `RunEvent::Opened`，用户右键「打开方式」或双击关联文件时，系统只把路径塞进 argv。
+
+```rust
+pub const OPEN_FILE_EVENT: &str = "bplayer://open-file";
+pub fn video_from_args(args) -> Option<String>        // argv 解析（纯函数，可单测）
+pub fn stash(app, path)                               // 存 state + emit 事件
+take_open_file(state) -> Option<String>               // 取一次即清空
+```
+
+- `video_from_args`：跳过 `argv[0]` → 认 `--open <path>` 显式写法 → `-` / `--` 开头当开关跳过（Tauri / WebView2 会塞自己的参数）→ 第一个「扩展名在 `VIDEO_EXTS` 里**且 `path.is_file()`**」的参数胜出，后面忽略。要求文件真实存在，是因为用户可能把字幕/弹幕/任意文件关联过来。
+- **两条入口分开处理**，因为前端就绪状态不同：
+  - 首次启动：参数在自己 argv 里，但 webview 还没加载完 → `setup` 存进 `PendingOpen`，前端初始化完 `invoke('take_open_file')` 取。
+  - 已有实例：`single-instance` 插件把第二个进程的 argv 用 `WM_COPYDATA` 转发过来 → 走 `stash` 存 state **再** emit 事件，界面立刻换片。emit 失败（前端还没监听）不算错误，state 里还有值，两条路互为兜底。
+
+### 3.10 `autostart.rs` — 开机自启
+
+```rust
+get_autostart() -> bool
+set_autostart(enable) -> Result<bool, String>
+```
+
+- 写 `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`，值名固定英文 `Danmuku Video Player`（中文键名在部分系统上编码异常），路径统一加引号。
+- 用注册表而不是任务计划：删掉这个值就彻底停用，不需要额外组件。`exists()` 用 `RegGetValueW` 判断，`set(false)` 走 `RegDeleteKeyValueW`。
+- 整模块 `#![cfg(windows)]`。
+
+### 3.11 前端总览：单文件 IIFE 的结构
+
+`src/index.html` 3705 行，**CSS 与 JS 全部内联、无构建步骤**、ES5 风格大 IIFE。内部按功能分 12 个区（行号为大致边界，改动时按注释找）：
+
+| 行段 | 分区 |
+|---|---|
+| ~600–1500 | 状态与工具（`appSettings`、`$()`、`toast()`、`invoke` 包装）、播放器装配 `createPlayer` |
+| 1492 | 画面适配 `applyFitMode` / `videoPictureBox` |
+| 1511 | 字幕样式 / 位置 / 延时的纯函数部分（不碰 DOM，可离线单测） |
+| 1644 | 停止播放（回到空态） |
+| 1945 | 音轨编码探测 + 外挂音轨（audio-track 插件） |
+| 2274 | 流式音轨（MSE） |
+| 2607 | 音轨菜单 |
+| 2666 | 字幕：外挂扫描 + 内嵌抽取 |
+| 2965 | PGS 位图字幕 |
+| 3343 | 停止播放（第二轮，含状态清理） |
+| 3568 | 设置页 |
+| 3673 | 字幕样式 / 延时面板 |
+| 3802 | 从命令行 / 文件关联打开 |
+
+主要运行时状态：
+
+```js
+var appSettings  = { autoAudio: true, autoSubtitle: true, fit: 'contain' };  // 齿轮页
+var art          = null;      // Artplayer 实例
+var danmakuList  = [];        // 播放器格式的弹幕数组
+var subSourceText = '';       // 当前字幕的原始 SRT（改延时要在它上面重做位移）
+var probeTracks  = null;      // 最近一次探测的音频轨列表（可能为 null，读取前必须判空）
+var audioJob     = { video: '', ordinal: -1 };            // 音轨任务记账位（ordinal 1-based）
+var subJob       = { video: '', index: -1, item: null };  // 内嵌字幕任务记账位
+```
+
+**作用域陷阱**：`createPlayer` 在 2 空格缩进，字幕/音频/PGS 那一大坨在 4 空格缩进的块里。块内 `function` 声明不外泄，跨层调用会 `ReferenceError: pgsPump is not defined`。要跨层用就挪到外层或挂到对象上。
+
+### 3.12 播放器装配与文件打开
+
+- 视频走 Tauri 官方 **asset 协议**（`http://asset.localhost/<编码后路径>`），原生支持 Range，不经过自定义命令。`art.video.crossOrigin = 'anonymous'` 必须在**第一次设 `src` 之前**（WebAudio 要抓音轨做隔离）。
+- 打开单个文件：`pick_video` → `fs_stat`（判 `file` / `dir` / `missing`）→ `probe_mkv_tracks`（MKV 才有轨道表，其他容器返回 Err）→ `pair_danmaku` → `scan_subtitles` → 装配播放器 → 自动挂弹幕/字幕。
+- 打开文件夹：`scan_folder` 产出剧集列表（`Episode { path, name, hasDanmaku }`），按自然序排列，双击切集走的是**同源换集**路径（不重建播放器）。
+- 拖放：拖入视频 = 打开；拖入字幕 = 登记进字幕菜单并立即挂载（`addDroppedSubtitle`）；拖入弹幕 XML = 登记并应用。
+- 换片必须先 `transcode_cancel_all()` + 清 `audioJob` / `subJob`，否则上一片的 worker 会把产物认领到新片上。
+
+### 3.13 弹幕
+
+- 源格式：B 站 XML（`<d p="时间,模式,字号,颜色,时间戳,池,用户,行号">文本</d>`）与 JSON（新版接口）。解析后统一成 `danmakuList`，交给 `artplayer-plugin-danmuku` 消费。
+- 配对规则在 Rust `pair_danmaku`：视频同目录同名 `.xml` / `.json`，**xml 优先、忽略大小写**；读超 64 MB 视为「没有弹幕」静默处理。
+- 插件通过 `mount()` 挂进播放器；密度与屏蔽词是两套独立配置（`DENSITY_VER` / `CONFIG_VER`），改动即存。
+- `danmakuManual` 令牌：只有**非空的**手动选择才置位，否则自动配对永久失效。
+
+### 3.14 字幕（文本 / 位图 / 样式 / 延时）
+
+**候选来源三条**：同目录外挂（`scan_subtitles`，含语言后缀变体）、内嵌文本（`extract_subtitle_text`）、内嵌位图（`pgs_open`）。
+
+**文本字幕路径**：
+
+1. 外挂：`subtitle_to_srt_text(path)` → Rust 纯解析（不依赖 ffmpeg）。
+2. 内嵌：`extract_subtitle_text(video, subs, durationUs)` → Rust 先试 `mkv_sub` 稀疏抽（毫秒级），失败回退 ffmpeg 顺序抽（分钟级）。
+3. 拿到 SRT 文本后 `mountSubtitleText()`：原文留档到 `subSourceText` → 建 blob URL → `art.subtitle.switch()`。文本**只进内存**，不落盘。
+
+**位图字幕路径**：`pgs_open(video, track)` 拿 `PgsIndex` → 建一个绝对定位的图片层 → 播放时按当前时间二分查事件 → `pgs_image(index)` 取 base64 PNG。图片数量多，取回后要缓存。
+
+**自动挂载优先级**（`autoSubtitle` 开时）：外挂（精确同名 / 语言后缀变体 / 拖入）> 内嵌 `default` 轨 > 唯一一条内嵌文本轨 > 位图兜底 > 静默。一条候选都没有时**不弹任何提示**。
+
+**样式**：字号 / 颜色 / 描边 / 位置走 CSS 变量（`--art-subtitle-font-size`、`--art-subtitle-bottom` 等），必须用 `setProperty`（Artplayer 的 `style()` 对自定义属性静默失效）。位置按 `videoPictureBox()` 反算的**可见画面**摆放，不是窗口。
+
+**延时**：`shiftSrtTimes(text, deltaMs)` 在**文本层**整体位移时间戳后重建 blob 再 `switch()`（重建时**不传 `name`**，否则 Artplayer 会弹「切换字幕」notice）。原文必须留档，否则每拖一次就在已位移的文本上再位移一次。
+
+### 3.15 音轨（探测 → 决策 → 三条通道）
+
+```
+probeTracks (probe_mkv_tracks 产出，可能 null)
+  → classifyAudio()  →  { count, dead, deadNames, shakyNames, audioIndex, defDead, pin }
+  → audioPlan()      →  决定「要不要接管音频管线」
+  → needsAudioEntry()→  决定「音轨按钮显不显示」
+```
+
+- `isDeadCodec(codec)`：`A_DTS*` / `A_TRUEHD` / `A_AC4` / `A_DRA` 是内核真解不了的；`A_AC3` / `A_EAC3` / `A_PCM*` 归 `shakyNames`（内核应该能解）。
+- `classifyAudio()` 算出的 `pin` = 「内核会挑的那条 ≠ 用户要的默认轨」。`pin` 为真必须强制隔离并静音原轨（Chromium 会挑第一条能解的，不是播默认轨）。
+- `needsAudioEntry()` = `count > 1 || (count > 0 && (dead > 0 || pin))` —— **「有多条可选」本身就是入口的理由**。
+- `handleAudioCodecs()` 的提前返回**必须写在 `pin` 之后**（双 AAC 文件没有任何死编码轨，但内核照样播错）。
+
+**三条通道**（由 `ensureAudioTrack` 按编码分流）：
+
+| 通道 | 条件 | 实现 |
+|---|---|---|
+| **A 原生** | 默认轨编码内核能解且 `pin` 为假 | 什么都不做，内核直接播 |
+| **B copy** | `isDeadCodec` 为假（AC-3 / E-AC-3 / PCM） | `transcode_audio_start` 带 `copy: true`，`-c:a copy` 抽 mka 挂外挂音轨（5.1 原样保留） |
+| **C 流式转码** | `isDeadCodec` 为真（DTS / TrueHD…） | `audio_stream_start` + MSE 边转边播；失败回落整段转码 |
+
+**双记账位**：`audioJob` / `subJob` 各自记 video + 序号，`transcode://progress|done|error|cancelled` 一律按 `p.kind` 分流、只比对该组自己的 video。胶囊由 `syncPill()` 统管，两组都空才隐藏。
+
+### 3.16 画面适配与层定位
+
+- `appSettings.fit` 三态：`contain`（默认，保比例留黑边）/ `cover`（裁满）/ `fill`（拉伸），落成 `video.style.objectFit`。
+- `videoPictureBox(hostW, hostH, videoWidth, videoHeight, fit)` 返回**实际可见画面**在容器里的 `{ x, y, w, h }`。字幕层和 PGS 位图层的坐标**必须**用它反算 —— 用容器尺寸会在有黑边时整体偏出去。
+- `object-fit` 变化**不触发 `ResizeObserver`**（元素尺寸没变），所以 `applyFitMode()` 主动广播 `bplayer:fit` 事件，两个层都监听它重排。
+- 窗口尺寸、画面尺寸（`loadedmetadata`）、fit 切换、进入/退出全屏都是重排触发点。
+
+### 3.17 断点续播 / 设置 / 进度胶囊 / 命令行打开
+
+- **断点续播**：`bplayer_resume` 存 `{ path, position, duration, updatedAt }` 数组。播放中每 5 秒节流写一次，`ended` 时删除该条，读取时丢弃 30 天前的记录。点开有记录的视频先问「继续 / 从头」。
+- **设置页**：`bplayer_settings`（`autoAudio` / `autoSubtitle` / `fit` / 常亮 / 自启动），改动即存，带 `SETTINGS_VER` 并在读取时对字段做白名单回落。
+- **字幕面板**：`bplayer_subtitle_style`（字号 / 颜色 / 描边 / 位置 / 延时），**只有点「保存」才写**，预览即时生效但不落盘、不跨片。
+- **进度胶囊**：底部浮层，显示 `音轨转换 xx%` / `字幕抽取中`；`syncPill()` 按 `audioJob` / `subJob` 两组状态渲染，点它 = `transcode_cancel_all()`。
+- **命令行 / 文件关联**：启动后 `invoke('take_open_file')` 取首次参数；运行中监听 `bplayer://open-file` 事件换片。
+
+## 4. 构建与验证
 
 ```powershell
 npm run build -- --no-bundle        # 只编 exe，不出安装包（迭代时用这个）
@@ -63,7 +367,7 @@ npm run test:audio                   # 前端选轨决策单测（从 index.html
 $env:SPARSE_TEST_SRC='<mkv>'; $env:SPARSE_TEST_TRACK='9'; $env:SPARSE_TEST_ASS='0'
 ```
 
-## 4. 硬性约束（都是踩过的坑）
+## 5. 硬性约束（都是踩过的坑）
 
 **作用域**：`index.html` 是一个大 IIFE，但内部有二级块作用域——`createPlayer` 在 2 空格缩进，字幕/音频/PGS 那一大坨在 4 空格缩进的块里。**块内的函数声明不会外泄**，从外层调用会 `ReferenceError: pgsPump is not defined`。要跨层用，就显式挪到外层或挂到对象上。
 
@@ -134,7 +438,7 @@ $env:SPARSE_TEST_SRC='<mkv>'; $env:SPARSE_TEST_TRACK='9'; $env:SPARSE_TEST_ASS='
 
 **发版**：GitHub Release / tag / 上传资产要**每轮单独拿同意**，跟 git push 是两个独立的门。版本号要同时改 `package.json`、`src-tauri/tauri.conf.json`、`src-tauri/Cargo.toml` 三处。
 
-## 5. 代码风格
+## 6. 代码风格
 
 - 注释用中文，解释**为什么**这么做（尤其是绕过某个引擎缺陷的地方），不要复述代码在做什么。
 - 前端是 ES5 风格的 IIFE，别引入构建链或框架；新逻辑跟着现有的 `$()` / `toast()` / `invoke()` 走。
