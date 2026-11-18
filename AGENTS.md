@@ -1,5 +1,7 @@
 # AGENTS.md
 
+> **改完代码、验证通过后立刻维护本文件（AGENTS.md）——不要等提交。** 新增模块写进 §3「模块实现」，新踩的坑写进 §5「硬性约束」，行为有变就同步改已有描述。提交前再复核一遍，确保描述与最终代码一致。
+
 给在这个仓库里改代码的 AI / 人类协作者。只写容易踩错、又不好从代码里一眼看出来的东西。
 
 ## 1. 这是什么
@@ -288,7 +290,7 @@ var subJob       = { video: '', index: -1, item: null };  // 内嵌字幕任务�
 
 **自动挂载优先级**（`autoSubtitle` 开时）：外挂（精确同名 / 语言后缀变体 / 拖入）> 内嵌 `default` 轨 > 唯一一条内嵌文本轨 > 位图兜底 > 静默。一条候选都没有时**不弹任何提示**。
 
-**样式**：字号 / 颜色 / 描边 / 位置走 CSS 变量（`--art-subtitle-font-size`、`--art-subtitle-bottom` 等），必须用 `setProperty`（Artplayer 的 `style()` 对自定义属性静默失效）。位置按 `videoPictureBox()` 反算的**可见画面**摆放，不是窗口。
+**样式**：字号 32/38/44（默认 32）/ 颜色 / 描边 / 位置走 CSS 变量（`--art-subtitle-font-size`、`--art-subtitle-bottom` 等），必须用 `setProperty`（Artplayer 的 `style()` 对自定义属性静默失效）。字号**只对文本字幕有效**：srt/vtt/ass/ssa 统一先转 SRT 再渲染，ASS 自带的字号样式转换时就被剥掉；PGS 是位图，只随可见画面等比缩放，字号/颜色/描边对它无效。位置按 `videoPictureBox()` 反算的**可见画面**摆放，不是窗口。
 
 **延时**：`shiftSrtTimes(text, deltaMs)` 在**文本层**整体位移时间戳后重建 blob 再 `switch()`（重建时**不传 `name`**，否则 Artplayer 会弹「切换字幕」notice）。原文必须留档，否则每拖一次就在已位移的文本上再位移一次。
 
@@ -434,7 +436,7 @@ $env:SPARSE_TEST_SRC='<mkv>'; $env:SPARSE_TEST_TRACK='9'; $env:SPARSE_TEST_ASS='
 
 **音轨入口与切轨**：`needsAudioEntry()` = `count > 1 || (count > 0 && (dead > 0 || pin))` —— **「有多条可选」本身就是入口的理由**，不能只看「要不要修正」。只看 dead/pin 的后果：5 条全 AC-3、默认轨也对、内核能解的片子（多音轨国配片典型）音轨按钮根本不出现，用户以为文件只有一条轨（2026-11-17 实测）。注意「入口显示」和「要不要接管音频管线」是两件独立的事：同一部片可以 `audioPlan().native === true`（不用接管）却仍然必须给入口。手动切轨按编码分流：`isDeadCodec` 为假就 `-c copy` 抽进 mka（转 AAC 会被 `-ac 2` 把 5.1 压成立体声，用户只是换个语言听，不该顺手降质），为真才转 AAC。`ensureAudioTrack` 里读 `probeTracks[audioIdx].codec` **必须先判空**：探测失败/换片途中它是 null，而在 `fs_stat` 的异步回调里抛 ReferenceError 会被静默吞掉，表现成"点了没反应、胶囊卡在某个百分比"。
 
-**设置项改默认值**：`localStorage` 里已经存过的旧值会盖住新默认。凡是改默认值，必须同时升 `SETTINGS_VER` / `CONFIG_VER` / `DENSITY_VER` 并让旧存档（无版本号）回落到新默认，否则老用户看不到变化。
+**设置项改默认值**：`localStorage` 里已经存过的旧值会盖住新默认。凡是改默认值，必须同时升 `SETTINGS_VER` / `CONFIG_VER` / `DENSITY_VER` / `SUB_STYLE_VER` 并让旧存档（无版本号）回落到新默认，否则老用户看不到变化。**换了档位集合时，光升版本号还不够**：旧值可能落在新 `<option>` 列表之外，`sel.value = String(旧值)` 会把下拉框置成无选中（面板空白）而样式仍在生效 —— 必须在 `loadSubStyle` 里做显式档位映射（`SUB_SIZE_V1_MAP`，字幕字号 v1→v2 就是这么迁的）。
 
 **发版**：GitHub Release / tag / 上传资产要**每轮单独拿同意**，跟 git push 是两个独立的门。版本号要同时改 `package.json`、`src-tauri/tauri.conf.json`、`src-tauri/Cargo.toml` 三处。
 
