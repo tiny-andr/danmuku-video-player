@@ -208,7 +208,8 @@ pub struct JobDone {
     /// 纯内存字幕：抽取结果直接随事件带回，不落盘
     #[serde(skip_serializing_if = "Option::is_none")]
     pub text: Option<String>,
-    /// 对应哪条字幕轨（0 基序号）
+    /// 对应哪条轨（0 基序号）：字幕是字幕轨序号，音轨是 audio_index。
+    /// 音轨必须带上它，前端才能在"同片换轨"时判断这份产物属于哪一单（见 JobSpec.index）。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub index: Option<usize>,
 }
@@ -444,6 +445,13 @@ pub(crate) fn last_err_line(tail: &str) -> String {
 struct JobSpec {
     slot: Slot,
     video: String,
+    /// 这条任务对应的轨序号（音轨是 0 基 audio_index，字幕是 0 基字幕序号）。
+    ///
+    /// 必须随 done 事件一起回前端：前端记账位记的是"当前想播的那条轨"，同片换轨时
+    /// 旧任务的记账位早已被新轨覆盖。只有事件自带轨号，前端才能判断"这份产物是不是
+    /// 我当前记的那一单" —— 否则旧任务收尾时会把旧 mka 按新轨号挂上去（声音是 A 轨、
+    /// 菜单高亮 B 轨）。不要改成传 1-based ordinal：前端自己 +1 才是显示序号。
+    index: Option<usize>,
     args: Vec<String>,
     /// 每个产物：(临时文件, 最终文件)。多于一个表示一次 ffmpeg 调用产出多个文件 ——
     /// 音频块和字幕块遍布每个 cluster，读取次数才是成本，多路输出共用同一次 demux。
@@ -480,6 +488,7 @@ fn spawn_job(app: &AppHandle, spec: JobSpec) -> Result<Vec<String>, String> {
         .unwrap_or_default();
     let all_outs: Vec<String> = outputs.iter().map(|(_, o)| o.to_string_lossy().into_owned()).collect();
     let duration_us = spec.duration_us;
+    let index = spec.index;
     let app2 = app.clone();
     std::thread::spawn(move || {
         let err_thread = std::thread::spawn(move || drain_stderr(stderr));
@@ -507,7 +516,17 @@ fn spawn_job(app: &AppHandle, spec: JobSpec) -> Result<Vec<String>, String> {
                         // 0 字节 = 实际没抽出内容（例如字幕时间戳全在视频时长之外）。
                         // 当成失败处理，否则前端会挂载一条空字幕。
                         if fs::metadata(out).map(|m| m.len() == 0).unwrap_or(true) {
-                            let _ = fs::remove_file(out);
+                            // 0 字节产物绝不能留在正式路径上：留着会被当「缓存命中」，
+                            // 下次直接挂一条空字幕 / 空音轨，用户只看到「这段没声音」。
+                            // 删不掉（文件被 Windows 占用等）就改名回 .tmp 形态 —— 它落在
+                            // clean_sidecar_tmp 的清理范围内，永远不会被当成正式产物。
+                            // 两条都失败时文件确实还在原地，必须留日志给排查。
+                            if fs::remove_file(out).is_err() && fs::rename(out, tmp).is_err() {
+                                eprintln!(
+                                    "转码产物为空且无法回滚：{}（会被当成缓存命中，请手动删除）",
+                                    out.display()
+                                );
+                            }
                             failed = Some((out.to_string_lossy().into_owned(), "没有可抽取的内容（产物为空）".to_string()));
                             break;
                         }
@@ -530,7 +549,7 @@ fn spawn_job(app: &AppHandle, spec: JobSpec) -> Result<Vec<String>, String> {
                                 out: first_out.clone(),
                                 outs: renamed,
                                 text: None,
-                                index: None,
+                                index,
                             },
                         );
                     }
@@ -611,6 +630,8 @@ fn transcode_audio_start_impl(
         JobSpec {
             slot: Slot::Audio,
             video: video_path,
+            // 0 基 audio_index 原样带给前端（前端 +1 才是 1-based 显示序号）
+            index: Some(audio_index),
             args: ffmpeg_audio_args(&src, audio_index, &tmp, None, copy_audio),
             outputs: vec![(tmp, out)],
             duration_us,
@@ -1088,6 +1109,24 @@ mod tests {
             sub,
             serde_json::json!({ "kind": "subtitle", "video": "a.mkv", "index": 2 })
         );
+    }
+
+    /// done 事件必须自带轨号：同片换轨时前端记账位已被新轨覆盖，只有事件里的
+    /// 0 基 index 才能判断"这份产物是不是当前记的那一单"。约定是 0 基 audio_index，
+    /// 前端自己 +1 变显示序号 —— 后端传 1-based 会让前端多 +1 挂到错的轨上。
+    #[test]
+    fn done_payload_carries_zero_based_audio_index() {
+        let v = serde_json::to_value(JobDone {
+            kind: "audio".into(),
+            video: r"D:\影\a.mkv".into(),
+            out: r"D:\影\a (音轨2).mka".into(),
+            outs: vec![r"D:\影\a (音轨2).mka".into()],
+            text: None,
+            index: Some(1),
+        })
+        .unwrap();
+        assert_eq!(v.get("kind").and_then(|k| k.as_str()), Some("audio"));
+        assert_eq!(v.get("index").and_then(|i| i.as_u64()), Some(1), "第二条音轨必须是 0 基 1");
     }
 
     /// 事件里 kind 的取值是前后端契约，改名会让前端认不出事件类型。

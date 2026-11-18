@@ -3156,8 +3156,11 @@
         refreshSubtitleMenu();
         if (!silent) toast('位图字幕已就绪：' + clipName(s.name) + '（' + idx.events.length + ' 条）', 4000);
       }).catch(function (e) {
-        if (token !== pgsToken) return;
+        // 与 .then 对齐先收胶囊再判 token：token 过期只说明这次解析已被更新的选择/换片
+        // 作废，但「正在解析」的胶囊不在这里收就永远挂着（subJob 为空时 syncPill 收它，
+        // 不会误伤音轨那颗还在跑的胶囊）。
         syncPill();
+        if (token !== pgsToken) return;
         toast('位图字幕解析失败：' + e, 8000);
       });
     }
@@ -3369,6 +3372,9 @@
           resume.save(normPath(currentVideoPath), v.currentTime, v.duration);
         }
       } catch (e) { }
+      // 停止 = 本次会话对这部片的续播提示到此结束：令牌必须复位，否则下次再打开同一部片，
+      // offerResume 会当成「已经问过」直接跳过，刚存下的进度连问都不问（等于白存）。
+      resumeHintedPath = '';
       // 2) 作废所有在途请求：fs_stat / 探测 / 字幕抽取 / 弹幕配对 / PGS 回来的结果全丢弃，
       //    否则停止之后它们还会往空态界面上写东西（弹幕条数、字幕菜单、胶囊进度）。
       videoLoadSeq++;
@@ -3472,6 +3478,11 @@
       clearSubJob();
       hideAllPills(); // 新片从零开始，旧片两颗胶囊一律收掉
       resetExternalAudio();
+      // 换片路径不走 unmountSubtitle（它会隐藏字幕层、推进选择代际，副作用不对），但上一部
+      // 文本字幕的 blob 必须在这里回收：只动 blob 记账变量。否则每部片漏一份，要等下次成功
+      // 切换字幕或停止播放才释放（长剧集一路看下去就是持续泄漏）。
+      if (switchingSubBlobUrl) { try { URL.revokeObjectURL(switchingSubBlobUrl); } catch (e) { } switchingSubBlobUrl = ''; }
+      if (lastSubBlobUrl) { try { URL.revokeObjectURL(lastSubBlobUrl); } catch (e) { } lastSubBlobUrl = ''; }
       // 上一次被强杀/崩溃会留下 *.tmp.* 半成品，打开这部片时顺手清掉
       try { invoke('clean_sidecar_tmp', { videoPath: path }).catch(function () { }); } catch (e) { }
       unmountPgs(); // 上一部的位图字幕数据（Rust 侧约 30 MB）随换片释放
@@ -3484,6 +3495,9 @@
       // 换源那一瞬 duration/currentTime 还是旧片的，不复位会把旧进度记到新路径上。
       hideResumeBar();
       resumeReady = false;
+      // 换片/换集：上一部问过不代表这部问过。不复位的话，重开同一部片或切集后
+      // offerResume 会直接跳过，续播提示永远不再出现。
+      resumeHintedPath = '';
       bindResumeEvents(); // 首次载片时 art 才建出来，监听在这里补挂（内部只挂一次）
       handleAudioCodecs(path, name);
       // 外挂字幕扫描对全部视频类型生效（内嵌轨只有 MKV 能探测，由 handleAudioCodecs 补齐）
@@ -3866,9 +3880,19 @@
           mountSubtitleText(p.text, s, false);
         }
       } else {
-        var ordinal = audioJob.ordinal;
+        // 音轨的轨号只能来自事件本身，不能读记账位：同片换轨时 ensureAudioTrack 已经把
+        // audioJob.ordinal 覆盖成新轨号，旧任务收尾时再读它就等于把旧 mka 当成新轨挂上
+        // （声音是 A 轨、菜单高亮 B 轨）。后端补的 p.index 是 0 基 audio_index，这里 +1
+        // 转成 1 基 ordinal；旧后端没有这个字段时回落到记账位，保持原行为。
+        var evOrdinal = (typeof p.index === 'number') ? p.index + 1 : audioJob.ordinal;
+        // 先判归属再动账：这条 done 若不是当前记账的任务（同片换轨时已被让位），产物
+        // 已经在磁盘上，用户再点该轨会命中缓存直接挂载 —— 这里只提示，不挂载、不动账。
+        if (!(audioJob.video === vid && audioJob.ordinal === evOrdinal)) {
+          toast('后台处理完成');
+          return;
+        }
         clearAudioJob();
-        if (ordinal > 0) engageExternalAudio(p.video, p.out, ordinal, false); // 正播这个文件：直接挂载外挂音频
+        if (evOrdinal > 0) engageExternalAudio(p.video, p.out, evOrdinal, false); // 正播这个文件：直接挂载外挂音频
       }
     });
     T.event.listen('transcode://error', function (ev) {

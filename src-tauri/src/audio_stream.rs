@@ -199,7 +199,19 @@ fn start_impl(
     std::thread::spawn(move || worker(stdout, stderr, s2, c2, ch2));
 
     let handle = StreamHandle { id, shared, child: child_slot, cancel };
-    *lock(&app.state::<StreamState>().0) = Some(handle);
+    // 安装新 handle 前先把旧的 take 出来、在锁外停掉：只靠开头那次 stop 不够 ——
+    // 两个 start 并发时（快速 seek / 连点换轨）后到的直接覆盖会丢掉先到的 handle，
+    // 而它的 ffmpeg 子进程没人杀，会继续把整部片转完（队列没人消费，最后卡在写满的
+    // 管道上），既泄漏进程也白占磁盘 IO。这与 transcode::JobSlots::install 是同一套
+    // 防护：进锁只做替换，kill 放到锁外。
+    let displaced = {
+        let state = app.state::<StreamState>();
+        let mut slot = lock(&state.0);
+        slot.replace(handle)
+    };
+    if let Some(old) = displaced {
+        kill_handle(old);
+    }
 
     Ok(StreamInfo { id, mime: MIME_AAC.into(), start_secs })
 }
@@ -217,6 +229,12 @@ fn read_impl(app: &AppHandle, id: u64, max_bytes: usize) -> Result<Vec<u8>, Stri
     let (l, cv) = &*shared;
     let mut g = lock(l);
     loop {
+        // 流已被 stop / 被新流顶掉：立刻按「流结束」返回空块，不要让前端干等到
+        // WAIT_TIMEOUT 再收到一条「长时间没有输出」的假错误。worker 在 cancelled
+        // 分支里只 notify、不设 eof（它认为没人再看了），所以不能只靠 eof 判定。
+        if g.cancelled {
+            return Ok(Vec::new());
+        }
         if let Some(err) = g.error.clone() {
             return Err(err);
         }
@@ -261,20 +279,30 @@ fn stop_by_id(app: &AppHandle, id: Option<u64>) -> bool {
         }
     };
     let Some(h) = taken else { return false };
+    // 先摘出槽、再收尾：kill 在锁外做，理由见 kill_handle
+    kill_handle(h);
+    true
+}
+
+/// 收尾一个已经从 `StreamState` 里摘出来的流：置取消标志 → 唤醒卡在 read 里的
+/// 等待者 → 杀子进程并回收。
+///
+/// **必须在锁外调用**：等子进程退出要几百毫秒，持着 `StreamState` 锁做会把
+/// read / state / stop 这些命令一起堵住（项目里对 transcode 的两个任务槽也是同一约定）。
+fn kill_handle(h: StreamHandle) {
     h.cancel.store(true, Ordering::Relaxed);
     {
         let (l, cv) = &*h.shared;
         let mut g = lock(l);
         g.cancelled = true;
+        // 唤醒可能正卡在 Condvar 上的 read：它看到 cancelled 会立即返回空块
         cv.notify_all();
     }
-    // kill 在锁外做：等子进程退出可能要几百毫秒，拿锁会把前端其它命令一起卡住
     let child = lock(&h.child).take();
     if let Some(mut c) = child {
         let _ = c.kill();
         let _ = c.wait();
     }
-    true
 }
 
 /// 读线程：ffmpeg stdout → 按 fragment 切块 → 队列；stderr 另起一线程收集错误。

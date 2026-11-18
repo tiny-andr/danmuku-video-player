@@ -210,6 +210,12 @@ fn parse_ts(s: &str) -> Option<i64> {
     let frac = halves.next().unwrap_or("").trim();
     let mut parts = head.split(':');
     let h: i64 = parts.next()?.trim().parse().ok()?;
+    // 小时数不设上限时，后面 `h * 3600 * 1000` 在 debug 构建下会整数溢出 panic、
+    // release 下回绕成负时间戳（SRT/VTT 的小时位最多 3 位，99:59:59 已是实际上限）。
+    // 拒绝掉这一条（返回 None，由调用方 continue 丢弃）比整条字幕转换失败好。
+    if !(0..1000).contains(&h) {
+        return None;
+    }
     let m: i64 = parts.next()?.trim().parse().ok()?;
     let sec: i64 = parts.next().unwrap_or("0").trim().parse().ok()?;
     if parts.next().is_some() || !(0..60).contains(&m) || !(0..60).contains(&sec) {
@@ -241,11 +247,15 @@ fn scan_cues(text: &str, strip_seq: bool) -> Vec<Cue> {
     let lines: Vec<&str> = text.split('\n').collect();
     let mut i = 0usize;
     while i < lines.len() {
-        let Some(arrow) = lines[i].find("-->") else {
+        // 先 trim 再找箭头、再切时间戳：时间行的前导空白在手工编辑 / 工具导出的
+        // SRT/VTT 里很常见（浏览器解析 VTT 时也会先丢掉行首空白）。以前箭头索引来自
+        // 未 trim 的原始行、却拿去切 trim 后的串 —— 轻则整条 cue 静默丢弃，重则
+        // 切片越过分词边界 panic（前导空白超过 13 个时 `&time_line[arrow + 3..]`）。
+        let time_line = lines[i].trim();
+        let Some(arrow) = time_line.find("-->") else {
             i += 1;
             continue;
         };
-        let time_line = lines[i].trim();
         i += 1;
         let body_start = i;
         while i < lines.len() && !lines[i].trim().is_empty() {
@@ -300,26 +310,48 @@ fn vtt_to_srt(text: &str) -> String {
     let t = text.replace("\r\n", "\n").replace('\r', "\n");
     let mut body = String::with_capacity(t.len());
     let mut skipping = false;
+    // NOTE/STYLE/REGION 是**块**头，只出现在块起始位置（空行之后）。旧实现按"行首
+    // 关键字"无条件判定，于是 cue 正文里以 NOTE/STYLE/REGION 开头的台词也会被当成
+    // 块头，连同后面的正文一起被吞到下一个空行 —— scan_cues 收到空正文就把整条
+    // cue 丢掉，表现成"某几句字幕凭空消失"。这里必须区分块起始与正文行。
+    let mut at_block_start = true;
     for line in t.split('\n') {
         let lt = line.trim();
-        if lt.eq_ignore_ascii_case("webvtt") || lt.to_ascii_lowercase().starts_with("webvtt ") {
+        if lt.is_empty() {
+            // 空行既结束 NOTE 块，也标记"下一个非空行是块起始"
+            skipping = false;
+            at_block_start = true;
+            body.push_str(line);
+            body.push('\n');
             continue;
         }
-        // NOTE / STYLE / REGION 块以关键字开头，直到下一个空行
-        if lt.starts_with("NOTE") || lt.starts_with("STYLE") || lt.starts_with("REGION") {
+        if lt.eq_ignore_ascii_case("webvtt") || lt.to_ascii_lowercase().starts_with("webvtt ") {
+            // 头部行本身不是块起始；紧跟的空行会把它置回 true
+            continue;
+        }
+        if at_block_start && is_vtt_block_header(lt) {
             skipping = true;
             continue;
-        }
-        if lt.is_empty() {
-            skipping = false;
         }
         if skipping {
             continue;
         }
+        at_block_start = false;
         body.push_str(line);
         body.push('\n');
     }
     render(&scan_cues(&body, false))
+}
+
+/// 是否是 VTT 的 NOTE / STYLE / REGION 块头：关键字本身，或关键字后紧跟空白。
+/// 不能退化成 `starts_with`：`STYLED`、`REGIONAL`、`NOTEWORTHY` 这类正文/标识行
+/// 都不是块头，按前缀认会把整条 cue 吞掉。
+fn is_vtt_block_header(lt: &str) -> bool {
+    ["NOTE", "STYLE", "REGION"].iter().any(|key| {
+        lt.get(..key.len())
+            .is_some_and(|head| head.eq_ignore_ascii_case(key))
+            && matches!(lt.as_bytes().get(key.len()).copied(), None | Some(b' ' | b'\t'))
+    })
 }
 
 /// ASS/SSA → SRT。只取 `[Events]` 段的 `Dialogue:` 行；样式、特效、定位全部
@@ -570,5 +602,46 @@ mod tests {
         assert_eq!(parse_ts("0:00:01.05"), Some(1050));
         assert_eq!(parse_ts("01:02:03,004"), Some(3_723_004));
         assert_eq!(parse_ts("nonsense"), None);
+    }
+
+    /// 小时数必须设上限：`999:59:59,999` 是正常上限，再大就返回 None。
+    /// 以前 h 无范围检查，`h*3600*1000` 在 debug 构建下整数溢出 panic、
+    /// release 下回绕成负时间戳（然后被 `end <= start` 判掉，表现成静默丢字幕）。
+    #[test]
+    fn timestamp_parsing_rejects_overflowing_hours() {
+        assert_eq!(parse_ts("999:59:59,999"), Some(3_599_999_999));
+        assert_eq!(parse_ts("99999:00:00,000"), None);
+    }
+
+    /// 时间行带前导空白时也必须解析出 cue。
+    /// 以前箭头索引取自未 trim 的原始行、却拿去切 trim 后的串：前导空白会让时间戳
+    /// 切片错位（整条 cue 静默丢弃），空白多到一定程度还会直接切片越界 panic。
+    #[test]
+    fn cue_time_line_with_leading_whitespace_is_parsed() {
+        // 14 个前导空格：旧实现会走到 `&time_line[arrow + 3..]` 的越界 panic
+        let srt = normalize_srt("1\n              00:00:01,000 --> 00:00:02,000\nhello\n");
+        assert_eq!(srt, "1\n00:00:01,000 --> 00:00:02,000\nhello\n\n");
+        // VTT 的缩进时间行同理
+        let vtt = vtt_to_srt("WEBVTT\n\n\t00:00:03.000 --> 00:00:04.000\nworld\n");
+        assert_eq!(vtt, "1\n00:00:03,000 --> 00:00:04,000\nworld\n\n");
+    }
+
+    /// NOTE/STYLE/REGION 只在**块起始位置**才是块头。旧实现按行首关键字无条件判定，
+    /// 于是 cue 正文里以 NOTE/STYLE/REGION 开头的台词会被当成块头，连同后面的正文
+    /// 一起吞到下一个空行 —— 整条 cue 因正文为空被丢弃，表现成"某几句字幕消失"。
+    /// 顺带钉住关键字边界：`STYLE_1` 这种 cue 标识行不能被当成 STYLE 块头。
+    #[test]
+    fn vtt_note_block_does_not_swallow_cue_body() {
+        let s = Scratch::new("vtt-note-body");
+        let p = s.file(
+            "movie.vtt",
+            "WEBVTT\n\nNOTE real comment\nsecond comment line\n\nSTYLE_1\n00:00:01.000 --> 00:00:02.000\nNOTE this is dialogue\nplain line\n\n00:00:03.000 --> 00:00:04.000\nSTYLED text stays\n"
+                .as_bytes(),
+        );
+        let out = to_srt(&p).expect("VTT 应当能转");
+        assert!(!out.contains("real comment") && !out.contains("second comment line"), "NOTE 块没被丢掉：{out:?}");
+        assert_eq!(out.matches("-->").count(), 2, "有 cue 被整条吞掉了：{out:?}");
+        assert!(out.contains("NOTE this is dialogue\nplain line"), "正文开头的 NOTE 行把整条 cue 吞了：{out:?}");
+        assert!(out.contains("STYLED text stays"), "STYLED 被误判成 STYLE 块头：{out:?}");
     }
 }

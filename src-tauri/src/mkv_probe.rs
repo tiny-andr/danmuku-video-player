@@ -43,11 +43,34 @@ const ID_NAME: u32 = 0x536E;
 const ID_CLUSTER: u32 = 0x1F43_B675;
 const ID_CUES: u32 = 0x1C53_BB6B;
 
-/// 入口：定位 Segment → 找 Tracks → 解析全部 TrackEntry。非 MKV/WebM 返回 Err。
+/// 单层 EBML 元素扫描预算（顶层 / Segment 内各一份）。
+///
+/// 正常 MKV 的顶层只有 EBML 头 + 一个 Segment（偶尔几个 Void）；Segment 里在第一个
+/// Cluster/Cues 之前也只有 SeekHead / Info / Tracks / Void 这几个。4096 远大于正常
+/// 文件所需，预算用完还没走到数据段，只可能是结构异常（或伪造了 EBML magic 的其它
+/// 文件）—— 这时继续逐元素扫到 EOF 会把 shared 的 blocking 线程占住几分钟。
+const MAX_SCAN_ELEMENTS: usize = 4096;
+
+/// 入口：先快拒非 EBML 文件，再定位 Segment → 找 Tracks → 解析全部 TrackEntry。
 pub fn probe(path: &str) -> Result<MkvProbe, String> {
     let f = File::open(path).map_err(|e| e.to_string())?;
     let mut r = BufReader::new(f);
+
+    // 快拒：真正的 MKV/WebM 第一个元素就是 EBML 头，文件前 4 字节必然是 magic。
+    // 没有这一条，一个几 GB 的假 .mkv（扩展名对、内容不是）会被下面逐元素扫到
+    // EOF，秒到分钟级占死 blocking 线程池里的一个线程，把之后所有命令一起堵住。
+    let mut magic = [0u8; 4];
+    if r.read_exact(&mut magic).is_err() || magic != [0x1A, 0x45, 0xDF, 0xA3] {
+        return Err("不是 EBML 容器（MKV/WebM）".into());
+    }
+    r.seek(SeekFrom::Start(0)).map_err(|e| e.to_string())?;
+
+    let mut budget = MAX_SCAN_ELEMENTS;
     loop {
+        if budget == 0 {
+            return Err("MKV 顶层元素过多，文件结构异常".into());
+        }
+        budget -= 1;
         match next_element(&mut r).map_err(|e| e.to_string())? {
             None => return Err("不是 EBML 容器（MKV/WebM）".into()),
             Some((ID_EBML, size, unk)) => skip(&mut r, size, unk)?,
@@ -130,7 +153,14 @@ fn skip(r: &mut BufReader<File>, size: u64, unknown: bool) -> Result<(), String>
 fn scan_segment(r: &mut BufReader<File>) -> Result<MkvProbe, String> {
     let mut tracks = Vec::new();
     let mut duration_us: Option<u64> = None;
+    // 段内扫描预算：见 MAX_SCAN_ELEMENTS。正常片在第一个 Cluster/Cues 之前就
+    // break 了，远远用不到这么多。
+    let mut budget = MAX_SCAN_ELEMENTS;
     loop {
+        if budget == 0 {
+            return Err("MKV 段内元素过多，文件结构异常".into());
+        }
+        budget -= 1;
         match next_element(r).map_err(|e| e.to_string())? {
             None => break,
             Some((ID_TRACKS, size, unk)) => parse_tracks_into(r, size, unk, &mut tracks)?,
@@ -191,14 +221,22 @@ fn parse_tracks_into(r: &mut BufReader<File>, size: u64, unknown: bool, tracks: 
     while r.stream_position().map_err(|e| e.to_string())? < end {
         match next_element(r).map_err(|e| e.to_string())? {
             None => break,
-            Some((ID_TRACK_ENTRY, size, false)) => tracks.push(parse_track_entry(r, size)?),
+            Some((ID_TRACK_ENTRY, size, false)) => {
+                // TrackNumber 越界的畸形轨会在 parse_track_entry 里被丢掉，只跳过
+                // 这一条，不让整部片（其余正常轨）跟着失败。
+                if let Some(track) = parse_track_entry(r, size)? {
+                    tracks.push(track);
+                }
+            }
             Some((_, size, unk)) => skip(r, size, unk)?,
         }
     }
     Ok(())
 }
 
-fn parse_track_entry(r: &mut BufReader<File>, size: u64) -> Result<MkvTrack, String> {
+/// 解析一条 TrackEntry。返回 `Ok(None)` 表示这条轨的字段不可信、整条跳过
+/// （目前只有 TrackNumber 超出 u32 这一种：截断后会与别的轨撞号）。
+fn parse_track_entry(r: &mut BufReader<File>, size: u64) -> Result<Option<MkvTrack>, String> {
     let start = r.stream_position().map_err(|e| e.to_string())?;
     let end = start.saturating_add(size);
     let mut kind = String::from("other");
@@ -207,6 +245,12 @@ fn parse_track_entry(r: &mut BufReader<File>, size: u64) -> Result<MkvTrack, Str
     let mut lang_ietf = String::new();
     let mut name = String::new();
     let mut number = 0u32; // TrackNumber：PGS 位图渲染按它定位轨道（libpgs 用同一个号）
+    // TrackNumber 规范是 u32，但 read_uint 返回 u64：畸形文件写 2^32+1 时直接
+    // `as u32` 会静默截断成 1，和真正的 1 号轨撞号 —— 下游 Cues 索引和 PGS 渲染
+    // 都按 number 定位，等于抽到另一条轨（音轨/字幕全错，还查不出来）。
+    // 撞号无法修复（没有第二个号可用），所以整条轨丢弃并记日志；但不能整个文件
+    // Err，否则一条坏轨会让整部正常片子连音轨列表都拿不到。
+    let mut bad_number: Option<u64> = None;
     let mut default = true; // Matroska 规范中 FlagDefault 缺省为 1
     while r.stream_position().map_err(|e| e.to_string())? < end {
         match next_element(r).map_err(|e| e.to_string())? {
@@ -220,7 +264,13 @@ fn parse_track_entry(r: &mut BufReader<File>, size: u64) -> Result<MkvTrack, Str
                 };
             }
             Some((ID_FLAG_DEFAULT, size, false)) => default = read_uint(r, size)? != 0,
-            Some((ID_TRACK_NUMBER, size, false)) => number = read_uint(r, size)? as u32,
+            Some((ID_TRACK_NUMBER, size, false)) => {
+                let raw = read_uint(r, size)?;
+                match u32::try_from(raw) {
+                    Ok(n) => number = n,
+                    Err(_) => bad_number = Some(raw),
+                }
+            }
             Some((ID_CODEC_ID, size, false)) => codec = read_string(r, size)?,
             Some((ID_LANGUAGE, size, false)) => lang_legacy = read_string(r, size)?,
             Some((ID_LANG_IETF, size, false)) => lang_ietf = read_string(r, size)?,
@@ -228,14 +278,20 @@ fn parse_track_entry(r: &mut BufReader<File>, size: u64) -> Result<MkvTrack, Str
             Some((_, size, unk)) => skip(r, size, unk)?,
         }
     }
-    Ok(MkvTrack {
+    if let Some(raw) = bad_number {
+        eprintln!(
+            "[mkv_probe] 跳过一条轨道：TrackNumber={raw} 超出 u32 范围，截断后会与其它轨撞号"
+        );
+        return Ok(None);
+    }
+    Ok(Some(MkvTrack {
         kind,
         codec,
         lang: if lang_ietf.is_empty() { lang_legacy } else { lang_ietf },
         name,
         number,
         default,
-    })
+    }))
 }
 
 fn read_uint(r: &mut BufReader<File>, size: u64) -> Result<u64, String> {
@@ -354,6 +410,49 @@ mod tests {
     fn rejects_non_mkv() {
         let path = write_sample("test-notmkv.bin", b"RIFFxxxx not an ebml file");
         assert!(probe(&path).is_err());
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// 扫描预算：文件开头是合法 EBML magic，但后面堆满 Void、永远没有 Segment。
+    /// 这类伪造文件必须被预算拒掉，而不是一路扫到 EOF 占死 blocking 线程。
+    #[test]
+    fn rejects_top_level_scan_budget_exhaustion() {
+        let mut bytes = el(ID_EBML, &[0x42, 0x86, 0x81, 0x01]);
+        for _ in 0..(MAX_SCAN_ELEMENTS + 1) {
+            bytes.extend(el(0xEC, &[])); // Void（ID 0xEC，空 payload）
+        }
+        let path = write_sample("test-scan-budget.mkv", &bytes);
+        // 用 err() 而不是 unwrap_err()：MkvProbe 没有 derive Debug，unwrap_err 要 T: Debug。
+        let err = probe(&path).err().expect("应命中扫描预算而不是成功返回");
+        assert!(err.contains("结构异常"), "应命中扫描预算而不是走到 EOF：{err}");
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// TrackNumber 越界：只丢这一条轨，其余轨照常返回（不能整文件 Err）。
+    /// 2^32+1 用 `as u32` 会静默截断成 1，跟真正的 1 号轨撞号。
+    #[test]
+    fn skips_track_with_out_of_range_number() {
+        let good = [
+            el(ID_TRACK_NUMBER, &[1]),
+            el(ID_TRACK_TYPE, &[2]),
+            el(ID_CODEC_ID, b"A_AAC"),
+        ]
+        .concat();
+        let bad = [
+            el(ID_TRACK_NUMBER, &[0x01, 0x00, 0x00, 0x00, 0x01]), // 2^32 + 1
+            el(ID_TRACK_TYPE, &[2]),
+            el(ID_CODEC_ID, b"A_DTS"),
+        ]
+        .concat();
+        let tracks = [el(ID_TRACK_ENTRY, &good), el(ID_TRACK_ENTRY, &bad)].concat();
+        let segment = el(ID_TRACKS, &tracks);
+        let bytes = [el(ID_EBML, &[0x42, 0x86, 0x81, 0x01]), el(ID_SEGMENT, &segment)].concat();
+
+        let path = write_sample("test-bad-tracknumber.mkv", &bytes);
+        let probe = probe(&path).unwrap();
+        assert_eq!(probe.tracks.len(), 1, "越界 TrackNumber 的轨必须被跳过");
+        assert_eq!(probe.tracks[0].number, 1);
+        assert_eq!(probe.tracks[0].codec, "A_AAC");
         std::fs::remove_file(&path).ok();
     }
 

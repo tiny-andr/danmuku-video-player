@@ -235,8 +235,13 @@ fn pair_danmaku_impl(video_path: &str) -> Option<DanmakuPayload> {
         if !p.is_file() {
             continue;
         }
-        let name = p.file_name()?.to_string_lossy().to_string();
-        let ext = p.extension()?.to_string_lossy().to_ascii_lowercase();
+        // 这里不能用 `?`：循环体里的 `?` 会把「任一文件没有扩展名」变成整个函数
+        // 返回 None —— 同目录放个 Makefile / README / LICENSE 就让整部片静默丢弹幕，
+        // 而且没有任何报错可查。无扩展名的文件不是弹幕候选，跳过即可。
+        let Some(file_name) = p.file_name() else { continue };
+        let name = file_name.to_string_lossy().to_string();
+        let Some(ext_os) = p.extension() else { continue };
+        let ext = ext_os.to_string_lossy().to_ascii_lowercase();
         let prio = match ext.as_str() {
             "xml" => 0u8,
             "json" => 1u8,
@@ -804,6 +809,21 @@ mod tests {
         let got = pair_danmaku_impl(&s(&video)).expect("应该配上 A.xml");
         assert_eq!((got.name.as_str(), got.text.as_str()), ("A.xml", "<i/>"));
         assert!(pair_danmaku_impl(&s(&dir.join("B.mkv"))).is_none());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// 回归：循环体里用 `?` 时，目录里任一**无扩展名**文件（Makefile / README /
+    /// LICENSE）都会让整个配对提前返回 None —— 整部片静默丢弹幕且无从排查。
+    /// 这里钉住「无扩展名 = 不是候选，跳过继续找」的语义。
+    #[test]
+    fn pair_danmaku_impl_ignores_files_without_extension() {
+        let dir = scratch("danmaku-noext");
+        let video = touch(&dir, "A.mkv");
+        touch(&dir, "Makefile");
+        touch(&dir, "LICENSE");
+        fs::write(dir.join("A.xml"), b"<i/>").unwrap();
+        let got = pair_danmaku_impl(&s(&video)).expect("无扩展名文件不该让弹幕配对失明");
+        assert_eq!((got.name.as_str(), got.text.as_str()), ("A.xml", "<i/>"));
         let _ = fs::remove_dir_all(&dir);
     }
 

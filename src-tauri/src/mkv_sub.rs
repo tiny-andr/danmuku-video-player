@@ -221,11 +221,27 @@ fn read_cues(f: &mut File, cues_pos: u64, track: u32) -> Result<Vec<CuePoint>, S
                     _ => {}
                 }
             }
-            if t == Some(track as u64) {
-                if let Some(c) = cluster {
-                    out.push(CuePoint { cluster: c, relative: rel, time: cue_time });
-                }
+            // CueTrack 是 Matroska 规定的必需子元素，缺失只可能是文件结构损坏；
+            // 它后面的 CueClusterPosition 也是必需元素（缺了这条 cue 就无从定位）。
+            // 两种都不能 continue：这里丢掉的 cue 上游 dropped 计数器完全看不见
+            // （它只统计"定位到 block 但解析失败"的条数，而分母 cues.len() 用的又是
+            // 已经丢过 cue 的列表长度），最终会产出一份缺行却结构正常的 SRT ——
+            // 用户只看到"这段怎么没字幕"，且没有任何自动修复途径（SRT 进缓存后永远命中）。
+            // 整轨 Err 会回退 ffmpeg 顺序抽，慢但完整，符合本模块的 fail-closed 约定。
+            let Some(cue_track) = t else {
+                return Err("Cues 里有 CueTrackPositions 缺 CueTrack（文件结构损坏），拒绝稀疏抽取".into());
+            };
+            // CueTrack 存在但不等于目标轨：这是其它轨的正常索引（Cues 常只索引视频
+            // 关键帧，或同时索引音轨），不是文件缺陷，跳过即可。
+            if cue_track != track as u64 {
+                continue;
             }
+            let Some(c) = cluster else {
+                return Err(format!(
+                    "Cues 里目标轨 {track} 有 cue 缺 CueClusterPosition，拒绝稀疏抽取"
+                ));
+            };
+            out.push(CuePoint { cluster: c, relative: rel, time: cue_time });
         }
     }
     Ok(out)
@@ -636,10 +652,12 @@ mod tests {
         (cluster, offsets)
     }
 
-    fn cue_point(track: u32, time: u64, cluster_pos: u64, relative: Option<u64>) -> Vec<u8> {
+    fn cue_point(track: u32, time: u64, cluster_pos: Option<u64>, relative: Option<u64>) -> Vec<u8> {
         let mut ctps = Vec::new();
         ctps.extend(el(ID_CUE_TRACK, &uint_min(track as u64)));
-        ctps.extend(el(ID_CUE_CLUSTER, &uint8(cluster_pos)));
+        if let Some(pos) = cluster_pos {
+            ctps.extend(el(ID_CUE_CLUSTER, &uint8(pos)));
+        }
         if let Some(r) = relative {
             ctps.extend(el(ID_CUE_REL, &uint8(r)));
         }
@@ -654,10 +672,17 @@ mod tests {
         el(ID_SEEK_HEAD, &el(ID_SEEK, &seek))
     }
 
-    fn cues_element(cluster_pos: u64, rels: &[u64], with_relative: bool) -> Vec<u8> {
+    /// `with_cluster=false` 时故意不给目标轨（TRACK_SRT）的 CuePoint 写
+    /// CueClusterPosition（fail-closed 用例：定位缺失必须整轨拒绝）。
+    fn cues_element(cluster_pos: u64, rels: &[u64], with_relative: bool, with_cluster: bool) -> Vec<u8> {
         let mut body = Vec::new();
-        body.extend(cue_point(TRACK_SRT, 1000, cluster_pos, with_relative.then_some(rels[0])));
-        body.extend(cue_point(TRACK_ASS, 2000, cluster_pos, with_relative.then_some(rels[1])));
+        body.extend(cue_point(
+            TRACK_SRT,
+            1000,
+            with_cluster.then_some(cluster_pos),
+            with_relative.then_some(rels[0]),
+        ));
+        body.extend(cue_point(TRACK_ASS, 2000, Some(cluster_pos), with_relative.then_some(rels[1])));
         el(ID_CUES, &body)
     }
 
@@ -665,7 +690,8 @@ mod tests {
     /// Cues(两条轨各一个 CuePoint), Cluster(字幕块) }。
     /// Cluster 放在文件末尾，Cues 的 CueClusterPosition 指向它；
     /// `with_relative=false` 时故意不写 CueRelativePosition（fail-closed 用例）。
-    fn build_mkv(with_relative: bool) -> Vec<u8> {
+    /// `with_cluster=false` 时故意不给目标轨写 CueClusterPosition（fail-closed 用例）。
+    fn build_mkv(with_relative: bool, with_cluster: bool) -> Vec<u8> {
         let info = el(ID_INFO, &el(ID_TIMESTAMP_SCALE, &[0x0F, 0x42, 0x40]));
         // 同一个 Cluster 里两条轨各一条字幕：SRT 轨带 BlockDuration，ASS 轨不带（走下一条推算）
         let (cluster, offsets) = cluster_element(&[
@@ -679,9 +705,9 @@ mod tests {
         // 最短编码，两遍长度会不同，SeekHead 里写死的 Cues 偏移就会错位。
         let seek_head_len = seek_head(0).len();
         let cues_pos = info.len() + seek_head_len;
-        let cues_len = cues_element(0, &offsets, with_relative).len();
+        let cues_len = cues_element(0, &offsets, with_relative, with_cluster).len();
         let cluster_pos = (cues_pos + cues_len) as u64;
-        let cues = cues_element(cluster_pos, &offsets, with_relative);
+        let cues = cues_element(cluster_pos, &offsets, with_relative, with_cluster);
         let seek = seek_head(cues_pos as u64);
         assert_eq!(cues.len(), cues_len, "Cues 两遍构建长度必须一致");
         assert_eq!(seek.len(), seek_head_len, "SeekHead 两遍构建长度必须一致");
@@ -703,7 +729,7 @@ mod tests {
     #[test]
     fn synthetic_mkv_sparse_extract_srt_and_ass() {
         let path = temp_mkv_path("synthetic");
-        std::fs::write(&path, build_mkv(true)).unwrap();
+        std::fs::write(&path, build_mkv(true, true)).unwrap();
 
         let srt = sparse_extract_srt(&path, TRACK_SRT, false)
             .unwrap_or_else(|e| panic!("SRT 轨稀疏抽取失败：{e}"));
@@ -730,10 +756,32 @@ mod tests {
     #[test]
     fn synthetic_mkv_without_relative_position_is_fail_closed() {
         let path = temp_mkv_path("no_rel");
-        std::fs::write(&path, build_mkv(false)).unwrap();
+        std::fs::write(&path, build_mkv(false, true)).unwrap();
         let err = sparse_extract_srt(&path, TRACK_SRT, false).expect_err("缺 CueRelativePosition 必须整轨 Err");
         let _ = std::fs::remove_file(&path);
         assert!(err.contains("CueRelativePosition"), "错误要指明原因，实际：{err}");
+    }
+
+    /// 目标轨的 CuePoint 缺 CueClusterPosition 时必须整轨 Err。
+    ///
+    /// 以前这里静默 continue：被丢掉的 cue 连 `dropped` 计数器都看不到（`cues.len()`
+    /// 分母也是丢过之后的长度），产出一份缺行却结构正常的 SRT，写进缓存后永远命中，
+    /// 用户只会觉得"这段怎么没字幕"。这条测试钉的就是这个 fail-closed 语义。
+    #[test]
+    fn synthetic_mkv_missing_cluster_position_is_fail_closed() {
+        let path = temp_mkv_path("no_cluster");
+        std::fs::write(&path, build_mkv(true, false)).unwrap();
+        let err = sparse_extract_srt(&path, TRACK_SRT, false)
+            .expect_err("目标轨 cue 缺 CueClusterPosition 必须整轨 Err");
+        assert!(err.contains("CueClusterPosition"), "错误要指明原因，实际：{err}");
+        let track_label = format!("目标轨 {TRACK_SRT}");
+        assert!(err.contains(track_label.as_str()), "错误要带目标轨号，实际：{err}");
+        // 缺位置的是 SRT 轨；ASS 轨的 cue 完好，抽它必须照常成功 ——
+        // 证明拒绝的是"目标轨缺位置"，而不是"文件里见到缺位置就整体报错"
+        let ass = sparse_extract_srt(&path, TRACK_ASS, true)
+            .unwrap_or_else(|e| panic!("非目标轨缺位置不该影响 ASS 轨抽取：{e}"));
+        assert_eq!(ass, "1\n00:00:02,000 --> 00:00:04,000\nhi, there\n\n");
+        let _ = std::fs::remove_file(&path);
     }
 
     /// BlockGroup 里的 Block 与 SimpleBlock 的 flags 布局相同，带 lacing 时正文前面是

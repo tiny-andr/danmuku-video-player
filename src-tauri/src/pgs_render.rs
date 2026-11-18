@@ -7,8 +7,8 @@
 // 不像 mkvextract/ffmpeg 那样顺序扫全片（那个要读 33 GB、139 秒）。
 //
 // 事件切分：显示集里出现 PCS 对象且"构图签名"（对象 id/版本/坐标 + 调色板）变化，
-// 就算一条新事件；事件在下一次清屏显示集处结束。纯调色板更新（palette_only）
-// 不产生新事件，只是重绘已有事件。
+// 就算一条新事件；上一条事件在下一次清屏显示集处结束，中间没有清屏时则由新事件
+// 在出现的时刻替它收尾。纯调色板更新（palette_only）不产生新事件，只是重绘已有事件。
 
 use serde::Serialize;
 use std::collections::HashMap;
@@ -110,6 +110,16 @@ const PGS_MAX_CANVAS_BYTES: usize = 64 * 1024 * 1024;
 /// 单个 epoch 内解码后的对象总量上限。对象尺寸已限 8192²（单对象 64 MB），
 /// 但 id 空间有 65536 个，坏文件能堆出天文数字；真片几百 KB 到几 MB。
 const PGS_MAX_OBJECT_BYTES: usize = 128 * 1024 * 1024;
+
+/// 整条轨显示集 payload 的总量上限（256 MiB）。
+///
+/// **局限必须说清楚**：`libpgs::extract_display_sets` 是一次性 API，没有流式版本，
+/// 它返回时整条轨的所有显示集已经全量读进 `sets` 了 —— 所以这条预算**挡不住抽取
+/// 阶段的驻留**，那部分峰值由 libpgs 决定，这里拦不到。它只能回答另一半问题：
+/// 抽取都完成了，源数据还大得离谱时，不值得再往下解码对象 + 编 PNG 把内存再放大
+/// 一层（源数据 256 MiB 时，解码后的对象/位图很容易再翻几倍）。真正的根治要换
+/// 流式抽取 API（`libpgs::Extractor` 逐条 yield），那是另一项改造。
+const PGS_MAX_SOURCE_BYTES: usize = 256 * 1024 * 1024;
 
 fn check_canvas_size(w: u32, h: u32) -> Result<(), String> {
     if w == 0 || h == 0 || w > PGS_MAX_DIM || h > PGS_MAX_DIM {
@@ -258,6 +268,20 @@ fn build(video: &str, track: u32) -> Result<PgsDoc, String> {
     if sets.is_empty() {
         return Err("这条字幕轨里没有可渲染的位图".into());
     }
+    // 抽取已经全量驻留（见 PGS_MAX_SOURCE_BYTES 注释），这里先量一遍：源数据本身
+    // 就超预算的轨直接拒绝，避免后续解码对象 / 编 PNG 再把内存放大一层。
+    let source_bytes: usize = sets
+        .iter()
+        .flat_map(|ds| ds.segments.iter())
+        .map(|seg| seg.payload.len())
+        .sum();
+    if source_bytes > PGS_MAX_SOURCE_BYTES {
+        return Err(format!(
+            "PGS 源数据过大（{} MB，上限 {} MB），拒绝合成",
+            source_bytes / (1024 * 1024),
+            PGS_MAX_SOURCE_BYTES / (1024 * 1024)
+        ));
+    }
 
     let mut palette: HashMap<u8, PaletteEntry> = HashMap::new();
     let mut palette_ver: u8 = 0;
@@ -267,7 +291,7 @@ fn build(video: &str, track: u32) -> Result<PgsDoc, String> {
     let mut images: Vec<Vec<u8>> = Vec::new();
     let (mut canvas_w, mut canvas_h) = (0u32, 0u32);
     let mut current: Option<Vec<(u16, u8, u16, u16)>> = None;
-    // 累计已吃下的内存，超预算就整轨放弃（见上面两个常量）
+    // 累计已吃下的内存，超预算就整轨放弃（见上面几个 PGS_MAX_* 常量）
     let mut object_bytes: usize = 0;
     let mut image_bytes: usize = 0;
 
@@ -332,7 +356,7 @@ fn build(video: &str, track: u32) -> Result<PgsDoc, String> {
         canvas_h = pcs.video_height as u32;
 
         if pcs.objects.is_empty() {
-            // 清屏：收尾当前事件
+            // 路径1（清屏收尾）：清屏显示集的 pts 就是上一条事件的 end。
             if let Some(mut sig) = current.take() {
                 sig.clear();
                 if let Some(last) = events.last_mut() {
@@ -368,9 +392,12 @@ fn build(video: &str, track: u32) -> Result<PgsDoc, String> {
         };
 
         let png = canvas.crop_png(bx, by, bw, bh)?;
+        // 路径2（新帧替换旧帧）：只有 end 仍是哨兵的上一帧才需要在这里收尾 ——
+        // 那说明它没等到清屏就被这一帧替换了。若上一条已被清屏收尾（end 是有限
+        // 值），这里绝不能再用新帧 pts 覆盖它，否则字幕会被续到下一幕。
         if let Some(last) = events.last_mut() {
-            if last.end <= last.start {
-                last.end = ds.pts_ms; // 上一帧结束在这里
+            if last.end.is_infinite() {
+                last.end = ds.pts_ms;
             }
         }
         if events.len() >= PGS_MAX_EVENTS {
@@ -383,15 +410,25 @@ fn build(video: &str, track: u32) -> Result<PgsDoc, String> {
                 PGS_MAX_IMAGE_BYTES / (1024 * 1024)
             ));
         }
-        events.push(PgsEvent { start: ds.pts_ms, end: ds.pts_ms + 2000.0, x: bx, y: by, w: bw, h: bh });
+        // push 时 end 先写哨兵而不是 start + 2000：默认值会让"已收尾/未收尾"两种
+        // 状态无法区分（原来靠 `end <= start` 判断收尾因此恒假，push 时 end 必然
+        // 大于 start），才有"死代码 + 误砍合法长事件"两个问题。收尾见三条路径：
+        // 清屏、被新帧替换、循环结束后的兜底。
+        events.push(PgsEvent { start: ds.pts_ms, end: f64::INFINITY, x: bx, y: by, w: bw, h: bh });
         images.push(png);
         current = Some(sig);
     }
 
-    // 最后一条事件没有明确的结束时间：按常见字幕时长兜底
-    if let Some(last) = events.last_mut() {
-        if last.end > last.start + 30_000.0 {
-            last.end = last.start + 8000.0;
+    // 路径3（片尾兜底）：最后一条如果一直显示到流结束、既没等到清屏也没被替换，
+    // end 还是哨兵，只能按常见字幕时长给个有限值（+8000）。这里遍历整张事件表而
+    // 不是只看最后一条，是把"循环结束时不存在 INFINITY"当成硬不变式来兜住：
+    // serde 会把非有限浮点序列化成 null，前端 `t < ev.end` 会永远判 false，那条
+    // 字幕整段不显示，且从外部完全看不出原因。
+    // 注意：不要再加"end 比 start 大 30 秒就砍到 8 秒"这类判断 —— 被清屏正确
+    // 收尾的长事件（片尾曲持续显示半分钟以上）是合法值，砍它会提前半分钟消失。
+    for ev in events.iter_mut() {
+        if ev.end.is_infinite() {
+            ev.end = ev.start + 8000.0;
         }
     }
     if events.is_empty() {
@@ -658,9 +695,14 @@ mod tests {
         assert_eq!((doc.index.canvas_w, doc.index.canvas_h), (1920, 1080));
         assert_eq!(doc.index.events.len(), 1);
         let e = &doc.index.events[0];
-        // 位置尺寸是裁掉透明边后的对象外接矩形；未清屏时默认 2 s 时长
+        // 位置尺寸是裁掉透明边后的对象外接矩形。整条流只有这一帧、没有任何清屏或
+        // 替换来收尾，所以走"路径3 片尾兜底"：end = start + 8000 ms（旧实现是
+        // push 时写死的 +2000，被这次修复换成了哨兵 + 兜底）。
         assert_eq!((e.x, e.y, e.w, e.h), (100, 900, 40, 20));
-        assert_eq!((e.start, e.end), (2000.0, 4000.0));
+        assert_eq!((e.start, e.end), (2000.0, 10_000.0));
+        // 事件表里不允许残留哨兵：serde 会把非有限浮点序列化成 null，前端
+        // `t < ev.end` 会永远判 false，这条字幕整段不显示。
+        assert!(e.end.is_finite(), "收尾后 end 必须是有限值");
 
         assert_eq!(&doc.images[0][..8], b"\x89PNG\r\n\x1a\n", "应是 PNG 魔数");
         let mut reader = png::Decoder::new(&doc.images[0][..]).read_info().expect("读 PNG 头");
@@ -675,5 +717,90 @@ mod tests {
         let b64 = base64_encode(&doc.images[0]);
         assert!(!b64.starts_with("data:"), "pgs_image 不能带 data URL 前缀");
         assert!(b64.starts_with("iVBORw0KGgo"), "PNG 的 base64 应以 iVBORw0KGgo 开头");
+    }
+
+    /// 收尾三条路径的端到端验证，剧本就是"1000 ms 出现 A，1500 ms 被 B 替换
+    /// （中间没有清屏），3000 ms 清屏"：
+    ///   A.end 必须 = 1500（路径2：被新帧替换），B.end 必须 = 3000（路径1：清屏）。
+    /// 旧实现里 A.end 是 push 时写死的 start+2000=3000（与 B 重叠 1.5 s，画面却
+    /// 按后取的事件只显示 B），而收尾代码因为 `end <= start` 恒假从未生效 ——
+    /// 这条测试就是钉住那个缺陷。
+    #[test]
+    fn synthetic_sup_replacement_and_clear_close_events() {
+        use libpgs::pgs::{
+            CompositionObject, DisplaySetBuilder, ObjectBitmap, PcsData, PdsData, WindowDefinition,
+            WdsData,
+        };
+
+        // A：1000 ms，对象 1 放在 (100,900)，EpochStart 建立对象表
+        let ds_a = DisplaySetBuilder::new(1_000 * 90)
+            .pcs(PcsData {
+                video_width: 1920,
+                video_height: 1080,
+                composition_number: 0,
+                composition_state: CompositionState::EpochStart,
+                palette_only: false,
+                palette_id: 0,
+                objects: vec![CompositionObject { object_id: 1, window_id: 0, x: 100, y: 900, crop: None }],
+            })
+            .wds(WdsData { windows: vec![WindowDefinition { id: 0, x: 100, y: 900, width: 40, height: 20 }] })
+            .palette(PdsData {
+                id: 0,
+                version: 0,
+                entries: vec![PaletteEntry { id: 1, luminance: 235, cr: 128, cb: 128, alpha: 255 }],
+            })
+            .object(ObjectBitmap { id: 1, version: 0, width: 40, height: 20, pixels: vec![1u8; 40 * 20] })
+            .build()
+            .expect("构造显示集 A");
+
+        // B：1500 ms，构图签名变了（同一对象左移 10 px）→ 新事件，且中间没有清屏
+        let ds_b = DisplaySetBuilder::new(1_500 * 90)
+            .pcs(PcsData {
+                video_width: 1920,
+                video_height: 1080,
+                composition_number: 1,
+                composition_state: CompositionState::Normal,
+                palette_only: false,
+                palette_id: 0,
+                objects: vec![CompositionObject { object_id: 1, window_id: 0, x: 110, y: 900, crop: None }],
+            })
+            .object(ObjectBitmap { id: 1, version: 0, width: 40, height: 20, pixels: vec![1u8; 40 * 20] })
+            .build()
+            .expect("构造显示集 B");
+
+        // 清屏：3000 ms，PCS 里没有任何 composition object
+        let ds_clear = DisplaySetBuilder::new(3_000 * 90)
+            .pcs(PcsData {
+                video_width: 1920,
+                video_height: 1080,
+                composition_number: 2,
+                composition_state: CompositionState::Normal,
+                palette_only: false,
+                palette_id: 0,
+                objects: Vec::new(),
+            })
+            .build()
+            .expect("构造清屏显示集");
+
+        let path = std::env::temp_dir()
+            .join(format!("bplayer_desktop_pgs_close_paths_{}.sup", std::process::id()));
+        libpgs::write_sup_file(&[ds_a, ds_b, ds_clear], &path).expect("写 SUP");
+        let path_str = path.to_str().unwrap().to_string();
+        let doc = build(&path_str, 0).expect("合成 PGS 位图");
+        let _ = std::fs::remove_file(&path);
+
+        // 清屏本身不是事件，只把上一条收尾
+        assert_eq!(doc.index.events.len(), 2);
+        let a = &doc.index.events[0];
+        let b = &doc.index.events[1];
+        assert_eq!((a.start, a.end), (1_000.0, 1_500.0), "A 应被 1500 ms 的新帧 B 替换收尾");
+        assert_eq!((b.start, b.end), (1_500.0, 3_000.0), "B 应被 3000 ms 的清屏收尾");
+        assert_eq!((a.x, a.w), (100, 40), "A 的位图位置应是裁边后的 (100,900)");
+        assert_eq!((b.x, b.w), (110, 40), "B 的位图位置应是裁边后的 (110,900)");
+        assert_eq!(doc.images.len(), 2);
+        assert!(
+            doc.index.events.iter().all(|e| e.end.is_finite() && e.end >= e.start),
+            "任何事件的 end 都不允许残留 INFINITY"
+        );
     }
 }

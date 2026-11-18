@@ -86,6 +86,8 @@ probe(path) -> Result<MkvProbe, String>
 - **`number` 是 Matroska TrackNumber，不是 0 基索引**。Cues 索引和 PGS 渲染都按它定位；前端拿到的「第几条轨」是另一个概念，两者不能混用。
 - `duration_us` 来自 `Info/Duration × TimestampScale`，转码进度条用；读不到就是 `None`，调用方必须容忍。
 - 只读文件头：Tracks 在 Cluster 之前，大文件也是毫秒级。
+- **入口先校验 EBML magic**（`1A 45 DF A3`）：以前一个几 GB 的假 `.mkv` 会逐元素扫到 EOF，秒到分钟级占死一个共享 blocking 线程。顶层与 `scan_segment` 内层各有一道 `MAX_SCAN_ELEMENTS = 4096` 预算。
+- `TrackNumber` 用 `u32::try_from` 转换，超范围**只丢该轨**（`eprintln!` 记录），不整文件 Err —— 截断成 1 会和真正的 1 号轨撞号，而 Cues / PGS 都按 number 定位，撞号必然抽错轨。
 
 ### 3.4 `mkv_sub.rs` — 内嵌文本字幕稀疏抽取
 
@@ -106,6 +108,8 @@ pub fn strip_markup(srt: &str) -> String      // 被 subtitle_text 复用
 6. 排序、按 `duration`（BlockDuration）或下一条 `start_ms` 算结束时间、拼 SRT。
 
 **失败语义是整轨 fail-closed**：任何一条 cue 解析不出（缺 `CueRelativePosition`、block 带 lacing、cluster 头异常、时间戳溢出、ASS 行格式不对）→ 返回 `Err("稀疏解析失败 n/m 条，整轨拒绝")`，调用方回退 ffmpeg 顺序抽。
+
+**`read_cues` 也在这条防线上**：目标轨的 `CueTrackPositions` 缺 `CueClusterPosition`、或缺 `CueTrack`（Matroska 必需元素）= 文件损坏，直接 `Err`。**不要退回「`if let Some(c) = cluster`，没有就静默跳过」** —— 那样丢掉的 cue 既不计入 `dropped` 分子也不计入 `cues.len()` 分母，最终产出一份缺行却看起来正常的 SRT，而这条链路没有任何自动修复途径（2026-11-18 评审抓到的 P0 破口，`synthetic_mkv_missing_cluster_position_is_fail_closed` 钉住）。`CueTrack` 存在但**不是**目标轨的必须继续正常跳过 —— 那是别的轨，不是缺陷。
 
 单测里有一条**不依赖任何片源**的端到端：内存里拼真 EBML（EBML 头 + Segment{Info + SeekHead + Cues + Cluster}）写临时文件，真跑全链路并逐字节比对 SRT / ASS 输出。
 
@@ -137,7 +141,14 @@ pgs_current()                -> Option<(String, u32)>   当前文档的 (视频,
 
 - 数据流：`libpgs` 按 Cues 抽取显示集 → `decode_rle()` 解位图 → 合成到画布 → 裁掉透明边 → `png` 编码 → `Vec<Vec<u8>>` 全部存进 `PgsDoc`，`PgsIndex`（画布尺寸 + 事件表）交给前端，图像按需 `pgs_image(index)` 取。
 - 实测（潘神 UHD 35.6 GB / 1669 个显示集）：只读 **13.4 MB**（文件的 0.038%），冷启动 7.3 s、缓存热 50 ms；合成 884 张裁边 PNG 约 2.5 s，合计约 30 MB 内存。
+- 实测 2（`Pan's Labyrinth` UHD 33.14 GB，5 条 PGS 轨）：Eng 轨 887 事件 / Chs 轨 884 事件，`pgs_open` 冷启动 18.5 s / 14.3 s；两条轨 **零 INFINITY、零负间隔、零重叠**，并存在精确衔接（上一帧 `end` == 下一帧 `start`），时长 p50≈2.1–2.5 s、最长 6.1–8.2 s。这是 `end` 哨兵化收尾的真机证据 —— 旧的固定 `+2000` 会同时造出"字幕提前消失的空隙"和"与下一帧重叠"。
 - **事件切分**：显示集里出现 PCS 对象且「构图签名」（对象 id/版本/坐标 + 调色板）变化 = 新事件；下一次清屏显示集结束它。纯调色板更新（`palette_only`）**不产生新事件**，只重绘已有事件。
+- **`end` 用哨兵 `f64::INFINITY`，三条路径各自收尾**（2026-11-18 评审修掉的真缺陷）：
+  - 路径1 **清屏**：清屏显示集的 `pts` 就是上一条的 `end`；
+  - 路径2 **新帧替换旧帧**（签名变了但没清屏，卡拉OK逐字/多行替换）：push 新事件前，若上一条 `end` 仍是 `INFINITY` 才用新帧 `pts` 收尾；
+  - 路径3 **循环结束**：仍残留 `INFINITY` 的按 `start + 8000` 兜底，保证事件表里**没有非有限值**（serde 会把 ±INF 序列化成 `null`，前端 `t < null` 恒假 → 那条字幕永远不显示）。
+  **不要退回「push 时 end = start + 2000」**：默认值让"已收尾/未收尾"无法区分，才导致原来的收尾判断恒假（死代码）、以及片尾合法长事件被 `> start+30000` 截成 8 秒（字幕提前消失半分钟）。
+- **两处预算的边界要说清**：`PGS_MAX_OBJECT_BYTES` / `PGS_MAX_IMAGE_BYTES` 管的是合成阶段（RLE 解码后的像素 + PNG 编码产物）；`PGS_MAX_SOURCE_BYTES = 256 MiB` 管的是 `extract_display_sets` 返回后、进合成循环前的源数据总量。**但抽取本身没有预算**：`libpgs::extract_display_sets` 是一次性 API，调用即全量驻留，`PGS_MAX_SOURCE_BYTES` 只能避免之后继续放大（对象解码 + PNG），挡不住抽取阶段的峰值。根治要换流式抽取（`libpgs` 目前没有）。
 - `PgsEvent { start, end, x, y, w, h }` 的时间单位是**毫秒**，坐标是**裁边后**位图在 PGS 画布上的位置；前端按 `canvas_w/h` 和可见画面框等比摆放。
 - **单例 state**：`PgsState = Mutex<Option<PgsDoc>>`，同一时刻只存在一份文档。`pgs_open` 里用 `PGS_GEN: AtomicU64` 认号 —— 前端连点两条 PGS 轨时，先发出的那次 build 可能更慢，一完成就无条件写 state 会把后发者已经写好的文档盖回去，`pgs_image` 随后按序号取到另一条轨的图。`pgs_current` 就是给前端判断"现在挂的是不是我要的那条"用的。
 - 锁中毒不能跟着 panic（持锁方只做整体替换 Option，不存在半个状态），统一 `unwrap_or_else(|e| e.into_inner())`。
@@ -164,6 +175,7 @@ Job Object 是 `OnceLock` 单例：父进程无论怎么死（点关闭 / 崩溃
 - 产物先写 `{stem} (音轨N).tmp.mka`，成功后原子重命名 —— 半成品永远不会被当成缓存命中。
 - 进度/结果靠事件：`transcode://progress`（`{ kind, video, index, percent, written }`）、`done`、`error`、`cancelled`。
 - kill 一律在锁外做（等子进程退出要几百毫秒，拿锁会把另一个槽的命令一起卡住）。
+- **`done` 必须自带轨号**：`JobSpec.index` → `JobDone.index`。音轨填 0 基 `audio_index`，字幕填 0 基轨序号。前端**不能拿记账位当前值当事件轨号**（同片换轨时记账位已被覆盖，旧任务收尾会把 A 轨的 mka 用 B 轨的号挂上）。`done_payload_carries_zero_based_audio_index` 钉住这个契约。
 
 **命令**：
 
@@ -198,6 +210,8 @@ audio_stream_state(id)                           -> String     // 诊断用
 - **pull 模型的实现**：`read` 命令用 `Condvar` 等数据；前端不来取 → 队列满 → 读线程不读 stdout → ffmpeg 写满管道自己阻塞。缓冲上限天然卡死。
 - 常量：`MAX_BUFFERED_BYTES` 8 MB（约 5.5 分钟 192k）、`MAX_BOX_BYTES` 64 MB（防损坏数据吃穿内存）、`MAX_READ_BYTES` 4 MB（单次 IPC 上限）、`WAIT_TIMEOUT` 30 s（NAS 断连时 ffmpeg 可能长时间不吐数据）。
 - `MIME_AAC = audio/mp4; codecs="mp4a.40.2"` —— 前端 `addSourceBuffer` 直接用 `info.mime`。
+- **`read` 必须能立刻嗅到"已被取消"**：`stop` 会置 `cancelled` + `notify_all`，但等待循环若只判 `error/chunks/eof`，哨兵唤醒后会重新睡回去，等满 `WAIT_TIMEOUT` 30 s 才返回假错误。命中 `cancelled` 时返回**空 `Vec`**（长度 0 = 流结束），不要返 Err。
+- **并发 `start` 要先杀旧 handle**：单例槽直接 `Some(handle)` 覆盖时，旧 `StreamHandle` 被 drop，但 worker 手里的 `Arc` 还在 ⇒ 子进程不会被杀；没人消费队列后它攒满 8 MB 卡在 `wait_for_room`、ffmpeg 卡在写满的管道，孤儿进程一直占 IO。做法是 `slot.replace(handle)` 取旧值、**在锁外** `kill_handle(old)`（对齐 `transcode::JobSlots::install`）。
 - 前端配套的三个 MSE 坑（`duration = Infinity`、`timestampOffset` 必须先设、`QuotaExceededError`）见 §5。
 
 ### 3.9 `open_file.rs` — 命令行 / 文件关联打开
@@ -353,7 +367,7 @@ Start-Process 'src-tauri\target\release\danmuku-video-player.exe'
 注意：`document.getElementById('someRange').value` 在面板**没打开过**时读到的是 HTML 初始值，不是运行时配置。验证默认值必须先把面板打开。
 
 ```powershell
-cargo test --lib                     # Rust 单测 74 条，含合成的 MKV / SUP 端到端、argv 解析
+cargo test --lib                     # Rust 单测 83 条，含合成的 MKV / SUP 端到端、argv 解析
 npm run test:audio                   # 前端选轨决策单测（从 index.html 抠真函数跑，不依赖程序）
 ```
 
@@ -437,6 +451,10 @@ $env:SPARSE_TEST_SRC='<mkv>'; $env:SPARSE_TEST_TRACK='9'; $env:SPARSE_TEST_ASS='
 **音轨入口与切轨**：`needsAudioEntry()` = `count > 1 || (count > 0 && (dead > 0 || pin))` —— **「有多条可选」本身就是入口的理由**，不能只看「要不要修正」。只看 dead/pin 的后果：5 条全 AC-3、默认轨也对、内核能解的片子（多音轨国配片典型）音轨按钮根本不出现，用户以为文件只有一条轨（2026-11-17 实测）。注意「入口显示」和「要不要接管音频管线」是两件独立的事：同一部片可以 `audioPlan().native === true`（不用接管）却仍然必须给入口。手动切轨按编码分流：`isDeadCodec` 为假就 `-c copy` 抽进 mka（转 AAC 会被 `-ac 2` 把 5.1 压成立体声，用户只是换个语言听，不该顺手降质），为真才转 AAC。`ensureAudioTrack` 里读 `probeTracks[audioIdx].codec` **必须先判空**：探测失败/换片途中它是 null，而在 `fs_stat` 的异步回调里抛 ReferenceError 会被静默吞掉，表现成"点了没反应、胶囊卡在某个百分比"。
 
 **设置项改默认值**：`localStorage` 里已经存过的旧值会盖住新默认。凡是改默认值，必须同时升 `SETTINGS_VER` / `CONFIG_VER` / `DENSITY_VER` / `SUB_STYLE_VER` 并让旧存档（无版本号）回落到新默认，否则老用户看不到变化。**换了档位集合时，光升版本号还不够**：旧值可能落在新 `<option>` 列表之外，`sel.value = String(旧值)` 会把下拉框置成无选中（面板空白）而样式仍在生效 —— 必须在 `loadSubStyle` 里做显式档位映射（`SUB_SIZE_V1_MAP`，字幕字号 v1→v2 就是这么迁的）。
+
+**收敛段（done / stop / error）最容易漏，且漏得对称**：2026-11-18 的工程控制论评审扫出 9 处 P0/P1，全部集中在"回路的最后一步"——done 归属确认、stop 的状态复位、error 的收尾。规律是：**同一个受控状态有多条退出路径时，清理往往只写在其中一条上**（stop 有 blob 回收而换片没有；then 收胶囊而 catch 不收；ended 复位续播令牌而 stop 不复位；字幕有 pickSeq 而音轨没有）。加任何"进入"逻辑时，先数一遍这个状态有几条退出路径，再逐条写清理 —— 不对称就是缺陷。
+**声明级 fail-closed ≠ 代码级 fail-closed**：AGENTS.md 写着"任何一条 cue 解析失败→整轨拒绝"，代码里却有 `if let Some(x)` 无 else 的静默旁路（P0）。写"绝不静默"这类承诺时，顺带把承诺对应的**每个分支**过一遍，并配一条单元测试钉住；没测试的承诺通常已经有洞。
+**默认值会掩盖状态**：`end = start + 2000` 这种"给个合理默认"让"已收尾/未收尾"变得无法区分，于是收尾判断恒假（死代码）+ 兜底逻辑误伤合法值。要区分两种状态就用哨兵（`f64::INFINITY`）并在每个出口显式收敛，不要用"看起来合理的默认值"。
 
 **发版**：GitHub Release / tag / 上传资产要**每轮单独拿同意**，跟 git push 是两个独立的门。版本号要同时改 `package.json`、`src-tauri/tauri.conf.json`、`src-tauri/Cargo.toml` 三处。
 
