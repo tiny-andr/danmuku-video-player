@@ -489,11 +489,9 @@
       <div class="sub-row">
         <span class="sub-label">字号</span>
         <select id="subSize">
-          <option value="16">16 px</option>
-          <option value="18" selected>18 px（默认）</option>
-          <option value="22">22 px</option>
-          <option value="26">26 px</option>
-          <option value="32">32 px</option>
+          <option value="32" selected>32 px（默认）</option>
+          <option value="38">38 px</option>
+          <option value="44">44 px</option>
         </select>
       </div>
       <div class="sub-row">
@@ -522,7 +520,7 @@
         <button type="button" class="sub-btn primary" id="subSave">保存</button>
         <button type="button" class="sub-btn" id="subReset">重置为默认</button>
       </div>
-      <div class="block-foot">改字号/颜色/描边/位置立即预览当前片 · 点「保存」才会记住，以后打开的片沿用 · 延时只对当前片的文本字幕有效（负数=字幕更早），换片归零</div>
+      <div class="block-foot">改字号/颜色/描边/位置立即预览当前片 · 只对文本字幕生效（PGS 位图不缩字号）· 点「保存」才会记住，以后打开的片沿用 · 延时只对当前片的文本字幕有效（负数=字幕更早），换片归零</div>
     </div>
     <div class="block-foot">外挂字幕扫描同目录同名/变体文件 · 内嵌文本字幕需后台抽取为 SRT · PGS 位图字幕由本地解码后直接叠加显示</div>
   </div>
@@ -1672,16 +1670,19 @@
   }
 
   /* ---- 字幕样式（字号 / 颜色 / 描边 / 位置）与延时 ----
-   * 规格由安卓版定死，桌面版这里是实现：字号 16/18/22/26/32（默认 18）、
-   * 颜色 白/黄/青（默认白）、描边默认关、位置两选（默认画面内底部）、
-   * 延时 ±10.0s（负数=字幕更早，换片归零）。
+   * 字号 32/38/44（默认 32）、颜色 白/黄/青（默认白）、描边默认关、
+   * 位置两选（默认画面内底部）、延时 ±10.0s（负数=字幕更早，换片归零）。
+   * 字号只对**文本字幕**生效：srt/vtt/ass/ssa 都先转成 SRT 交给 Artplayer 渲染，
+   * ASS 脚本自带的字号样式在转换时就被丢掉了，统一用这里设定的值。PGS 是位图，
+   * 只随画面尺寸等比缩放，字号/颜色/描边对它没有任何作用（用户反馈"改字号 PGS
+   * 没反应"不是 bug）。
    * 改任一项立即预览当前片；只有点「保存」才写 localStorage 并让以后打开的片沿用
    * （老用户没保存过就一直是默认值，不会因为一次误拖就永久改了样式）。
    * 延时永不落盘：它和这一部片的时间轴对齐关系强相关，换片必须归零。
    */
   var SUB_STYLE_KEY = 'bplayer_subtitle_style';
-  var SUB_STYLE_VER = 1; // 以后改默认值要升这个版本，旧存档（无 ver）回落新默认
-  var SUB_SIZE_STEPS = [16, 18, 22, 26, 32];
+  var SUB_STYLE_VER = 2; // 改档位/默认值要升；v1 旧档在 loadSubStyle 里按档位映射迁移
+  var SUB_SIZE_STEPS = [32, 38, 44];
   var SUB_COLORS = ['#ffffff', '#ffff00', '#00ffff'];
   var SUB_DELAY_LIMIT = 10000; // ±10.0s
   // 描边开启时的 8 方向阴影（Artplayer 默认就是拿这招冒充描边）。关闭时写 text-shadow:none
@@ -1689,12 +1690,12 @@
   // --art-text-shadow-color 那层阴影。
   var SUB_OUTLINE_SHADOW = '0 0 2px rgba(0,0,0,.92),1px 0 1px #000,0 1px 1px #000,-1px 0 1px #000,' +
     '0 -1px 1px #000,1px 1px 1px #000,-1px -1px 1px #000,1px -1px 1px #000,-1px 1px 1px #000';
-  var subStyle = { size: 18, color: '#ffffff', outline: false, position: 'inside' };
+  var subStyle = { size: 32, color: '#ffffff', outline: false, position: 'inside' };
   var subDelayMs = 0;       // 当前片的字幕延时（毫秒，负=更早）；永不持久化
   var subSourceText = '';   // 当前文本字幕的原始 SRT 文本（改延时要在它上面重做位移）
   var subSourceItem = null; // 原文对应的菜单条目（重建时还要靠它认领归属 / 菜单高亮）
 
-  function defaultSubStyle() { return { size: 18, color: '#ffffff', outline: false, position: 'inside' }; }
+  function defaultSubStyle() { return { size: 32, color: '#ffffff', outline: false, position: 'inside' }; }
   function isSubSize(v) {
     for (var i = 0; i < SUB_SIZE_STEPS.length; i++) if (SUB_SIZE_STEPS[i] === v) return true;
     return false;
@@ -1705,12 +1706,27 @@
   }
   function isSubPosition(v) { return v === 'inside' || v === 'below'; }
 
+  // v1 → v2 档位迁移（v1 是 16/18/22/26/32，v2 是 32/38/44）。
+  // v1 的档位在新列表里只剩 32 能对上，所以一律迁到 32（新档位最小值 = 默认值）；
+  // 不往 38/44 迁，是因为旧用户没人主动要过那么大。
+  // 必须映射不能只扩白名单：下拉框里没有 18/22/26 这些 option，sel.value 会置空、
+  // 面板字号显示成空白，而样式却还在生效。
+  var SUB_SIZE_V1_MAP = { 16: 32, 18: 32, 22: 32, 26: 32, 32: 32 };
+
   // 存档读坏 / 版本不符一律回落默认（和 appSettings 同一套路：白名单 + ver）
   function loadSubStyle() {
     var out = defaultSubStyle();
     try {
       var c = JSON.parse(localStorage.getItem(SUB_STYLE_KEY)) || {};
-      if (c.ver !== SUB_STYLE_VER) return out; // 旧档没有版本号：按新默认走一次
+      if (c.ver === 1) {
+        // v1 旧档：字号按档位映射，颜色/描边/位置沿用，坏字段照旧回落默认
+        if (SUB_SIZE_V1_MAP[c.size] !== undefined) out.size = SUB_SIZE_V1_MAP[c.size];
+        if (isSubColor(c.color)) out.color = c.color;
+        if (isSubPosition(c.position)) out.position = c.position;
+        out.outline = c.outline === true;
+        return out;
+      }
+      if (c.ver !== SUB_STYLE_VER) return out; // 无版本号 / 未来版本：按新默认走一次
       if (isSubSize(c.size)) out.size = c.size;
       if (isSubColor(c.color)) out.color = c.color;
       if (isSubPosition(c.position)) out.position = c.position;
@@ -3682,7 +3698,7 @@
     function bindSubtitleStylePanel() {
       $('subSize').addEventListener('change', function () {
         var v = Number(this.value);
-        subStyle.size = isSubSize(v) ? v : 18;
+        subStyle.size = isSubSize(v) ? v : defaultSubStyle().size;
         applySubtitleStyle(); // 即时预览
       });
       var colorBtns = document.querySelectorAll('#subColors .sub-color');
